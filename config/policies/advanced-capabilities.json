@@ -1,0 +1,54 @@
+{
+  "policy": "advanced-capabilities",
+  "capabilities": {
+    "code": {
+      "available": true,
+      "approval": "per-run",
+      "signed_only": true,
+      "isolated_worker": true
+    },
+    "file": {
+      "available": true,
+      "approval": "per-run",
+      "read_only_mount": true,
+      "deny_sensitive_files": true
+    },
+    "dast": {
+      "available": true,
+      "approval": "per-run",
+      "operator_presence": true,
+      "emergency_stop": true
+    },
+    "self_contained": {
+      "available": true,
+      "approval": "per-run",
+      "signed_only": true
+    },
+    "headless": {
+      "available": true,
+      "approval": "per-run",
+      "operator_presence": true
+    },
+    "javascript": {
+      "available": true,
+      "approval": "per-run",
+      "isolated_worker": true
+    },
+    "oast": {
+      "available": true,
+      "approval": "per-run",
+      "external_callback_warning": true
+    }
+  },
+  "unverified_templates": {
+    "available": false
+  },
+  "production_controls": {
+    "scope_required": true,
+    "excluded_paths_enforced": true,
+    "third_party_domains_blocked": true,
+    "rate_limit_required": true,
+    "timeout_required": true,
+    "health_monitoring_required": true
+  }
+}
