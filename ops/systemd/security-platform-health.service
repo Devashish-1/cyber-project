@@ -1,0 +1,12 @@
+[Unit]
+Description=Security Platform health check
+After=docker.service
+
+[Service]
+Type=oneshot
+User=killswitch
+Group=killswitch
+ExecStart=/home/killswitch/security-platform/ops/health-check.sh
+NoNewPrivileges=true
+PrivateTmp=true
+

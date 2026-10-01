@@ -1,0 +1,16 @@
+[Unit]
+Description=Security Platform database and configuration backup
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=killswitch
+Group=killswitch
+ExecStart=/home/killswitch/security-platform/ops/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+

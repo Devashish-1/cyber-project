@@ -1,0 +1,71 @@
+profiles:
+  observe: {description: Passive production checks, max_concurrency: 2, tools: [httpx, testssl, zap-passive]}
+  controlled-active: {description: Reviewed active checks, max_concurrency: 1, tools: [subfinder, dnsx, katana, nuclei-reviewed, zap-baseline, nikto, schemathesis]}
+  extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox]}
+  source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, trivy, gitleaks, trufflehog, osv-scanner, checkov]}
+
+tools:
+  amass: {category: recon, risk: medium, availability: optional, execution: adapter}
+  subfinder: {category: recon, risk: low, availability: core, execution: adapter}
+  theharvester: {category: osint, risk: medium, availability: optional, execution: adapter}
+  spiderfoot: {category: osint, risk: medium, availability: optional, execution: standalone}
+  recon-ng: {category: osint, risk: medium, availability: optional, execution: manual}
+  sherlock: {category: osint, risk: low, availability: optional, execution: manual}
+  maigret: {category: osint, risk: low, availability: optional, execution: manual}
+  dnsx: {category: dns, risk: low, availability: core, execution: adapter}
+  dnsrecon: {category: dns, risk: medium, availability: optional, execution: adapter}
+  massdns: {category: dns, risk: high, availability: optional, execution: adapter}
+  httpx: {category: http-discovery, risk: low, availability: core, execution: adapter}
+  nmap: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
+  naabu: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
+  masscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}
+  rustscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}
+  katana: {category: crawling, risk: medium, availability: core, execution: adapter}
+  ffuf: {category: fuzzing, risk: high, availability: core, execution: approval-gated}
+  feroxbuster: {category: content-discovery, risk: high, availability: core, execution: approval-gated}
+  gobuster: {category: content-discovery, risk: high, availability: optional, execution: approval-gated}
+  arjun: {category: parameter-discovery, risk: high, availability: core, execution: approval-gated}
+  nuclei-reviewed: {category: vulnerability, risk: medium, availability: core, execution: adapter}
+  zap-passive: {category: dast, risk: low, availability: core, execution: adapter}
+  zap-baseline: {category: dast, risk: medium, availability: core, execution: adapter}
+  zap-full: {category: dast, risk: high, availability: core, execution: approval-gated}
+  testssl: {category: tls, risk: low, availability: core, execution: adapter}
+  nikto: {category: web-server, risk: medium, availability: core, execution: adapter}
+  wapiti: {category: dast, risk: high, availability: optional, execution: approval-gated}
+  sqlmap-controlled: {category: injection, risk: high, availability: core, execution: approval-gated}
+  dalfox: {category: xss, risk: high, availability: core, execution: approval-gated}
+  schemathesis: {category: api, risk: medium, availability: core, execution: adapter}
+  kiterunner: {category: api-discovery, risk: high, availability: optional, execution: approval-gated}
+  playwright: {category: browser-auth, risk: medium, availability: core, execution: adapter}
+  semgrep: {category: sast, risk: low, availability: core, execution: adapter}
+  bandit: {category: sast-python, risk: low, availability: core, execution: adapter}
+  codeql: {category: sast, risk: low, availability: optional, execution: adapter}
+  trivy: {category: supply-chain, risk: low, availability: core, execution: adapter}
+  gitleaks: {category: secrets, risk: low, availability: core, execution: adapter}
+  trufflehog: {category: secrets, risk: low, availability: core, execution: adapter}
+  osv-scanner: {category: dependencies, risk: low, availability: core, execution: adapter}
+  checkov: {category: iac, risk: low, availability: core, execution: adapter}
+  prowler: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
+  scoutsuite: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
+  kube-bench: {category: kubernetes, risk: low, availability: optional, execution: adapter}
+  kubescape: {category: kubernetes, risk: low, availability: optional, execution: adapter}
+  mobsf: {category: mobile, risk: low, availability: optional, execution: standalone}
+  greenbone: {category: infrastructure, risk: high, availability: optional-heavy, execution: standalone}
+  defectdojo: {category: reporting, risk: low, availability: optional-heavy, execution: connector}
+  faraday: {category: reporting, risk: low, availability: optional-heavy, execution: connector}
+  hydra: {category: credential-testing, risk: critical, availability: manual-lab, execution: disabled}
+  medusa: {category: credential-testing, risk: critical, availability: manual-lab, execution: disabled}
+  hashcat: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
+  john: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
+  metasploit: {category: exploitation, risk: critical, availability: manual-lab, execution: disabled}
+  netexec: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
+  impacket: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
+  bloodhound: {category: active-directory, risk: high, availability: manual-lab, execution: disabled}
+  certipy: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
+  responder: {category: network-interception, risk: critical, availability: manual-lab, execution: disabled}
+  sliver: {category: c2, risk: critical, availability: excluded, execution: disabled}
+  mythic: {category: c2, risk: critical, availability: excluded, execution: disabled}
+  havoc: {category: c2, risk: critical, availability: excluded, execution: disabled}
+  aircrack-ng: {category: wireless, risk: critical, availability: out-of-scope, execution: disabled}
+  kismet: {category: wireless, risk: high, availability: out-of-scope, execution: disabled}
+  bettercap: {category: network-interception, risk: critical, availability: out-of-scope, execution: disabled}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Security Testing Platform</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; background: #0b1020; color: #e7ecff; }
+      main { width: min(1100px, 90vw); margin: 3rem auto; }
+      .status,.tag { display:inline-block; padding:.3rem .65rem; border-radius:999px; background:#123e30; color:#83f2bd; }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin-top:1.5rem; }
+      article { padding:1rem; border:1px solid #263253; border-radius:12px; background:#111936; }
+      h3 { margin:.2rem 0 .6rem; } p { color:#aeb9d8; } .tag { background:#202d50; color:#b9c8ff; font-size:.8rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="status">Foundation online</span>
+      <h1>Security Testing Platform</h1>
+      <p id="summary">Loading governed tool registry…</p>
+      <section class="grid" id="tools"></section>
+    </main>
+    <script>
+      fetch('/api/tools').then(r => r.json()).then(({tools}) => {
+        const entries = Object.entries(tools);
+        const enabled = entries.filter(([,v]) => v.execution !== 'disabled');
+        document.querySelector('#summary').textContent = `${entries.length} tools catalogued; ${enabled.length} eligible for governed adapters.`;
+        document.querySelector('#tools').innerHTML = entries.map(([name, tool]) =>
+          `<article><h3>${name}</h3><span class="tag">${tool.category}</span><p>Risk: ${tool.risk}<br>Mode: ${tool.execution}<br>Tier: ${tool.availability}</p></article>`
+        ).join('');
+      }).catch(() => document.querySelector('#summary').textContent = 'Registry API unavailable.');
+    </script>
+  </body>
+</html>

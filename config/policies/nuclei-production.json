@@ -1,0 +1,23 @@
+{
+  "signed_templates_only": true,
+  "rate_limit_per_second": 5,
+  "concurrency": 2,
+  "bulk_size": 5,
+  "timeout_seconds": 10,
+  "deny_tags": [
+    "dos",
+    "fuzz",
+    "bruteforce",
+    "default-login",
+    "intrusive",
+    "headless",
+    "code",
+    "file",
+    "javascript"
+  ],
+  "require_operator_for": [
+    "critical",
+    "oast",
+    "authenticated"
+  ]
+}

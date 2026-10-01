@@ -1,0 +1,9 @@
+.env
+data/
+evidence/
+logs/
+__pycache__/
+
+backups/
+config/templates/nuclei-upstream/
+*.zip

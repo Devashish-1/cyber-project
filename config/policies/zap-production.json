@@ -1,0 +1,12 @@
+{
+  "mode": "baseline",
+  "spider_minutes": 1,
+  "maximum_runtime_minutes": 15,
+  "active_scan": false,
+  "ajax_spider": false,
+  "authentication_required_for_private_routes": true,
+  "report_formats": [
+    "json",
+    "html"
+  ]
+}

@@ -1,0 +1,44 @@
+adapters:
+  httpx:
+    version: v1.12.0
+    image: projectdiscovery/httpx@sha256:f8275a7c6aaec187249df9eaf4ad9196f4677adfc6a51a47b4aaa1d4db4f8ffc
+    profile: observe
+    approval: scope-required
+    timeout_seconds: 600
+    resources: {cpus: 0.5, memory: 512m, pids: 128}
+    output: jsonl
+    capabilities: [status-code, title, technology, tls, redirect, ip, cname]
+    state: verified-image
+
+  nuclei-reviewed:
+    version: v3.11.1
+    image: projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+    profile: controlled-active
+    approval: template-review-and-scope-required
+    timeout_seconds: 1800
+    resources: {cpus: 1.0, memory: 1g, pids: 256}
+    output: jsonl
+    controls: [signed-templates, reviewed-tag-allowlist, rate-limit, bulk-size-limit, no-interactsh-by-default]
+    state: verified-image
+
+  testssl:
+    version: 3.2.4
+    image: ghcr.io/testssl/testssl.sh@sha256:31213829a371e90afc9beae12a715793190aecebe9b64488ea49f72de7ff3c62
+    profile: observe
+    approval: scope-required
+    timeout_seconds: 900
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: json-pretty
+    capabilities: [protocols, ciphers, certificate, vulnerabilities, headers]
+    state: verified-image
+
+  zap-baseline:
+    version: 2.17.0
+    image: ghcr.io/zaproxy/zaproxy@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef
+    profile: observe
+    approval: scope-required
+    timeout_seconds: 1200
+    resources: {cpus: 1.5, memory: 4g, pids: 512}
+    output: [json, html]
+    controls: [baseline-only, passive-rules, spider-time-limit, no-active-scan]
+    state: verified-image

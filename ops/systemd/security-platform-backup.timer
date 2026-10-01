@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Security Platform backup daily
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=security-platform-backup.service
+
+[Install]
+WantedBy=timers.target
