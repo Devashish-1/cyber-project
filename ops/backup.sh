@@ -18,7 +18,7 @@ docker compose exec -T postgres \
   --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   | gzip -9 > "$backup_dir/postgres-$timestamp.sql.gz"
 
-tar -czf "$backup_dir/config-$timestamp.tar.gz" \
+tar --exclude="config/templates/nuclei-upstream" -czf "$backup_dir/config-$timestamp.tar.gz" \
   compose.yaml config dashboard backend .env.example .gitignore README.md
 
 find "$backup_dir" -type f -mtime +14 -delete
