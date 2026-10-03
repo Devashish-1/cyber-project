@@ -17,6 +17,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+NUCLEI_TEMPLATES_HOST_PATH = os.getenv(
+    "NUCLEI_TEMPLATES_HOST_PATH",
+    "/home/killswitch/security-platform/config/templates/nuclei-upstream",
+)
 RUN_QUEUE = "security-platform:runs"
 POLL_SECONDS = 1.0
 
@@ -93,6 +97,23 @@ def build_command(tool_id: str, base_url: str) -> list[str]:
             "-oJ", "/tmp/testssl.json",
             base_url,
         ]
+    if tool_id == "nuclei-reviewed":
+        return [
+            "-u", base_url,
+            "-t", "/templates",
+            "-jsonl",
+            "-silent",
+            "-disable-update-check",
+            "-disable-unsigned-templates",
+            "-no-interactsh",
+            "-tags", "cve,misconfig,exposure,config",
+            "-severity", "info,low,medium,high,critical",
+            "-rate-limit", "5",
+            "-bulk-size", "10",
+            "-concurrency", "2",
+            "-timeout", "10",
+            "-retries", "1",
+        ]
     if tool_id == "zap-baseline":
         return [
             "-t", base_url,
@@ -142,6 +163,61 @@ def normalize_httpx(run_id: UUID, output_file: Path) -> int:
             }
             fingerprint = hashlib.sha256(f"http-service|{asset}".encode()).hexdigest()
             records.append((uuid4(), run_id, "http-service", "HTTP service observed", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_nuclei(run_id: UUID, output_file: Path) -> int:
+    allowed_severities = {"info", "low", "medium", "high", "critical"}
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            info = item.get("info") or {}
+            template_id = str(item.get("template-id") or "nuclei-template")[:200]
+            matcher = str(item.get("matcher-name") or item.get("type") or "match")[:200]
+            asset = str(item.get("matched-at") or item.get("host") or "HTTP target")[:2000]
+            severity = str(info.get("severity") or "info").lower()
+            if severity not in allowed_severities:
+                severity = "info"
+            title = str(info.get("name") or template_id)[:500]
+            details = {
+                "template_id": template_id,
+                "template_url": item.get("template-url"),
+                "matcher": matcher,
+                "type": item.get("type"),
+                "host": item.get("host"),
+                "ip": item.get("ip"),
+                "port": item.get("port"),
+                "scheme": item.get("scheme"),
+                "tags": info.get("tags") or [],
+                "description": info.get("description"),
+                "reference": info.get("reference") or [],
+                "classification": info.get("classification") or {},
+                "extracted_results": item.get("extracted-results") or [],
+            }
+            fingerprint = hashlib.sha256(
+                f"nuclei|{template_id}|{matcher}|{asset}".encode()
+            ).hexdigest()
+            records.append((uuid4(), run_id, "nuclei-finding", title, severity, asset, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
     if not records:
@@ -350,6 +426,7 @@ def execute_run(run_id: UUID) -> None:
         memory = resources.get("memory", "512m")
         cpus = float(resources.get("cpus", 0.5))
         pids = int(resources.get("pids", 128))
+        timeout_seconds = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
         command = build_command(run["tool_id"], run["base_url"])
         container = client.containers.run(
             adapter["image"],
@@ -370,17 +447,31 @@ def execute_run(run_id: UUID) -> None:
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
-                None if run["tool_id"] == "testssl"
-                else None
-                if run["tool_id"] in {"zap-baseline", "zap-full"}
-                else {"/tmp": "rw,nosuid,nodev,noexec,size=64m"}
+                None if run["tool_id"] in {"testssl", "zap-baseline", "zap-full"}
+                else {
+                    "/tmp": "rw,nosuid,nodev,noexec,size=64m",
+                    **(
+                        {
+                            "/root/.config": "rw,nosuid,nodev,noexec,size=16m",
+                            "/root/.cache": "rw,nosuid,nodev,noexec,size=64m",
+                        }
+                        if run["tool_id"] == "nuclei-reviewed"
+                        else {}
+                    ),
+                }
             ),
             labels={
                 "security-platform.run-id": str(run_id),
                 "security-platform.tool": run["tool_id"],
             },
+            volumes=(
+                {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
+                if run["tool_id"] == "nuclei-reviewed"
+                else None
+            ),
         )
 
+        deadline = time.monotonic() + timeout_seconds
         while True:
             container.reload()
             current = get_run(run_id)
@@ -388,6 +479,12 @@ def execute_run(run_id: UUID) -> None:
                 container.stop(timeout=5)
                 set_status(run_id, "cancelled")
                 append_event(event_file, {"event": "cancelled", "time": time.time()})
+                return
+            if time.monotonic() >= deadline:
+                container.stop(timeout=5)
+                message = f"Tool exceeded configured timeout of {timeout_seconds} seconds"
+                set_status(run_id, "failed", message)
+                append_event(event_file, {"event": "timeout", "timeout_seconds": timeout_seconds, "time": time.time()})
                 return
             if container.status in {"exited", "dead"}:
                 break
@@ -412,7 +509,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

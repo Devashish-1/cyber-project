@@ -18,7 +18,7 @@ adapters:
     timeout_seconds: 1800
     resources: {cpus: 1.0, memory: 1g, pids: 256}
     output: jsonl
-    controls: [signed-templates, reviewed-tag-allowlist, rate-limit, bulk-size-limit, no-interactsh-by-default]
+    controls: [signed-templates-only, fixed-tag-allowlist, rate-limit-5, concurrency-2, no-interactsh]
     state: verified-image
 
   testssl:
