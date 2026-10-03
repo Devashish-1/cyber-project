@@ -16,7 +16,7 @@ ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
-RUNNER_IMPLEMENTED_TOOLS = {"httpx", "katana", "nikto", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"ffuf", "httpx", "katana", "nikto", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
@@ -91,7 +91,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.18.1", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.19.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):

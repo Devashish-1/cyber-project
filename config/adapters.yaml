@@ -1,4 +1,16 @@
 adapters:
+  ffuf:
+    version: 2.3.0
+    image: security-platform/ffuf:2.3.0
+    profile: extended-active
+    approval: explicit-run-and-scope-required
+    timeout_seconds: 150
+    resources: {cpus: 0.5, memory: 512m, pids: 96}
+    output: jsonl
+    capabilities: [reviewed-content-discovery]
+    controls: [reviewed-small-wordlist, excluded-path-precheck, rate-limit-5, threads-2, duration-2-minutes, filter-404]
+    state: local-hardened-image
+
   subfinder:
     version: v2.16.0
     image: projectdiscovery/subfinder@sha256:c0f4683f91e8e30fbb5bf45051ef45e245ef48424b0d5bc99f8a72cb45163ea9

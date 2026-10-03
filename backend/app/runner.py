@@ -24,6 +24,13 @@ NUCLEI_TEMPLATES_HOST_PATH = os.getenv(
     "NUCLEI_TEMPLATES_HOST_PATH",
     "/home/killswitch/security-platform/config/templates/nuclei-upstream",
 )
+FFUF_WORDLIST_HOST_PATH = os.getenv(
+    "FFUF_WORDLIST_HOST_PATH",
+    "/home/killswitch/security-platform/config/wordlists/content-reviewed-small.txt",
+)
+FFUF_WORDLIST_RUNNER_PATH = Path(
+    os.getenv("FFUF_WORDLIST_RUNNER_PATH", "/app/config/wordlists/content-reviewed-small.txt")
+)
 RUN_QUEUE = "security-platform:runs"
 POLL_SECONDS = 1.0
 
@@ -190,6 +197,29 @@ def build_command(
             "-o", "/tmp/report.json",
             "--no-bugreport",
             "-v", "0",
+        ]
+    if tool_id == "ffuf":
+        candidates = [
+            f"/{line.strip().lstrip('/')}"
+            for line in FFUF_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        for excluded in (excluded_paths or []):
+            normalized = excluded.rstrip("/") or "/"
+            if any(candidate == normalized or candidate.startswith(f"{normalized}/") for candidate in candidates):
+                raise ValueError(f"Reviewed ffuf wordlist intersects excluded path: {excluded}")
+        return [
+            "-w", "/wordlists/content.txt",
+            "-u", f"{base_url.rstrip('/')}/FUZZ",
+            "-json",
+            "-s",
+            "-noninteractive",
+            "-rate", "5",
+            "-t", "2",
+            "-timeout", "10",
+            "-maxtime", "120",
+            "-mc", "all",
+            "-fc", "404",
         ]
     if tool_id == "zap-baseline":
         return [
@@ -489,6 +519,47 @@ def normalize_wapiti(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            url = str(item.get("url") or "")[:2000]
+            if not url:
+                continue
+            status = int(item.get("status") or 0)
+            details = {
+                "status_code": status,
+                "content_type": item.get("content-type"),
+                "content_length": item.get("length"),
+                "words": item.get("words"),
+                "lines": item.get("lines"),
+                "redirect_location": item.get("redirectlocation"),
+            }
+            fingerprint = hashlib.sha256(f"content-path|{url}|{status}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "content-path", "Content path discovered", "info", url, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def capture_testssl_output(container, output_file: Path) -> None:
     stream, _ = container.get_archive("/tmp")
     archive = io.BytesIO(b"".join(stream))
@@ -711,6 +782,11 @@ def execute_run(run_id: UUID) -> None:
                         if run["tool_id"] in {"katana", "nuclei-reviewed", "subfinder"}
                         else {}
                     ),
+                    **(
+                        {"/home/scanner/.config": "rw,nosuid,nodev,noexec,size=16m"}
+                        if run["tool_id"] == "ffuf"
+                        else {}
+                    ),
                 }
             ),
             labels={
@@ -720,6 +796,8 @@ def execute_run(run_id: UUID) -> None:
             volumes=(
                 {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
                 if run["tool_id"] == "nuclei-reviewed"
+                else {FFUF_WORDLIST_HOST_PATH: {"bind": "/wordlists/content.txt", "mode": "ro"}}
+                if run["tool_id"] == "ffuf"
                 else None
             ),
         )
@@ -768,7 +846,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

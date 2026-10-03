@@ -1,0 +1,12 @@
+admin
+api
+api/v1
+assets
+dashboard
+docs
+health
+index.html
+login
+robots.txt
+sitemap.xml
+status
