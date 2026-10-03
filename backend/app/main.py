@@ -99,6 +99,28 @@ def init_database() -> None:
                     ADD COLUMN IF NOT EXISTS reviewed_by TEXT;
                 ALTER TABLE observations
                     ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS audit_events_project_created_idx
+                    ON audit_events(project_id, created_at DESC);
+                CREATE OR REPLACE FUNCTION prevent_audit_event_mutation()
+                RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION 'audit events are append-only';
+                END;
+                $$ LANGUAGE plpgsql;
+                DROP TRIGGER IF EXISTS audit_events_append_only ON audit_events;
+                CREATE TRIGGER audit_events_append_only
+                    BEFORE UPDATE OR DELETE ON audit_events
+                    FOR EACH ROW EXECUTE FUNCTION prevent_audit_event_mutation();
                 """
             )
 
@@ -109,7 +131,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.22.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.23.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -158,6 +180,25 @@ def load_adapters() -> dict:
 
 def queue_client() -> redis.Redis:
     return redis.from_url(REDIS_URL, socket_connect_timeout=3, decode_responses=True)
+
+
+def record_audit(
+    cursor: psycopg.Cursor,
+    project_id: UUID,
+    event_type: str,
+    actor: str,
+    object_type: str,
+    object_id: object,
+    details: dict | None = None,
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO audit_events
+            (id, project_id, event_type, actor, object_type, object_id, details)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (uuid4(), project_id, event_type, actor, object_type, str(object_id), Jsonb(details or {})),
+    )
 
 
 def run_row(row: tuple) -> dict:
@@ -287,6 +328,7 @@ def create_project(payload: ProjectCreate) -> dict:
                 "INSERT INTO projects (id, name, description) VALUES (%s, %s, %s)",
                 (project_id, payload.name, payload.description),
             )
+            record_audit(cursor, project_id, "project.created", "system", "project", project_id, {"name": payload.name})
     return {"id": project_id, **payload.model_dump()}
 
 
@@ -330,6 +372,10 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     Jsonb(payload.excluded_paths),
                     payload.authorization_reference,
                 ),
+            )
+            record_audit(
+                cursor, project_id, "target.authorized", "system", "target", target_id,
+                {"base_url": str(payload.base_url), "authorization_reference": payload.authorization_reference},
             )
     return {"id": target_id, "project_id": project_id, **payload.model_dump(mode="json")}
 
@@ -407,6 +453,10 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                 """,
                 (run_id, project_id, payload.target_id, payload.tool_id, payload.profile, payload.requested_by),
             )
+            record_audit(
+                cursor, project_id, "run.approved", payload.requested_by, "run", run_id,
+                {"target_id": str(payload.target_id), "tool_id": payload.tool_id, "profile": payload.profile},
+            )
 
     queue_client().rpush(RUN_QUEUE, str(run_id))
     return {"id": run_id, "status": "queued", **payload.model_dump(mode="json")}
@@ -460,6 +510,10 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                     )
                     for batch_step, (run_id, tool_id) in enumerate(zip(run_ids, tool_ids), start=1)
                 ],
+            )
+            record_audit(
+                cursor, project_id, "workflow.approved", payload.requested_by, "batch", batch_id,
+                {"target_id": str(payload.target_id), "plan_id": payload.plan_id, "tools": tool_ids},
             )
 
     queue = queue_client()
@@ -533,8 +587,9 @@ def get_batch(batch_id: UUID) -> dict:
 def cancel_batch(batch_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM run_batches WHERE id = %s", (batch_id,))
-            if cursor.fetchone() is None:
+            cursor.execute("SELECT project_id, requested_by FROM run_batches WHERE id = %s", (batch_id,))
+            batch = cursor.fetchone()
+            if batch is None:
                 raise HTTPException(status_code=404, detail="Batch not found")
             cursor.execute(
                 """
@@ -547,6 +602,10 @@ def cancel_batch(batch_id: UUID) -> dict:
                 (batch_id,),
             )
             changed = cursor.fetchall()
+            record_audit(
+                cursor, batch[0], "workflow.cancel_requested", batch[1], "batch", batch_id,
+                {"changed_runs": [{"run_id": str(row[0]), "status": row[1]} for row in changed]},
+            )
     cache = queue_client()
     for run_id, _ in changed:
         cache.publish("security-platform:cancellations", str(run_id))
@@ -591,7 +650,7 @@ def get_run(run_id: UUID) -> dict:
 def cancel_run(run_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT status FROM runs WHERE id = %s FOR UPDATE", (run_id,))
+            cursor.execute("SELECT status, project_id, requested_by FROM runs WHERE id = %s FOR UPDATE", (run_id,))
             row = cursor.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Run not found")
@@ -601,6 +660,10 @@ def cancel_run(run_id: UUID) -> dict:
             cursor.execute(
                 "UPDATE runs SET status = %s, finished_at = CASE WHEN %s = 'cancelled' THEN NOW() ELSE finished_at END WHERE id = %s",
                 (next_status, next_status, run_id),
+            )
+            record_audit(
+                cursor, row[1], "run.cancel_requested", row[2], "run", run_id,
+                {"previous_status": row[0], "requested_status": next_status},
             )
     queue_client().publish("security-platform:cancellations", str(run_id))
     return {"id": run_id, "status": next_status}
@@ -809,10 +872,51 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     return "\n".join(lines)
 
 
+@app.get("/projects/{project_id}/audit-events")
+def get_project_audit_events(project_id: UUID, limit: int = 100) -> dict:
+    safe_limit = min(max(limit, 1), 500)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, event_type, actor, object_type, object_id, details, created_at
+                FROM audit_events WHERE project_id = %s
+                ORDER BY created_at DESC, id DESC LIMIT %s
+                """,
+                (project_id, safe_limit),
+            )
+            rows = cursor.fetchall()
+    return {
+        "project_id": project_id,
+        "events": [
+            {
+                "id": row[0], "event_type": row[1], "actor": row[2],
+                "object_type": row[3], "object_id": row[4],
+                "details": sanitize_evidence(row[5]), "created_at": row[6],
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.patch("/observations/{observation_id}")
 def review_observation(observation_id: UUID, payload: ObservationReview) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT r.project_id, o.review_status
+                FROM observations o JOIN runs r ON r.id = o.run_id
+                WHERE o.id = %s
+                """,
+                (observation_id,),
+            )
+            observation = cursor.fetchone()
+            if observation is None:
+                raise HTTPException(status_code=404, detail="Observation not found")
             cursor.execute(
                 """
                 UPDATE observations
@@ -823,8 +927,11 @@ def review_observation(observation_id: UUID, payload: ObservationReview) -> dict
                 (payload.status, payload.notes, payload.reviewed_by, observation_id),
             )
             row = cursor.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Observation not found")
+            record_audit(
+                cursor, observation[0], "finding.reviewed", payload.reviewed_by,
+                "observation", observation_id,
+                {"previous_status": observation[1], "review_status": payload.status},
+            )
     return {
         "id": observation_id, "run_id": row[0], "review_status": row[1],
         "review_notes": row[2], "reviewed_by": row[3], "reviewed_at": row[4],
