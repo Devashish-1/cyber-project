@@ -32,6 +32,10 @@ FFUF_WORDLIST_HOST_PATH = os.getenv(
 FFUF_WORDLIST_RUNNER_PATH = Path(
     os.getenv("FFUF_WORDLIST_RUNNER_PATH", "/app/config/wordlists/content-reviewed-small.txt")
 )
+ARJUN_WORDLIST_HOST_PATH = os.getenv(
+    "ARJUN_WORDLIST_HOST_PATH",
+    "/home/killswitch/security-platform/config/wordlists/parameters-reviewed-small.txt",
+)
 RUN_QUEUE = "security-platform:runs"
 POLL_SECONDS = 1.0
 
@@ -257,6 +261,21 @@ def build_command(
             "-maxtime", "120",
             "-mc", "all",
             "-fc", "404",
+        ]
+    if tool_id == "arjun":
+        return [
+            "-u", base_url,
+            "-oJ", "/tmp/arjun.json",
+            "-w", "/wordlists/parameters.txt",
+            "-m", "GET",
+            "-t", "2",
+            "-d", "0.2",
+            "--rate-limit", "5",
+            "-T", "10",
+            "-c", "10",
+            "--stable",
+            "--disable-redirects",
+            "-q",
         ]
     if tool_id == "zap-baseline":
         return [
@@ -697,6 +716,47 @@ def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_arjun(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        if not isinstance(report, dict):
+            return 0
+        for target, raw_parameters in report.items():
+            if isinstance(raw_parameters, dict):
+                parameters = list(raw_parameters)
+            elif isinstance(raw_parameters, list):
+                parameters = raw_parameters
+            else:
+                continue
+            for raw_parameter in parameters:
+                parameter = str(raw_parameter).strip()[:200]
+                if not parameter:
+                    continue
+                asset = str(target)[:2000]
+                details = {"parameter": parameter, "method": "GET", "source": "active-comparison"}
+                fingerprint = hashlib.sha256(f"http-parameter|GET|{asset}|{parameter}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "http-parameter", "HTTP GET parameter discovered", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def capture_testssl_output(container, output_file: Path) -> None:
     stream, _ = container.get_archive("/tmp")
     archive = io.BytesIO(b"".join(stream))
@@ -943,6 +1003,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "nuclei-reviewed"
                 else {FFUF_WORDLIST_HOST_PATH: {"bind": "/wordlists/content.txt", "mode": "ro"}}
                 if run["tool_id"] == "ffuf"
+                else {ARJUN_WORDLIST_HOST_PATH: {"bind": "/wordlists/parameters.txt", "mode": "ro"}}
+                if run["tool_id"] == "arjun"
                 else None
             ),
         )
@@ -987,11 +1049,20 @@ def execute_run(run_id: UUID) -> None:
                 capture_json_output(container, "/tmp/report.json", output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "arjun":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code == 0:
+                try:
+                    capture_json_output(container, "/tmp/arjun.json", output_file)
+                except (docker.errors.NotFound, RuntimeError):
+                    output_file.write_text("{}\n", encoding="utf-8")
+            else:
+                output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

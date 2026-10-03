@@ -1,0 +1,21 @@
+# Reviewed low-impact GET parameter candidates.
+id
+page
+q
+query
+search
+sort
+order
+filter
+limit
+offset
+lang
+locale
+format
+view
+category
+tag
+redirect
+return
+next
+callback

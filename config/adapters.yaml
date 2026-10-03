@@ -1,4 +1,17 @@
 adapters:
+  arjun:
+    version: 2.2.7
+    image: security-platform/arjun@sha256:0e40a6259a32dc0881f3a58e400c6a3de17412cc74ed2b5e228d0c275f44df4f
+    profile: extended-active
+    approval: explicit-run-and-scope-required
+    timeout_seconds: 180
+    user: scanner
+    resources: {cpus: 0.5, memory: 512m, pids: 96}
+    output: json
+    capabilities: [get-parameter-discovery]
+    controls: [reviewed-20-word-wordlist, get-only, redirects-disabled, rate-limit-5, threads-2, stable-mode, no-passive-third-party-sources]
+    state: local-hardened-image
+
   ffuf:
     version: 2.3.0
     image: security-platform/ffuf:2.3.0
