@@ -72,7 +72,7 @@ def get_run(run_id: UUID) -> dict | None:
     }
 
 
-def build_command(tool_id: str, base_url: str) -> list[str]:
+def build_command(tool_id: str, base_url: str, adapter: dict | None = None) -> list[str]:
     if tool_id == "httpx":
         return [
             "-u", base_url,
@@ -98,15 +98,18 @@ def build_command(tool_id: str, base_url: str) -> list[str]:
             base_url,
         ]
     if tool_id == "nuclei-reviewed":
+        reviewed_templates = (adapter or {}).get("templates") or []
+        if not reviewed_templates:
+            raise ValueError("Nuclei reviewed template allowlist is empty")
+        template_args = [value for path in reviewed_templates for value in ("-t", f"/templates/{path}")]
         return [
             "-u", base_url,
-            "-t", "/templates",
+            *template_args,
             "-jsonl",
             "-silent",
             "-disable-update-check",
             "-disable-unsigned-templates",
             "-no-interactsh",
-            "-tags", "cve,misconfig,exposure,config",
             "-severity", "info,low,medium,high,critical",
             "-rate-limit", "5",
             "-bulk-size", "10",
@@ -427,7 +430,7 @@ def execute_run(run_id: UUID) -> None:
         cpus = float(resources.get("cpus", 0.5))
         pids = int(resources.get("pids", 128))
         timeout_seconds = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
-        command = build_command(run["tool_id"], run["base_url"])
+        command = build_command(run["tool_id"], run["base_url"], adapter)
         container = client.containers.run(
             adapter["image"],
             command=command,

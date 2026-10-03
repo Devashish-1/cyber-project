@@ -18,7 +18,11 @@ adapters:
     timeout_seconds: 1800
     resources: {cpus: 1.0, memory: 1g, pids: 256}
     output: jsonl
-    controls: [signed-templates-only, fixed-tag-allowlist, rate-limit-5, concurrency-2, no-interactsh]
+    templates:
+      - http/technologies/tech-detect.yaml
+      - http/technologies/nginx/default-nginx-page.yaml
+      - http/misconfiguration/http-missing-security-headers.yaml
+    controls: [signed-templates-only, explicit-template-allowlist, rate-limit-5, concurrency-2, no-interactsh]
     state: verified-image
 
   testssl:
