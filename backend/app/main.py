@@ -132,7 +132,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.27.2", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.28.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -172,6 +172,11 @@ class ObservationReview(BaseModel):
 class RetestCreate(BaseModel):
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
+
+
+class EmergencyStopCreate(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^STOP ALL RUNS$")
 
 
 def load_registry() -> dict:
@@ -291,6 +296,42 @@ def health() -> dict[str, str]:
 @app.get("/")
 def root() -> dict[str, str]:
     return {"service": "security-testing-platform-api", "status": "ready"}
+
+
+@app.post("/emergency-stop", status_code=202)
+def emergency_stop(payload: EmergencyStopCreate) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE runs SET
+                    status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
+                    finished_at = CASE WHEN status = 'queued' THEN NOW() ELSE finished_at END
+                WHERE status IN ('queued', 'running')
+                RETURNING id, project_id, status
+                """
+            )
+            changed = cursor.fetchall()
+            by_project: dict[UUID, list[dict]] = {}
+            for run_id, project_id, status in changed:
+                by_project.setdefault(project_id, []).append(
+                    {"run_id": str(run_id), "status": status}
+                )
+            for project_id, project_runs in by_project.items():
+                record_audit(
+                    cursor, project_id, "platform.emergency_stop", payload.requested_by,
+                    "platform", "all-runs", {"changed_runs": project_runs},
+                )
+    cache = queue_client()
+    for run_id, _, _ in changed:
+        cache.publish("security-platform:cancellations", str(run_id))
+    return {
+        "status": "stop-requested",
+        "changed": [
+            {"run_id": row[0], "project_id": row[1], "status": row[2]}
+            for row in changed
+        ],
+    }
 
 
 @app.get("/tools")
