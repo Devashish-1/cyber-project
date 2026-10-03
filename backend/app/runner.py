@@ -24,6 +24,10 @@ ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 SOURCE_HOST_ROOT = Path(os.getenv("SOURCE_HOST_ROOT", "/home/killswitch/security-platform/data/sources"))
+SEMGREP_RULES_HOST_PATH = os.getenv(
+    "SEMGREP_RULES_HOST_PATH",
+    "/home/killswitch/security-platform/config/semgrep-reviewed.yaml",
+)
 NUCLEI_TEMPLATES_HOST_PATH = os.getenv(
     "NUCLEI_TEMPLATES_HOST_PATH",
     "/home/killswitch/security-platform/config/templates/nuclei-upstream",
@@ -130,6 +134,25 @@ def build_command(
             "--report-format", "json",
             "--report-path=-",
             "--exit-code", "1",
+        ]
+    if tool_id == "semgrep":
+        return [
+            "semgrep", "scan",
+            "--config", "/rules/semgrep-reviewed.yaml",
+            "--json",
+            "--quiet",
+            "--metrics", "off",
+            "--disable-version-check",
+            "--jobs", "1",
+            "--timeout", "5",
+            "--timeout-threshold", "3",
+            "--max-memory", "768",
+            "--max-target-bytes", "1000000",
+            "--exclude", ".git",
+            "--exclude", "node_modules",
+            "--exclude", "vendor",
+            "--exclude", "*.min.js",
+            "/src",
         ]
     if tool_id == "httpx":
         return [
@@ -838,6 +861,42 @@ def write_gitleaks_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    sanitized_results = []
+    for result in payload.get("results", []) if isinstance(payload, dict) else []:
+        extra = result.get("extra") or {}
+        sanitized_results.append(
+            {
+                "check_id": result.get("check_id"),
+                "path": result.get("path"),
+                "start": {
+                    "line": (result.get("start") or {}).get("line"),
+                    "col": (result.get("start") or {}).get("col"),
+                },
+                "end": {
+                    "line": (result.get("end") or {}).get("line"),
+                    "col": (result.get("end") or {}).get("col"),
+                },
+                "extra": {
+                    "message": extra.get("message"),
+                    "severity": extra.get("severity"),
+                    "metadata": extra.get("metadata") or {},
+                },
+            }
+        )
+    sanitized = {
+        "version": payload.get("version") if isinstance(payload, dict) else None,
+        "results": sanitized_results,
+        "errors": [
+            {"type": error.get("type"), "level": error.get("level"), "message": "[OMITTED]"}
+            for error in (payload.get("errors", []) if isinstance(payload, dict) else [])
+            if isinstance(error, dict)
+        ],
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def normalize_testssl(run_id: UUID, output_file: Path) -> int:
     severity_map = {
         "OK": "info", "INFO": "info", "LOW": "low", "MEDIUM": "medium",
@@ -943,6 +1002,67 @@ def normalize_zap(run_id: UUID, output_file: Path) -> int:
                 ON CONFLICT (run_id, fingerprint) DO UPDATE SET
                     title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
                     details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_semgrep(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for finding in report.get("results", []):
+            check_id = str(finding.get("check_id") or "semgrep-rule")[:300]
+            path = str(finding.get("path") or "source")[:2000]
+            start = finding.get("start") or {}
+            end = finding.get("end") or {}
+            line = int(start.get("line") or 0)
+            asset = f"{path}:{line}" if line else path
+            extra = finding.get("extra") or {}
+            message = str(extra.get("message") or "Static analysis finding")[:1000]
+            raw_severity = str(extra.get("severity") or "INFO").upper()
+            metadata = extra.get("metadata") or {}
+            details = {
+                "check_id": check_id,
+                "file": path,
+                "start_line": line,
+                "start_column": int(start.get("col") or 0),
+                "end_line": int(end.get("line") or line),
+                "end_column": int(end.get("col") or 0),
+                "message": message,
+                "semgrep_severity": raw_severity,
+                "cwe": metadata.get("cwe"),
+                "owasp": metadata.get("owasp"),
+                "category": metadata.get("category"),
+                "source_excerpt": "[OMITTED]",
+                "metavariables": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"semgrep|{check_id}|{path}|{line}".encode()
+            ).hexdigest()
+            records.append(
+                (
+                    uuid4(), run_id, "static-analysis", message,
+                    severity_map.get(raw_severity, "info"), asset,
+                    json.dumps(details), fingerprint,
+                )
+            )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
                 """,
                 records,
             )
@@ -1084,6 +1204,14 @@ def execute_run(run_id: UUID) -> None:
             pids_limit=pids,
             network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
+            environment=(
+                {
+                    "HOME": "/tmp/semgrep-home",
+                    "XDG_CACHE_HOME": "/tmp/semgrep-cache",
+                    "SEMGREP_SETTINGS_FILE": "/tmp/semgrep-settings.yml",
+                }
+                if run["tool_id"] == "semgrep" else None
+            ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
             entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
@@ -1112,7 +1240,13 @@ def execute_run(run_id: UUID) -> None:
                 "security-platform.tool": run["tool_id"],
             },
             volumes=(
-                {str(source_host_path): {"bind": "/src", "mode": "ro"}}
+                {
+                    str(source_host_path): {"bind": "/src", "mode": "ro"},
+                    **(
+                        {SEMGREP_RULES_HOST_PATH: {"bind": "/rules/semgrep-reviewed.yaml", "mode": "ro"}}
+                        if run["tool_id"] == "semgrep" else {}
+                    ),
+                }
                 if input_type == "source"
                 else {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
                 if run["tool_id"] == "nuclei-reviewed"
@@ -1179,11 +1313,17 @@ def execute_run(run_id: UUID) -> None:
                 write_gitleaks_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "semgrep":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_semgrep_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

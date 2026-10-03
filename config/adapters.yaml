@@ -13,6 +13,20 @@ adapters:
     controls: [read-only-source, network-disabled, redact-100-percent, no-git-history, no-remote-fetch, pinned-image]
     state: verified-image
 
+  semgrep:
+    version: 1.177.0
+    image: semgrep/semgrep@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 600
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 1g, pids: 192}
+    output: sanitized-json
+    capabilities: [reviewed-static-analysis, injection-patterns, security-misconfiguration]
+    controls: [read-only-source, reviewed-local-rules-only, network-disabled, metrics-off, version-check-disabled, jobs-1, per-file-timeout-5s, max-memory-768mb, max-target-1mb, no-code-excerpts, no-metavariables, pinned-image]
+    state: verified-image
+
   arjun:
     version: 2.2.7
     image: security-platform/arjun@sha256:0e40a6259a32dc0881f3a58e400c6a3de17412cc74ed2b5e228d0c275f44df4f
