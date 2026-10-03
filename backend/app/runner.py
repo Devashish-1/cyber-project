@@ -128,6 +128,16 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "checkov":
+        return [
+            "--directory", "/src",
+            "--output", "json",
+            "--quiet",
+            "--compact",
+            "--skip-download",
+            "--download-external-modules", "false",
+            "--soft-fail",
+        ]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -914,6 +924,80 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_checkov_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    frameworks = payload if isinstance(payload, list) else [payload]
+    sanitized = []
+    for framework in frameworks:
+        if not isinstance(framework, dict):
+            continue
+        results = framework.get("results") or {}
+        failures = []
+        for finding in results.get("failed_checks") or []:
+            if not isinstance(finding, dict):
+                continue
+            failures.append({key: finding.get(key) for key in (
+                "check_id", "bc_check_id", "check_name", "file_path",
+                "file_line_range", "resource", "guideline", "severity",
+            )})
+        sanitized.append(
+            {
+                "check_type": framework.get("check_type"),
+                "results": {"failed_checks": failures},
+                "summary": framework.get("summary") or {},
+            }
+        )
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_checkov(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for framework in report if isinstance(report, list) else [report]:
+            check_type = str(framework.get("check_type") or "iac")[:100]
+            for finding in (framework.get("results") or {}).get("failed_checks") or []:
+                check_id = str(finding.get("check_id") or finding.get("bc_check_id") or "checkov-check")[:300]
+                title = str(finding.get("check_name") or "Infrastructure-as-code issue")[:500]
+                path = str(finding.get("file_path") or "source")[:2000]
+                line_range = finding.get("file_line_range") or []
+                start_line = int(line_range[0]) if line_range else 0
+                asset = f"{path}:{start_line}" if start_line else path
+                raw_severity = str(finding.get("severity") or "MEDIUM").upper()
+                details = {
+                    "finding": title,
+                    "check_id": check_id,
+                    "framework": check_type,
+                    "resource": finding.get("resource"),
+                    "file": path,
+                    "start_line": start_line,
+                    "end_line": int(line_range[-1]) if line_range else start_line,
+                    "guideline": finding.get("guideline"),
+                    "source_excerpt": "[OMITTED]",
+                }
+                fingerprint = hashlib.sha256(f"checkov|{check_type}|{check_id}|{path}|{finding.get('resource')}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "iac-misconfiguration", title, severity_map.get(raw_severity, "medium"), asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
         result = container.exec_run(["cat", container_path])
@@ -1374,6 +1458,8 @@ def execute_run(run_id: UUID) -> None:
                     "SEMGREP_SETTINGS_FILE": "/tmp/semgrep-settings.yml",
                 }
                 if run["tool_id"] == "semgrep" else
+                {"HOME": "/tmp/checkov-home", "USER": "scanner"}
+                if run["tool_id"] == "checkov" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
@@ -1495,6 +1581,12 @@ def execute_run(run_id: UUID) -> None:
                 write_semgrep_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "checkov":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_checkov_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
@@ -1503,7 +1595,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
