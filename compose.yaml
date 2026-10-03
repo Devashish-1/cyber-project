@@ -35,13 +35,18 @@ services:
       context: ./backend
       network: host
     restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       TOOL_REGISTRY_PATH: /app/config/tools.yaml
       ADAPTERS_PATH: /app/config/adapters.yaml
+      EVIDENCE_ROOT: /evidence/runs
+      SOURCE_ROOT: /sources
     volumes:
       - ./config:/app/config:ro
+      - ./evidence:/evidence:ro
+      - ./data/sources:/sources
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +59,39 @@ services:
       retries: 5
     mem_limit: 1g
     cpus: 1.0
+
+  runner:
+    build:
+      context: ./backend
+      network: host
+    restart: unless-stopped
+    command: ["python", "-m", "app.runner"]
+    user: "${LOCAL_UID:-1000}:${DOCKER_GID:-999}"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      ADAPTERS_PATH: /app/config/adapters.yaml
+      EVIDENCE_ROOT: /evidence/runs
+      SOURCE_ROOT: /sources
+      SOURCE_HOST_ROOT: /home/killswitch/security-platform/data/sources
+    volumes:
+      - ./config:/app/config:ro
+      - ./evidence:/evidence
+      - ./data/sources:/sources:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    mem_limit: 512m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
 
   dashboard:
     image: nginx:1.29-alpine

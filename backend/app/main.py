@@ -1,15 +1,18 @@
 import json
+import hashlib
 import os
 import shutil
+import stat
 import time
+import zipfile
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
 
 import psycopg
 import redis
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
@@ -27,6 +30,10 @@ RUN_PLANS = {
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti"],
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
+MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
+MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
+MAX_SOURCE_FILES = 5_000
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
@@ -115,6 +122,20 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS audit_events_project_created_idx
                     ON audit_events(project_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS source_artifacts (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    compressed_size BIGINT NOT NULL,
+                    extracted_size BIGINT NOT NULL,
+                    file_count INTEGER NOT NULL,
+                    authorization_reference TEXT NOT NULL,
+                    authorization_confirmed BOOLEAN NOT NULL CHECK (authorization_confirmed),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS source_artifacts_project_created_idx
+                    ON source_artifacts(project_id, created_at DESC);
                 CREATE OR REPLACE FUNCTION prevent_audit_event_mutation()
                 RETURNS trigger AS $$
                 BEGIN
@@ -132,10 +153,11 @@ def init_database() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_database()
+    SOURCE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.29.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.30.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -429,6 +451,148 @@ def list_projects() -> dict:
     return {
         "projects": [
             {"id": row[0], "name": row[1], "description": row[2], "created_at": row[3]}
+            for row in rows
+        ]
+    }
+
+
+@app.post("/projects/{project_id}/source-artifacts", status_code=201)
+async def upload_source_artifact(
+    project_id: UUID,
+    archive: UploadFile = File(...),
+    requested_by: str = Form(..., min_length=2, max_length=120),
+    authorization_reference: str = Form(..., min_length=3, max_length=500),
+    authorization_confirmed: bool = Form(...),
+) -> dict:
+    if not authorization_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit source authorization confirmation is required")
+    filename = Path(archive.filename or "").name
+    if not filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=422, detail="Only ZIP source archives are accepted")
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+    artifact_id = uuid4()
+    artifact_root = SOURCE_ROOT / str(artifact_id)
+    archive_path = artifact_root / "upload.zip"
+    content_root = artifact_root / "content"
+    artifact_root.mkdir(mode=0o700)
+    digest = hashlib.sha256()
+    compressed_size = 0
+    extracted_size = 0
+    file_count = 0
+    try:
+        with archive_path.open("xb") as destination:
+            while chunk := await archive.read(1024 * 1024):
+                compressed_size += len(chunk)
+                if compressed_size > MAX_SOURCE_ARCHIVE_BYTES:
+                    raise HTTPException(status_code=413, detail="Source archive exceeds 25 MiB limit")
+                digest.update(chunk)
+                destination.write(chunk)
+
+        content_root.mkdir(mode=0o700)
+        with zipfile.ZipFile(archive_path) as source_zip:
+            for info in source_zip.infolist():
+                member = PurePosixPath(info.filename)
+                if (
+                    not info.filename
+                    or "\\" in info.filename
+                    or member.is_absolute()
+                    or ".." in member.parts
+                    or (member.parts and ":" in member.parts[0])
+                ):
+                    raise HTTPException(status_code=422, detail="Archive contains an unsafe path")
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise HTTPException(status_code=422, detail="Archive symlinks are not accepted")
+                if info.is_dir():
+                    continue
+                file_count += 1
+                extracted_size += info.file_size
+                if file_count > MAX_SOURCE_FILES:
+                    raise HTTPException(status_code=413, detail="Archive exceeds 5,000-file limit")
+                if extracted_size > MAX_SOURCE_EXTRACTED_BYTES:
+                    raise HTTPException(status_code=413, detail="Expanded source exceeds 250 MiB limit")
+                destination_path = content_root.joinpath(*member.parts)
+                destination_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                actual_size = 0
+                with source_zip.open(info) as source, destination_path.open("xb") as destination:
+                    while chunk := source.read(1024 * 1024):
+                        actual_size += len(chunk)
+                        if actual_size > info.file_size or extracted_size - info.file_size + actual_size > MAX_SOURCE_EXTRACTED_BYTES:
+                            raise HTTPException(status_code=413, detail="Expanded source exceeds declared limits")
+                        destination.write(chunk)
+                destination_path.chmod(0o600)
+        archive_path.unlink()
+        if file_count == 0:
+            raise HTTPException(status_code=422, detail="Source archive contains no files")
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO source_artifacts
+                        (id, project_id, filename, sha256, compressed_size, extracted_size,
+                         file_count, authorization_reference, authorization_confirmed)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                    """,
+                    (
+                        artifact_id, project_id, filename, digest.hexdigest(), compressed_size,
+                        extracted_size, file_count, authorization_reference,
+                    ),
+                )
+                record_audit(
+                    cursor, project_id, "source_artifact.authorized", requested_by,
+                    "source_artifact", artifact_id,
+                    {"filename": filename, "sha256": digest.hexdigest(), "file_count": file_count},
+                )
+    except HTTPException:
+        shutil.rmtree(artifact_root, ignore_errors=True)
+        raise
+    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+        shutil.rmtree(artifact_root, ignore_errors=True)
+        raise HTTPException(status_code=422, detail="Invalid or unreadable ZIP archive") from exc
+    finally:
+        await archive.close()
+
+    return {
+        "id": artifact_id,
+        "project_id": project_id,
+        "filename": filename,
+        "sha256": digest.hexdigest(),
+        "compressed_size": compressed_size,
+        "extracted_size": extracted_size,
+        "file_count": file_count,
+        "authorization_reference": authorization_reference,
+    }
+
+
+@app.get("/projects/{project_id}/source-artifacts")
+def list_source_artifacts(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, filename, sha256, compressed_size, extracted_size,
+                       file_count, authorization_reference, created_at
+                FROM source_artifacts
+                WHERE project_id = %s
+                ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {
+        "artifacts": [
+            {
+                "id": row[0], "filename": row[1], "sha256": row[2],
+                "compressed_size": row[3], "extracted_size": row[4],
+                "file_count": row[5], "authorization_reference": row[6],
+                "created_at": row[7],
+            }
             for row in rows
         ]
     }

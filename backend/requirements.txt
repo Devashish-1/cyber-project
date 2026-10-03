@@ -3,3 +3,5 @@ uvicorn[standard]==0.53.0
 redis==8.1.0
 psycopg[binary]==3.3.6
 PyYAML==6.0.3
+docker==7.1.0
+python-multipart==0.0.22
