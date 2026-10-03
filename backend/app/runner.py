@@ -1,6 +1,7 @@
 import json
 import hashlib
 import ipaddress
+import re
 import io
 import os
 import tarfile
@@ -138,6 +139,16 @@ def build_command(tool_id: str, base_url: str, adapter: dict | None = None) -> l
             "-rate-limit", "5",
             "-timeout", "15",
             "-max-time", "5",
+        ]
+    if tool_id == "nikto":
+        return [
+            "-h", base_url,
+            "-Tuning", "123",
+            "-maxtime", "5m",
+            "-Pause", "0.05",
+            "-nointeractive",
+            "-nocheck",
+            "-Display", "E",
         ]
     if tool_id == "zap-baseline":
         return [
@@ -281,6 +292,47 @@ def normalize_subfinder(run_id: UUID, output_file: Path) -> int:
             fingerprint = hashlib.sha256(f"subdomain|{hostname}".encode()).hexdigest()
             records.append((uuid4(), run_id, "subdomain", "Subdomain discovered", "info", hostname, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_nikto(run_id: UUID, output_file: Path) -> int:
+    finding_pattern = re.compile(r"^\+ \[(?P<test_id>[^]]+)\] (?P<path>\S+): (?P<message>.+)$")
+    target = "HTTP target"
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if line.startswith("+ Target Hostname:"):
+                target = line.split(":", 1)[1].strip()[:2000]
+                continue
+            match = finding_pattern.match(line)
+            if not match:
+                continue
+            test_id = match.group("test_id")[:200]
+            path = match.group("path")[:2000]
+            message = match.group("message")[:4000]
+            asset = f"{target}{path}"[:2000]
+            severity = "low" if "missing" in message.lower() or "misconfig" in message.lower() else "info"
+            details = {"test_id": test_id, "path": path, "message": message}
+            fingerprint = hashlib.sha256(f"nikto|{test_id}|{asset}|{message}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "nikto-finding", "Nikto web-server finding", severity, asset, json.dumps(details), fingerprint))
+    except OSError:
         return 0
     if not records:
         return 0
@@ -571,7 +623,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

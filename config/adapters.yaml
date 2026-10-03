@@ -22,6 +22,18 @@ adapters:
     capabilities: [status-code, title, technology, tls, redirect, ip, cname]
     state: verified-image
 
+  nikto:
+    version: 2.6.1
+    image: ghcr.io/sullo/nikto@sha256:f65dd97be358e8260d97a00e784c05c5f37d2ed69b9a9611b14d3889c2b54efa
+    profile: controlled-active
+    approval: scope-required
+    timeout_seconds: 360
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: text-normalized
+    capabilities: [interesting-files, misconfiguration, information-disclosure]
+    controls: [tuning-1-2-3-only, pause-50ms, max-time-5-minutes, no-update, no-interactive]
+    state: verified-image
+
   nuclei-reviewed:
     version: v3.11.1
     image: projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
