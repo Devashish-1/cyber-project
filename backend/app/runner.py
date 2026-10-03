@@ -97,11 +97,29 @@ def build_command(
             "-title",
             "-tech-detect",
             "-tls-grab",
-            "-follow-redirects",
+            "-follow-host-redirects",
             "-max-redirects", "3",
             "-rate-limit", "5",
             "-timeout", "10",
             "-retries", "1",
+        ]
+    if tool_id == "naabu":
+        hostname = urlsplit(base_url).hostname
+        if not hostname:
+            raise ValueError("Naabu target does not contain a hostname")
+        return [
+            "-host", hostname,
+            "-scan-type", "c",
+            "-top-ports", "100",
+            "-rate", "50",
+            "-c", "5",
+            "-timeout", "1000",
+            "-retries", "1",
+            "-verify",
+            "-Pn",
+            "-json",
+            "-silent",
+            "-disable-update-check",
         ]
     if tool_id == "testssl":
         return [
@@ -271,6 +289,48 @@ def normalize_httpx(run_id: UUID, output_file: Path) -> int:
             fingerprint = hashlib.sha256(f"http-service|{asset}".encode()).hexdigest()
             records.append((uuid4(), run_id, "http-service", "HTTP service observed", "info", asset, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_naabu(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            host = str(item.get("host") or item.get("ip") or "")[:1000]
+            ip = str(item.get("ip") or host)[:1000]
+            port = int(item.get("port") or 0)
+            if not host or not (1 <= port <= 65535):
+                continue
+            asset = f"{host}:{port}"[:2000]
+            details = {
+                "host": host,
+                "ip": ip,
+                "port": port,
+                "protocol": item.get("protocol") or "tcp",
+                "tls": bool(item.get("tls")),
+            }
+            fingerprint = hashlib.sha256(f"open-port|{ip}|{port}|tcp".encode()).hexdigest()
+            records.append((uuid4(), run_id, "open-port", "TCP port observed open", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return 0
     if not records:
         return 0
@@ -710,6 +770,13 @@ def execute_run(run_id: UUID) -> None:
     if not run["authorization_confirmed"]:
         set_status(run_id, "failed", "Target authorization is not confirmed")
         return
+    target_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    allowed_hosts = {
+        str(host).lower().rstrip(".") for host in (run["allowed_hosts"] or [])
+    }
+    if not target_host or target_host not in allowed_hosts:
+        set_status(run_id, "failed", "Target host is not present in the saved allowed-host scope")
+        return
 
     adapter = load_adapters().get(run["tool_id"])
     if adapter is None or adapter.get("profile") != run["profile"]:
@@ -779,7 +846,7 @@ def execute_run(run_id: UUID) -> None:
                             "/root/.config": "rw,nosuid,nodev,noexec,size=16m",
                             "/root/.cache": "rw,nosuid,nodev,noexec,size=64m",
                         }
-                        if run["tool_id"] in {"katana", "nuclei-reviewed", "subfinder"}
+                        if run["tool_id"] in {"katana", "naabu", "nuclei-reviewed", "subfinder"}
                         else {}
                     ),
                     **(
@@ -846,7 +913,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

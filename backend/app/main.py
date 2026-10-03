@@ -17,11 +17,11 @@ ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
-RUNNER_IMPLEMENTED_TOOLS = {"ffuf", "httpx", "katana", "nikto", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"ffuf", "httpx", "katana", "naabu", "nikto", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
-    "controlled-web": ["httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
-    "extended-web": ["httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti"],
+    "controlled-web": ["naabu", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
+    "extended-web": ["naabu", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti"],
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 MAX_EVIDENCE_BYTES = 1_048_576
@@ -132,7 +132,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.24.1", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.25.1", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -357,6 +357,10 @@ def list_projects() -> dict:
 def create_target(project_id: UUID, payload: TargetCreate) -> dict:
     if not payload.authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit target authorization confirmation is required")
+    base_host = (payload.base_url.host or "").lower().rstrip(".")
+    normalized_allowed_hosts = {host.lower().rstrip(".") for host in payload.allowed_hosts}
+    if not base_host or base_host not in normalized_allowed_hosts:
+        raise HTTPException(status_code=422, detail="Base URL host must be present in allowed_hosts")
 
     target_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:

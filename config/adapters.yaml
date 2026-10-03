@@ -34,6 +34,18 @@ adapters:
     capabilities: [status-code, title, technology, tls, redirect, ip, cname]
     state: verified-image
 
+  naabu:
+    version: v2.6.1
+    image: projectdiscovery/naabu@sha256:0b7efcd6eb4bf7be2c5cfb2bbfe091a132df0e442e549267bca818a4cef15ea4
+    profile: controlled-active
+    approval: host-scope-required
+    timeout_seconds: 180
+    resources: {cpus: 0.5, memory: 512m, pids: 128}
+    output: jsonl
+    capabilities: [tcp-connect-port-discovery]
+    controls: [single-authorized-host, tcp-connect-only, top-100-ports, rate-limit-50, concurrency-5, tcp-verification, no-service-exploitation]
+    state: verified-image
+
   katana:
     version: v1.7.0
     image: projectdiscovery/katana@sha256:4e9fce12c507e1ca455baf493e14b899db5f2e0ed22ba62591aa42300487a947
