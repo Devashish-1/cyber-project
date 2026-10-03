@@ -1,3 +1,4 @@
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +14,13 @@ from pydantic import BaseModel, Field, HttpUrl
 REGISTRY_PATH = Path(os.getenv("TOOL_REGISTRY_PATH", "/app/config/tools.yaml"))
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
+REDIS_URL = os.environ["REDIS_URL"]
+RUN_QUEUE = "security-platform:runs"
+RUNNER_IMPLEMENTED_TOOLS = {"httpx", "testssl", "zap-baseline", "zap-full"}
+EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+MAX_EVIDENCE_BYTES = 1_048_576
+MAX_EVIDENCE_LINES = 200
+SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
 
 
 def init_database() -> None:
@@ -36,6 +44,43 @@ def init_database() -> None:
                     authorization_confirmed BOOLEAN NOT NULL CHECK (authorization_confirmed),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS runs (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+                    tool_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancelling', 'cancelled', 'succeeded', 'failed')),
+                    requested_by TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS runs_project_created_idx
+                    ON runs(project_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS observations (
+                    id UUID PRIMARY KEY,
+                    run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    observation_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    severity TEXT NOT NULL CHECK (severity IN ('info', 'low', 'medium', 'high', 'critical')),
+                    asset TEXT NOT NULL,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    fingerprint TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (run_id, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS observations_run_created_idx
+                    ON observations(run_id, created_at);
+                ALTER TABLE observations
+                    ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'new';
+                ALTER TABLE observations
+                    ADD COLUMN IF NOT EXISTS review_notes TEXT NOT NULL DEFAULT '';
+                ALTER TABLE observations
+                    ADD COLUMN IF NOT EXISTS reviewed_by TEXT;
+                ALTER TABLE observations
+                    ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
                 """
             )
 
@@ -46,7 +91,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.12.3", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -62,9 +107,86 @@ class TargetCreate(BaseModel):
     authorization_confirmed: bool
 
 
+class RunCreate(BaseModel):
+    target_id: UUID
+    tool_id: str = Field(min_length=1, max_length=100)
+    profile: str = Field(min_length=1, max_length=100)
+    requested_by: str = Field(min_length=2, max_length=120)
+    approval_confirmed: bool
+
+
+class ObservationReview(BaseModel):
+    status: str = Field(pattern="^(new|confirmed|false_positive|accepted_risk|resolved)$")
+    reviewed_by: str = Field(min_length=2, max_length=120)
+    notes: str = Field(default="", max_length=2000)
+
+
 def load_registry() -> dict:
     with REGISTRY_PATH.open("r", encoding="utf-8") as registry_file:
         return yaml.safe_load(registry_file)
+
+
+def load_adapters() -> dict:
+    with ADAPTERS_PATH.open("r", encoding="utf-8") as adapters_file:
+        return yaml.safe_load(adapters_file)
+
+
+def queue_client() -> redis.Redis:
+    return redis.from_url(REDIS_URL, socket_connect_timeout=3, decode_responses=True)
+
+
+def run_row(row: tuple) -> dict:
+    return {
+        "id": row[0],
+        "project_id": row[1],
+        "target_id": row[2],
+        "tool_id": row[3],
+        "profile": row[4],
+        "status": row[5],
+        "requested_by": row[6],
+        "error_message": row[7],
+        "created_at": row[8],
+        "started_at": row[9],
+        "finished_at": row[10],
+    }
+
+
+def sanitize_evidence(value):
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if key.lower() in SENSITIVE_KEYS else sanitize_evidence(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_evidence(item) for item in value]
+    return value
+
+
+def read_json_file(path: Path) -> dict:
+    if not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
+        return {}
+    try:
+        return sanitize_evidence(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {}
+
+
+def read_jsonl_file(path: Path) -> list[dict]:
+    if not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
+        return []
+    records = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if len(records) >= MAX_EVIDENCE_LINES:
+                    break
+                try:
+                    records.append(sanitize_evidence(json.loads(line)))
+                except json.JSONDecodeError:
+                    records.append({"message": "Non-JSON output omitted"})
+    except (UnicodeDecodeError, OSError):
+        return []
+    return records
 
 
 @app.get("/health")
@@ -74,7 +196,7 @@ def health() -> dict[str, str]:
             cursor.execute("SELECT 1")
             cursor.fetchone()
 
-    cache = redis.from_url(os.environ["REDIS_URL"], socket_connect_timeout=3)
+    cache = queue_client()
     cache.ping()
     return {"status": "ok", "database": "ok", "queue": "ok"}
 
@@ -98,8 +220,8 @@ def profiles() -> dict:
 
 @app.get("/adapters")
 def adapters() -> dict:
-    with ADAPTERS_PATH.open("r", encoding="utf-8") as adapters_file:
-        return yaml.safe_load(adapters_file)
+    configured = load_adapters().get("adapters", {})
+    return {"adapters": {name: value for name, value in configured.items() if name in RUNNER_IMPLEMENTED_TOOLS}}
 
 
 @app.post("/projects", status_code=201)
@@ -180,4 +302,185 @@ def list_targets(project_id: UUID) -> dict:
             }
             for row in rows
         ]
+    }
+
+
+@app.post("/projects/{project_id}/runs", status_code=202)
+def create_run(project_id: UUID, payload: RunCreate) -> dict:
+    if not payload.approval_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit run approval is required")
+
+    registry = load_registry()
+    adapters = load_adapters().get("adapters", {})
+    tool = registry.get("tools", {}).get(payload.tool_id)
+    profile = registry.get("profiles", {}).get(payload.profile)
+    adapter = adapters.get(payload.tool_id)
+
+    if tool is None:
+        raise HTTPException(status_code=422, detail="Unknown tool")
+    if profile is None:
+        raise HTTPException(status_code=422, detail="Unknown execution profile")
+    if tool.get("execution") in {"disabled", "manual"}:
+        raise HTTPException(status_code=422, detail="Tool is not available for automated execution")
+    if adapter is None:
+        raise HTTPException(status_code=422, detail="Tool adapter is not implemented yet")
+    if payload.tool_id not in RUNNER_IMPLEMENTED_TOOLS:
+        raise HTTPException(status_code=422, detail="Tool runner is not implemented yet")
+    if adapter.get("profile") != payload.profile:
+        raise HTTPException(status_code=422, detail="Tool is not approved for the selected profile")
+
+    run_id = uuid4()
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT authorization_confirmed
+                FROM targets
+                WHERE id = %s AND project_id = %s
+                """,
+                (payload.target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Target not found in project")
+            if not target[0]:
+                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            cursor.execute(
+                """
+                INSERT INTO runs
+                    (id, project_id, target_id, tool_id, profile, status, requested_by)
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s)
+                """,
+                (run_id, project_id, payload.target_id, payload.tool_id, payload.profile, payload.requested_by),
+            )
+
+    queue_client().rpush(RUN_QUEUE, str(run_id))
+    return {"id": run_id, "status": "queued", **payload.model_dump(mode="json")}
+
+
+@app.get("/projects/{project_id}/runs")
+def list_runs(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, project_id, target_id, tool_id, profile, status,
+                       requested_by, error_message, created_at, started_at, finished_at
+                FROM runs WHERE project_id = %s ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {"runs": [run_row(row) for row in rows]}
+
+
+@app.get("/runs/{run_id}")
+def get_run(run_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, project_id, target_id, tool_id, profile, status,
+                       requested_by, error_message, created_at, started_at, finished_at
+                FROM runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run_row(row)
+
+
+@app.post("/runs/{run_id}/cancel", status_code=202)
+def cancel_run(run_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM runs WHERE id = %s FOR UPDATE", (run_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if row[0] in {"cancelled", "succeeded", "failed"}:
+                raise HTTPException(status_code=409, detail=f"Run is already {row[0]}")
+            next_status = "cancelled" if row[0] == "queued" else "cancelling"
+            cursor.execute(
+                "UPDATE runs SET status = %s, finished_at = CASE WHEN %s = 'cancelled' THEN NOW() ELSE finished_at END WHERE id = %s",
+                (next_status, next_status, run_id),
+            )
+    queue_client().publish("security-platform:cancellations", str(run_id))
+    return {"id": run_id, "status": next_status}
+
+
+@app.get("/runs/{run_id}/evidence")
+def get_run_evidence(run_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run_directory = EVIDENCE_ROOT / str(run_id)
+    return {
+        "run_id": run_id,
+        "status": row[0],
+        "metadata": read_json_file(run_directory / "metadata.json"),
+        "events": read_jsonl_file(run_directory / "events.jsonl"),
+        "output": read_jsonl_file(run_directory / "output.jsonl"),
+        "limits": {"max_bytes_per_file": MAX_EVIDENCE_BYTES, "max_lines_per_file": MAX_EVIDENCE_LINES},
+    }
+
+
+@app.get("/runs/{run_id}/observations")
+def get_run_observations(run_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+            run = cursor.fetchone()
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            cursor.execute(
+                """
+                SELECT id, observation_type, title, severity, asset, details, fingerprint, created_at,
+                       review_status, review_notes, reviewed_by, reviewed_at
+                FROM observations WHERE run_id = %s ORDER BY created_at, id
+                """,
+                (run_id,),
+            )
+            rows = cursor.fetchall()
+    return {
+        "run_id": run_id,
+        "status": run[0],
+        "observations": [
+            {
+                "id": row[0], "type": row[1], "title": row[2], "severity": row[3],
+                "asset": row[4], "details": sanitize_evidence(row[5]),
+                "fingerprint": row[6], "created_at": row[7],
+                "review_status": row[8], "review_notes": row[9],
+                "reviewed_by": row[10], "reviewed_at": row[11],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.patch("/observations/{observation_id}")
+def review_observation(observation_id: UUID, payload: ObservationReview) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE observations
+                SET review_status = %s, review_notes = %s, reviewed_by = %s, reviewed_at = NOW()
+                WHERE id = %s
+                RETURNING run_id, review_status, review_notes, reviewed_by, reviewed_at
+                """,
+                (payload.status, payload.notes, payload.reviewed_by, observation_id),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    return {
+        "id": observation_id, "run_id": row[0], "review_status": row[1],
+        "review_notes": row[2], "reviewed_by": row[3], "reviewed_at": row[4],
     }

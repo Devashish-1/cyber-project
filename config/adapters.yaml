@@ -34,11 +34,22 @@ adapters:
 
   zap-baseline:
     version: 2.17.0
-    image: ghcr.io/zaproxy/zaproxy@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef
+    image: security-platform/zap-runner:2.17.0
     profile: observe
     approval: scope-required
     timeout_seconds: 1200
     resources: {cpus: 1.5, memory: 4g, pids: 512}
     output: [json, html]
     controls: [baseline-only, passive-rules, spider-time-limit, no-active-scan]
-    state: verified-image
+    state: local-hardened-image
+
+  zap-full:
+    version: 2.17.0
+    image: security-platform/zap-runner:2.17.0
+    profile: extended-active
+    approval: explicit-run-and-scope-required
+    timeout_seconds: 1200
+    resources: {cpus: 2.0, memory: 6g, pids: 512}
+    output: json
+    controls: [active-scan, spider-time-limit, total-time-limit, rate-bounded, operator-cancellable]
+    state: local-hardened-image

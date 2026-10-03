@@ -1,0 +1,459 @@
+import json
+import hashlib
+import io
+import os
+import tarfile
+import time
+from pathlib import Path
+from uuid import UUID
+from uuid import uuid4
+
+import docker
+import psycopg
+import redis
+import yaml
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+REDIS_URL = os.environ["REDIS_URL"]
+ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
+EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+RUN_QUEUE = "security-platform:runs"
+POLL_SECONDS = 1.0
+
+
+def load_adapters() -> dict:
+    with ADAPTERS_PATH.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle).get("adapters", {})
+
+
+def set_status(run_id: UUID, status: str, error: str | None = None) -> None:
+    timestamps = {
+        "running": "started_at = NOW()",
+        "cancelled": "finished_at = NOW()",
+        "succeeded": "finished_at = NOW()",
+        "failed": "finished_at = NOW()",
+    }
+    timestamp = timestamps.get(status, "finished_at = finished_at")
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE runs SET status = %s, error_message = %s, {timestamp} WHERE id = %s",
+                (status, error, run_id),
+            )
+
+
+def get_run(run_id: UUID) -> dict | None:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT r.status, r.tool_id, r.profile, t.base_url, t.allowed_hosts,
+                       t.excluded_paths, t.authorization_confirmed
+                FROM runs r JOIN targets t ON t.id = r.target_id
+                WHERE r.id = %s
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "status": row[0],
+        "tool_id": row[1],
+        "profile": row[2],
+        "base_url": row[3],
+        "allowed_hosts": row[4],
+        "excluded_paths": row[5],
+        "authorization_confirmed": row[6],
+    }
+
+
+def build_command(tool_id: str, base_url: str) -> list[str]:
+    if tool_id == "httpx":
+        return [
+            "-u", base_url,
+            "-silent",
+            "-json",
+            "-status-code",
+            "-title",
+            "-tech-detect",
+            "-tls-grab",
+            "-follow-redirects",
+            "-max-redirects", "3",
+            "-rate-limit", "5",
+            "-timeout", "10",
+            "-retries", "1",
+        ]
+    if tool_id == "testssl":
+        return [
+            "--quiet",
+            "--warnings", "batch",
+            "--connect-timeout", "10",
+            "--openssl-timeout", "10",
+            "-oJ", "/tmp/testssl.json",
+            base_url,
+        ]
+    if tool_id == "zap-baseline":
+        return [
+            "-t", base_url,
+            "-J", "report.json",
+            "-m", "1",
+            "-T", "5",
+            "-I",
+            "-s",
+            "--autooff",
+        ]
+    if tool_id == "zap-full":
+        return [
+            "-t", base_url,
+            "-J", "report.json",
+            "-m", "2",
+            "-T", "15",
+            "-I",
+            "-s",
+        ]
+    raise ValueError(f"Runner does not implement adapter: {tool_id}")
+
+
+def append_event(event_file: Path, event: dict) -> None:
+    event_file.parent.mkdir(parents=True, exist_ok=True)
+    with event_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def normalize_httpx(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            asset = str(item.get("url") or item.get("input") or "")[:2000]
+            if not asset:
+                continue
+            details = {
+                "status_code": item.get("status_code"),
+                "title": item.get("title"),
+                "webserver": item.get("webserver"),
+                "content_type": item.get("content_type"),
+                "host_ip": item.get("host_ip"),
+                "port": item.get("port"),
+                "technologies": item.get("tech") or [],
+            }
+            fingerprint = hashlib.sha256(f"http-service|{asset}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "http-service", "HTTP service observed", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def capture_testssl_output(container, output_file: Path) -> None:
+    stream, _ = container.get_archive("/tmp")
+    archive = io.BytesIO(b"".join(stream))
+    with tarfile.open(fileobj=archive, mode="r:*") as tar:
+        member = next((item for item in tar.getmembers() if item.isfile() and item.name.lower().endswith(".json")), None)
+        if member is None:
+            raise RuntimeError("testssl JSON output was not found in /tmp")
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise RuntimeError("testssl JSON output could not be read")
+        payload = json.loads(extracted.read().decode("utf-8"))
+    records = payload if isinstance(payload, list) else [payload]
+    output_file.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def capture_json_output(container, container_path: str, output_file: Path) -> None:
+    stream, _ = container.get_archive(container_path)
+    archive = io.BytesIO(b"".join(stream))
+    with tarfile.open(fileobj=archive, mode="r:*") as tar:
+        member = next((item for item in tar.getmembers() if item.isfile()), None)
+        if member is None:
+            raise RuntimeError(f"JSON output was not found: {container_path}")
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise RuntimeError(f"JSON output could not be read: {container_path}")
+        payload = json.loads(extracted.read().decode("utf-8"))
+    output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_testssl(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "OK": "info", "INFO": "info", "LOW": "low", "MEDIUM": "medium",
+        "HIGH": "high", "CRITICAL": "critical", "WARN": "low",
+    }
+    records = []
+
+    def checks(value, path=()):
+        if isinstance(value, dict):
+            if all(key in value for key in ("id", "severity", "finding")):
+                yield path, value
+                return
+            for key, child in value.items():
+                yield from checks(child, path + (str(key),))
+        elif isinstance(value, list):
+            for child in value:
+                yield from checks(child, path)
+
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            report = json.loads(raw_line)
+            for target in report.get("scanResult", []):
+                host = str(target.get("targetHost") or target.get("ip") or "TLS target")
+                port = str(target.get("port") or "443")
+                asset = f"{host}:{port}"[:2000]
+                for path, item in checks(target):
+                    check_id = str(item.get("id") or "tls-check")[:200]
+                    category = next((part for part in path if part not in {"scanResult"}), "general")[:100]
+                    finding = str(item.get("finding") or "TLS check result")[:4000]
+                    raw_severity = str(item.get("severity") or "INFO").upper()
+                    severity = severity_map.get(raw_severity, "info")
+                    details = {
+                        "category": category,
+                        "finding": finding,
+                        "testssl_severity": raw_severity,
+                        "target_host": host,
+                        "target_ip": target.get("ip"),
+                        "port": port,
+                    }
+                    fingerprint = hashlib.sha256(f"testssl|{category}|{check_id}|{asset}".encode()).hexdigest()
+                    records.append((uuid4(), run_id, "tls-check", f"TLS {category}: {check_id}", severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_zap(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for site in report.get("site", []):
+            asset = str(site.get("@name") or site.get("@host") or "HTTP target")[:2000]
+            for alert in site.get("alerts", []):
+                plugin_id = str(alert.get("pluginid") or alert.get("alertRef") or "zap-alert")[:200]
+                title = str(alert.get("alert") or alert.get("name") or "ZAP passive alert")[:500]
+                severity = severity_map.get(str(alert.get("riskcode") or "0"), "info")
+                instances = [
+                    {"uri": item.get("uri"), "method": item.get("method"), "param": item.get("param")}
+                    for item in alert.get("instances", [])[:20]
+                ]
+                details = {
+                    "plugin_id": plugin_id,
+                    "risk": alert.get("riskdesc"),
+                    "confidence": alert.get("confidence"),
+                    "description": alert.get("desc"),
+                    "solution": alert.get("solution"),
+                    "reference": alert.get("reference"),
+                    "cwe_id": alert.get("cweid"),
+                    "wasc_id": alert.get("wascid"),
+                    "instances": instances,
+                }
+                fingerprint = hashlib.sha256(f"zap|{plugin_id}|{asset}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "zap-passive", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def execute_run(run_id: UUID) -> None:
+    run = get_run(run_id)
+    if run is None or run["status"] != "queued":
+        return
+    if not run["authorization_confirmed"]:
+        set_status(run_id, "failed", "Target authorization is not confirmed")
+        return
+
+    adapter = load_adapters().get(run["tool_id"])
+    if adapter is None or adapter.get("profile") != run["profile"]:
+        set_status(run_id, "failed", "Adapter policy mismatch")
+        return
+
+    run_dir = EVIDENCE_ROOT / str(run_id)
+    output_file = run_dir / "output.jsonl"
+    event_file = run_dir / "events.jsonl"
+    metadata_file = run_dir / "metadata.json"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata_file.write_text(
+        json.dumps(
+            {
+                "run_id": str(run_id),
+                "tool_id": run["tool_id"],
+                "profile": run["profile"],
+                "target": run["base_url"],
+                "image": adapter["image"],
+                "allowed_hosts": run["allowed_hosts"],
+                "excluded_paths": run["excluded_paths"],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    set_status(run_id, "running")
+    append_event(event_file, {"event": "started", "time": time.time()})
+    client = None
+    container = None
+    try:
+        client = docker.from_env()
+        resources = adapter.get("resources", {})
+        memory = resources.get("memory", "512m")
+        cpus = float(resources.get("cpus", 0.5))
+        pids = int(resources.get("pids", 128))
+        command = build_command(run["tool_id"], run["base_url"])
+        container = client.containers.run(
+            adapter["image"],
+            command=command,
+            name=f"security-run-{run_id}",
+            detach=True,
+            # testssl and ZAP need ephemeral writable image layers for their own runtimes.
+            # They remain non-root, capability-free, resource-limited, and are removed after each run.
+            read_only=run["tool_id"] not in {"testssl", "zap-baseline", "zap-full"},
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            mem_limit=memory,
+            nano_cpus=int(cpus * 1_000_000_000),
+            pids_limit=pids,
+            network_mode="bridge",
+            working_dir="/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
+            entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py"}.get(run["tool_id"]),
+            # testssl and ZAP reports must survive process exit long enough for docker cp.
+            # Their writable container layers are ephemeral and removed in finally.
+            tmpfs=(
+                None if run["tool_id"] == "testssl"
+                else None
+                if run["tool_id"] in {"zap-baseline", "zap-full"}
+                else {"/tmp": "rw,nosuid,nodev,noexec,size=64m"}
+            ),
+            labels={
+                "security-platform.run-id": str(run_id),
+                "security-platform.tool": run["tool_id"],
+            },
+        )
+
+        while True:
+            container.reload()
+            current = get_run(run_id)
+            if current and current["status"] in {"cancelling", "cancelled"}:
+                container.stop(timeout=5)
+                set_status(run_id, "cancelled")
+                append_event(event_file, {"event": "cancelled", "time": time.time()})
+                return
+            if container.status in {"exited", "dead"}:
+                break
+            time.sleep(POLL_SECONDS)
+
+        result = container.wait(timeout=10)
+        logs = container.logs(stdout=True, stderr=True)
+        exit_code = int(result.get("StatusCode", 1))
+        if run["tool_id"] == "testssl":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code == 0:
+                capture_testssl_output(container, output_file)
+            else:
+                output_file.write_bytes(logs)
+        elif run["tool_id"] in {"zap-baseline", "zap-full"}:
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code in {0, 1, 2}:
+                capture_json_output(container, "/zap/wrk/report.json", output_file)
+            else:
+                output_file.write_bytes(logs)
+        else:
+            output_file.write_bytes(logs)
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
+        if exit_code in successful_exit_codes:
+            normalizers = {"httpx": normalize_httpx, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            observation_count = normalizers[run["tool_id"]](run_id, output_file)
+            set_status(run_id, "succeeded")
+            append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
+            append_event(event_file, {"event": "succeeded", "exit_code": 0, "time": time.time()})
+        else:
+            set_status(run_id, "failed", f"Tool exited with status {exit_code}")
+            append_event(event_file, {"event": "failed", "exit_code": exit_code, "time": time.time()})
+    except Exception as exc:
+        set_status(run_id, "failed", str(exc)[:1000])
+        append_event(event_file, {"event": "failed", "error": str(exc)[:1000], "time": time.time()})
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except docker.errors.DockerException:
+                pass
+        if client is not None:
+            client.close()
+
+
+def main() -> None:
+    queue = redis.from_url(
+        REDIS_URL,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        decode_responses=True,
+    )
+    EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            item = queue.blpop(RUN_QUEUE, timeout=5)
+        except redis.TimeoutError:
+            continue
+        if item is None:
+            continue
+        try:
+            execute_run(UUID(item[1]))
+        except (ValueError, psycopg.Error, redis.RedisError) as exc:
+            print(f"runner queue error: {exc}", flush=True)
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
