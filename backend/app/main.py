@@ -23,7 +23,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
-RUNNER_IMPLEMENTED_TOOLS = {"arjun", "ffuf", "httpx", "katana", "naabu", "nikto", "nmap", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"arjun", "ffuf", "gitleaks", "httpx", "katana", "naabu", "nikto", "nmap", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "controlled-web": ["naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
@@ -136,6 +136,20 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS source_artifacts_project_created_idx
                     ON source_artifacts(project_id, created_at DESC);
+                ALTER TABLE runs ALTER COLUMN target_id DROP NOT NULL;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS source_artifact_id UUID
+                    REFERENCES source_artifacts(id) ON DELETE CASCADE;
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'runs_exactly_one_input'
+                    ) THEN
+                        ALTER TABLE runs ADD CONSTRAINT runs_exactly_one_input CHECK (
+                            (target_id IS NOT NULL AND source_artifact_id IS NULL)
+                            OR (target_id IS NULL AND source_artifact_id IS NOT NULL)
+                        );
+                    END IF;
+                END $$;
                 CREATE OR REPLACE FUNCTION prevent_audit_event_mutation()
                 RETURNS trigger AS $$
                 BEGIN
@@ -157,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.30.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.31.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -174,7 +188,8 @@ class TargetCreate(BaseModel):
 
 
 class RunCreate(BaseModel):
-    target_id: UUID
+    target_id: UUID | None = None
+    source_artifact_id: UUID | None = None
     tool_id: str = Field(min_length=1, max_length=100)
     profile: str = Field(min_length=1, max_length=100)
     requested_by: str = Field(min_length=2, max_length=120)
@@ -251,6 +266,7 @@ def run_row(row: tuple) -> dict:
         "started_at": row[9],
         "finished_at": row[10],
         "retest_of_observation": row[11] if len(row) > 11 else None,
+        "source_artifact_id": row[12] if len(row) > 12 else None,
     }
 
 
@@ -684,34 +700,54 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
         raise HTTPException(status_code=422, detail="Tool runner is not implemented yet")
     if adapter.get("profile") != payload.profile:
         raise HTTPException(status_code=422, detail="Tool is not approved for the selected profile")
+    input_type = adapter.get("input", "target")
+    if input_type == "source":
+        if payload.source_artifact_id is None or payload.target_id is not None:
+            raise HTTPException(status_code=422, detail="This adapter requires exactly one source artifact")
+    elif payload.target_id is None or payload.source_artifact_id is not None:
+        raise HTTPException(status_code=422, detail="This adapter requires exactly one authorized target")
 
     run_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT authorization_confirmed
-                FROM targets
-                WHERE id = %s AND project_id = %s
-                """,
-                (payload.target_id, project_id),
-            )
-            target = cursor.fetchone()
-            if target is None:
-                raise HTTPException(status_code=404, detail="Target not found in project")
-            if not target[0]:
-                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            if input_type == "source":
+                cursor.execute(
+                    "SELECT authorization_confirmed FROM source_artifacts WHERE id = %s AND project_id = %s",
+                    (payload.source_artifact_id, project_id),
+                )
+                source = cursor.fetchone()
+                if source is None:
+                    raise HTTPException(status_code=404, detail="Source artifact not found in project")
+                if not source[0]:
+                    raise HTTPException(status_code=422, detail="Source authorization is not confirmed")
+            else:
+                cursor.execute(
+                    "SELECT authorization_confirmed FROM targets WHERE id = %s AND project_id = %s",
+                    (payload.target_id, project_id),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    raise HTTPException(status_code=404, detail="Target not found in project")
+                if not target[0]:
+                    raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
             cursor.execute(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, tool_id, profile, status, requested_by)
-                VALUES (%s, %s, %s, %s, %s, 'queued', %s)
+                    (id, project_id, target_id, source_artifact_id, tool_id, profile, status, requested_by)
+                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s)
                 """,
-                (run_id, project_id, payload.target_id, payload.tool_id, payload.profile, payload.requested_by),
+                (
+                    run_id, project_id, payload.target_id, payload.source_artifact_id,
+                    payload.tool_id, payload.profile, payload.requested_by,
+                ),
             )
             record_audit(
                 cursor, project_id, "run.approved", payload.requested_by, "run", run_id,
-                {"target_id": str(payload.target_id), "tool_id": payload.tool_id, "profile": payload.profile},
+                {
+                    "target_id": str(payload.target_id) if payload.target_id else None,
+                    "source_artifact_id": str(payload.source_artifact_id) if payload.source_artifact_id else None,
+                    "tool_id": payload.tool_id, "profile": payload.profile,
+                },
             )
 
     queue_client().rpush(RUN_QUEUE, str(run_id))
@@ -827,7 +863,7 @@ def get_batch(batch_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation
+                       retest_of_observation, source_artifact_id
                 FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
                 """,
                 (batch_id,),
@@ -877,7 +913,7 @@ def list_runs(project_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation
+                       retest_of_observation, source_artifact_id
                 FROM runs WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -894,7 +930,7 @@ def get_run(run_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation
+                       retest_of_observation, source_artifact_id
                 FROM runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1170,10 +1206,12 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT r.project_id, r.target_id, r.tool_id, r.profile, t.authorization_confirmed
+                SELECT r.project_id, r.target_id, r.source_artifact_id, r.tool_id, r.profile,
+                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE)
                 FROM observations o
                 JOIN runs r ON r.id = o.run_id
-                JOIN targets t ON t.id = r.target_id
+                LEFT JOIN targets t ON t.id = r.target_id
+                LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
                 WHERE o.id = %s
                 """,
                 (observation_id,),
@@ -1181,11 +1219,11 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             origin = cursor.fetchone()
             if origin is None:
                 raise HTTPException(status_code=404, detail="Observation not found")
-            project_id, target_id, tool_id, profile, target_authorized = origin
+            project_id, target_id, source_artifact_id, tool_id, profile, input_authorized = origin
             registry_tool = load_registry().get("tools", {}).get(tool_id)
             adapter = load_adapters().get("adapters", {}).get(tool_id)
-            if not target_authorized:
-                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            if not input_authorized:
+                raise HTTPException(status_code=422, detail="Input authorization is not confirmed")
             if registry_tool is None or adapter is None or tool_id not in RUNNER_IMPLEMENTED_TOOLS:
                 raise HTTPException(status_code=422, detail="Original adapter is no longer available")
             if registry_tool.get("execution") in {"disabled", "manual"} or adapter.get("profile") != profile:
@@ -1193,20 +1231,30 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             cursor.execute(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, tool_id, profile, status, requested_by, retest_of_observation)
-                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)
+                    (id, project_id, target_id, source_artifact_id, tool_id, profile,
+                     status, requested_by, retest_of_observation)
+                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s)
                 """,
-                (run_id, project_id, target_id, tool_id, profile, payload.requested_by, observation_id),
+                (
+                    run_id, project_id, target_id, source_artifact_id, tool_id, profile,
+                    payload.requested_by, observation_id,
+                ),
             )
             record_audit(
                 cursor, project_id, "finding.retest_approved", payload.requested_by,
                 "observation", observation_id,
-                {"run_id": str(run_id), "target_id": str(target_id), "tool_id": tool_id, "profile": profile},
+                {
+                    "run_id": str(run_id),
+                    "target_id": str(target_id) if target_id else None,
+                    "source_artifact_id": str(source_artifact_id) if source_artifact_id else None,
+                    "tool_id": tool_id, "profile": profile,
+                },
             )
     queue_client().rpush(RUN_QUEUE, str(run_id))
     return {
         "id": run_id, "status": "queued", "project_id": project_id,
-        "target_id": target_id, "tool_id": tool_id, "profile": profile,
+        "target_id": target_id, "source_artifact_id": source_artifact_id,
+        "tool_id": tool_id, "profile": profile,
         "retest_of_observation": observation_id,
     }
 

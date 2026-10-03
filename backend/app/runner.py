@@ -22,6 +22,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
+SOURCE_HOST_ROOT = Path(os.getenv("SOURCE_HOST_ROOT", "/home/killswitch/security-platform/data/sources"))
 NUCLEI_TEMPLATES_HOST_PATH = os.getenv(
     "NUCLEI_TEMPLATES_HOST_PATH",
     "/home/killswitch/security-platform/config/templates/nuclei-upstream",
@@ -85,8 +87,12 @@ def get_run(run_id: UUID) -> dict | None:
             cursor.execute(
                 """
                 SELECT r.status, r.tool_id, r.profile, t.base_url, t.allowed_hosts,
-                       t.excluded_paths, t.authorization_confirmed
-                FROM runs r JOIN targets t ON t.id = r.target_id
+                       t.excluded_paths,
+                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
+                       r.source_artifact_id, s.filename, s.sha256
+                FROM runs r
+                LEFT JOIN targets t ON t.id = r.target_id
+                LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
                 WHERE r.id = %s
                 """,
                 (run_id,),
@@ -102,15 +108,29 @@ def get_run(run_id: UUID) -> dict | None:
         "allowed_hosts": row[4],
         "excluded_paths": row[5],
         "authorization_confirmed": row[6],
+        "source_artifact_id": row[7],
+        "source_filename": row[8],
+        "source_sha256": row[9],
     }
 
 
 def build_command(
     tool_id: str,
-    base_url: str,
+    base_url: str | None,
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "gitleaks":
+        return [
+            "detect",
+            "--source", "/src",
+            "--no-git",
+            "--no-banner",
+            "--redact", "100",
+            "--report-format", "json",
+            "--report-path=-",
+            "--exit-code", "1",
+        ]
     if tool_id == "httpx":
         return [
             "-u", base_url,
@@ -807,6 +827,17 @@ def capture_json_output(container, container_path: str, output_file: Path) -> No
     output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_gitleaks_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    if isinstance(payload, list):
+        for finding in payload:
+            if isinstance(finding, dict):
+                for key in list(finding):
+                    if key.lower() in {"secret", "match"}:
+                        finding[key] = "[REDACTED]"
+    output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def normalize_testssl(run_id: UUID, output_file: Path) -> int:
     severity_map = {
         "OK": "info", "INFO": "info", "LOW": "low", "MEDIUM": "medium",
@@ -918,25 +949,85 @@ def normalize_zap(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_gitleaks(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for finding in report if isinstance(report, list) else []:
+            rule_id = str(finding.get("RuleID") or "secret")[:200]
+            description = str(finding.get("Description") or "Potential secret detected")[:500]
+            relative_file = str(finding.get("File") or "source")[:2000]
+            start_line = int(finding.get("StartLine") or 0)
+            asset = f"{relative_file}:{start_line}" if start_line else relative_file
+            details = {
+                "rule_id": rule_id,
+                "file": relative_file,
+                "start_line": start_line,
+                "end_line": int(finding.get("EndLine") or start_line),
+                "entropy": finding.get("Entropy"),
+                "tags": finding.get("Tags") or [],
+                "fingerprint": finding.get("Fingerprint"),
+                "secret": "[REDACTED]",
+                "match": "[REDACTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"gitleaks|{rule_id}|{relative_file}|{start_line}".encode()
+            ).hexdigest()
+            records.append(
+                (
+                    uuid4(), run_id, "secret-detection", description, "high",
+                    asset, json.dumps(details), fingerprint,
+                )
+            )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def execute_run(run_id: UUID) -> None:
     run = get_run(run_id)
     if run is None or run["status"] != "queued":
         return
-    if not run["authorization_confirmed"]:
-        set_status(run_id, "failed", "Target authorization is not confirmed")
-        return
-    target_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
-    allowed_hosts = {
-        str(host).lower().rstrip(".") for host in (run["allowed_hosts"] or [])
-    }
-    if not target_host or target_host not in allowed_hosts:
-        set_status(run_id, "failed", "Target host is not present in the saved allowed-host scope")
-        return
-
     adapter = load_adapters().get(run["tool_id"])
     if adapter is None or adapter.get("profile") != run["profile"]:
         set_status(run_id, "failed", "Adapter policy mismatch")
         return
+    if not run["authorization_confirmed"]:
+        set_status(run_id, "failed", "Input authorization is not confirmed")
+        return
+    input_type = adapter.get("input", "target")
+    if input_type == "source":
+        if not run["source_artifact_id"]:
+            set_status(run_id, "failed", "Source adapter has no approved source artifact")
+            return
+        source_container_path = SOURCE_ROOT / str(run["source_artifact_id"]) / "content"
+        source_host_path = SOURCE_HOST_ROOT / str(run["source_artifact_id"]) / "content"
+        if not source_container_path.is_dir():
+            set_status(run_id, "failed", "Approved source artifact is missing from storage")
+            return
+    else:
+        target_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+        allowed_hosts = {
+            str(host).lower().rstrip(".") for host in (run["allowed_hosts"] or [])
+        }
+        if not target_host or target_host not in allowed_hosts:
+            set_status(run_id, "failed", "Target host is not present in the saved allowed-host scope")
+            return
 
     run_dir = EVIDENCE_ROOT / str(run_id)
     output_file = run_dir / "output.jsonl"
@@ -950,10 +1041,14 @@ def execute_run(run_id: UUID) -> None:
                 "run_id": str(run_id),
                 "tool_id": run["tool_id"],
                 "profile": run["profile"],
-                "target": run["base_url"],
+                "input_type": input_type,
+                "target": run["base_url"] if input_type == "target" else None,
+                "source_artifact_id": str(run["source_artifact_id"]) if run["source_artifact_id"] else None,
+                "source_filename": run["source_filename"],
+                "source_sha256": run["source_sha256"],
                 "image": adapter["image"],
-                "allowed_hosts": run["allowed_hosts"],
-                "excluded_paths": run["excluded_paths"],
+                "allowed_hosts": run["allowed_hosts"] if input_type == "target" else [],
+                "excluded_paths": run["excluded_paths"] if input_type == "target" else [],
             },
             indent=2,
         ),
@@ -987,9 +1082,9 @@ def execute_run(run_id: UUID) -> None:
             mem_limit=memory,
             nano_cpus=int(cpus * 1_000_000_000),
             pids_limit=pids,
-            network_mode="bridge",
+            network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
-            working_dir="/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
             entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
@@ -1017,7 +1112,9 @@ def execute_run(run_id: UUID) -> None:
                 "security-platform.tool": run["tool_id"],
             },
             volumes=(
-                {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
+                {str(source_host_path): {"bind": "/src", "mode": "ro"}}
+                if input_type == "source"
+                else {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
                 if run["tool_id"] == "nuclei-reviewed"
                 else {FFUF_WORDLIST_HOST_PATH: {"bind": "/wordlists/content.txt", "mode": "ro"}}
                 if run["tool_id"] == "ffuf"
@@ -1076,15 +1173,21 @@ def execute_run(run_id: UUID) -> None:
                     output_file.write_text("{}\n", encoding="utf-8")
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "gitleaks":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code in {0, 1}:
+                write_gitleaks_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
-            append_event(event_file, {"event": "succeeded", "exit_code": 0, "time": time.time()})
+            append_event(event_file, {"event": "succeeded", "exit_code": exit_code, "time": time.time()})
         else:
             set_status(run_id, "failed", f"Tool exited with status {exit_code}")
             append_event(event_file, {"event": "failed", "exit_code": exit_code, "time": time.time()})

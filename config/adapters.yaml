@@ -1,4 +1,18 @@
 adapters:
+  gitleaks:
+    version: 8.30.1
+    image: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 300
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: redacted-json
+    capabilities: [secret-pattern-detection, credential-leak-review]
+    controls: [read-only-source, network-disabled, redact-100-percent, no-git-history, no-remote-fetch, pinned-image]
+    state: verified-image
+
   arjun:
     version: 2.2.7
     image: security-platform/arjun@sha256:0e40a6259a32dc0881f3a58e400c6a3de17412cc74ed2b5e228d0c275f44df4f
