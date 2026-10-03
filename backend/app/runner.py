@@ -128,6 +128,16 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "bandit":
+        return [
+            "-r", "/src",
+            "-f", "json",
+            "-q",
+            "--severity-level", "all",
+            "--confidence-level", "all",
+            "--exit-zero",
+            "-x", "/src/.git,/src/node_modules,/src/vendor,/src/.venv,/src/venv",
+        ]
     if tool_id == "checkov":
         return [
             "--directory", "/src",
@@ -950,6 +960,88 @@ def write_checkov_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_bandit_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    results = []
+    for finding in payload.get("results", []) if isinstance(payload, dict) else []:
+        filename = str(finding.get("filename") or "source")
+        if filename.startswith("/src/"):
+            filename = filename[5:]
+        results.append(
+            {
+                "test_id": finding.get("test_id"),
+                "test_name": finding.get("test_name"),
+                "issue_severity": finding.get("issue_severity"),
+                "issue_confidence": finding.get("issue_confidence"),
+                "issue_text": finding.get("issue_text"),
+                "filename": filename,
+                "line_number": finding.get("line_number"),
+                "line_range": finding.get("line_range") or [],
+                "more_info": finding.get("more_info"),
+                "cwe": finding.get("issue_cwe") or {},
+                "code": "[OMITTED]",
+            }
+        )
+    sanitized = {
+        "results": results,
+        "errors": [
+            {"filename": item.get("filename"), "reason": "[OMITTED]"}
+            for item in (payload.get("errors", []) if isinstance(payload, dict) else [])
+            if isinstance(item, dict)
+        ],
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_bandit(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for finding in report.get("results", []):
+            test_id = str(finding.get("test_id") or "bandit-check")[:100]
+            test_name = str(finding.get("test_name") or "python-security-check")[:200]
+            title = str(finding.get("issue_text") or test_name)[:500]
+            path = str(finding.get("filename") or "source")[:2000]
+            line = int(finding.get("line_number") or 0)
+            asset = f"{path}:{line}" if line else path
+            raw_severity = str(finding.get("issue_severity") or "LOW").upper()
+            cwe = finding.get("cwe") or {}
+            details = {
+                "finding": title,
+                "test_id": test_id,
+                "test_name": test_name,
+                "file": path,
+                "line": line,
+                "line_range": finding.get("line_range") or [],
+                "confidence": finding.get("issue_confidence"),
+                "cwe_id": cwe.get("id") if isinstance(cwe, dict) else None,
+                "cwe_link": cwe.get("link") if isinstance(cwe, dict) else None,
+                "reference": finding.get("more_info"),
+                "source_excerpt": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"bandit|{test_id}|{path}|{line}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "python-static-analysis", title, severity_map.get(raw_severity, "info"), asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def normalize_checkov(run_id: UUID, output_file: Path) -> int:
     severity_map = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
     records = []
@@ -1458,6 +1550,8 @@ def execute_run(run_id: UUID) -> None:
                     "SEMGREP_SETTINGS_FILE": "/tmp/semgrep-settings.yml",
                 }
                 if run["tool_id"] == "semgrep" else
+                {"HOME": "/tmp/bandit-home"}
+                if run["tool_id"] == "bandit" else
                 {"HOME": "/tmp/checkov-home", "USER": "scanner"}
                 if run["tool_id"] == "checkov" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
@@ -1587,6 +1681,12 @@ def execute_run(run_id: UUID) -> None:
                 write_checkov_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "bandit":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_bandit_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
@@ -1595,7 +1695,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

@@ -1,4 +1,18 @@
 adapters:
+  bandit:
+    version: 1.9.4
+    image: ghcr.io/pycqa/bandit/bandit@sha256:ae35c5239f93da4e5a7b150524db8bfaafcd9dc41084f1d2235f8e6e780f4436
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 300
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: sanitized-json
+    capabilities: [python-security-analysis, dangerous-api-detection, weak-cryptography, injection-patterns]
+    controls: [read-only-source, network-disabled, recursive-python-only, all-severities, all-confidence-levels, excluded-vendor-directories, exit-zero-for-normalization, code-excerpts-omitted, pinned-image]
+    state: verified-image
+
   checkov:
     version: 3.3.20
     image: ghcr.io/bridgecrewio/checkov@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
