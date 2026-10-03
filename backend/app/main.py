@@ -17,6 +17,11 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_IMPLEMENTED_TOOLS = {"ffuf", "httpx", "katana", "nikto", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
+RUN_PLANS = {
+    "observe": ["httpx", "testssl", "zap-baseline"],
+    "controlled-web": ["httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
+    "extended-web": ["httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti"],
+}
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
@@ -57,6 +62,18 @@ def init_database() -> None:
                     started_at TIMESTAMPTZ,
                     finished_at TIMESTAMPTZ
                 );
+                CREATE TABLE IF NOT EXISTS run_batches (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+                    plan_id TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
+                CREATE INDEX IF NOT EXISTS runs_batch_step_idx
+                    ON runs(batch_id, batch_step, created_at);
                 CREATE INDEX IF NOT EXISTS runs_project_created_idx
                     ON runs(project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS observations (
@@ -91,7 +108,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.19.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.20.1", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -111,6 +128,13 @@ class RunCreate(BaseModel):
     target_id: UUID
     tool_id: str = Field(min_length=1, max_length=100)
     profile: str = Field(min_length=1, max_length=100)
+    requested_by: str = Field(min_length=2, max_length=120)
+    approval_confirmed: bool
+
+
+class BatchCreate(BaseModel):
+    target_id: UUID
+    plan_id: str = Field(pattern="^(observe|controlled-web|extended-web)$")
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
 
@@ -149,6 +173,20 @@ def run_row(row: tuple) -> dict:
         "started_at": row[9],
         "finished_at": row[10],
     }
+
+
+def derive_batch_status(statuses: list[str]) -> str:
+    if not statuses:
+        return "empty"
+    if any(status in {"running", "cancelling"} for status in statuses):
+        return "running"
+    if any(status == "queued" for status in statuses):
+        return "queued"
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if any(status == "cancelled" for status in statuses):
+        return "cancelled"
+    return "succeeded"
 
 
 def sanitize_evidence(value):
@@ -222,6 +260,21 @@ def profiles() -> dict:
 def adapters() -> dict:
     configured = load_adapters().get("adapters", {})
     return {"adapters": {name: value for name, value in configured.items() if name in RUNNER_IMPLEMENTED_TOOLS}}
+
+
+@app.get("/run-plans")
+def run_plans() -> dict:
+    adapters = load_adapters().get("adapters", {})
+    return {
+        "plans": {
+            plan_id: [
+                {"tool_id": tool_id, "profile": adapters[tool_id]["profile"]}
+                for tool_id in tool_ids
+                if tool_id in adapters and tool_id in RUNNER_IMPLEMENTED_TOOLS
+            ]
+            for plan_id, tool_ids in RUN_PLANS.items()
+        }
+    }
 
 
 @app.post("/projects", status_code=201)
@@ -356,6 +409,147 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
 
     queue_client().rpush(RUN_QUEUE, str(run_id))
     return {"id": run_id, "status": "queued", **payload.model_dump(mode="json")}
+
+
+@app.post("/projects/{project_id}/batches", status_code=202)
+def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
+    if not payload.approval_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit batch approval is required")
+    tool_ids = RUN_PLANS[payload.plan_id]
+    registry = load_registry().get("tools", {})
+    adapters = load_adapters().get("adapters", {})
+    for tool_id in tool_ids:
+        tool = registry.get(tool_id)
+        adapter = adapters.get(tool_id)
+        if tool is None or adapter is None or tool_id not in RUNNER_IMPLEMENTED_TOOLS:
+            raise HTTPException(status_code=422, detail=f"Plan adapter is unavailable: {tool_id}")
+        if tool.get("execution") in {"disabled", "manual"}:
+            raise HTTPException(status_code=422, detail=f"Plan adapter cannot run automatically: {tool_id}")
+
+    batch_id = uuid4()
+    run_ids = [uuid4() for _ in tool_ids]
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT authorization_confirmed FROM targets WHERE id = %s AND project_id = %s",
+                (payload.target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Target not found in project")
+            if not target[0]:
+                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            cursor.execute(
+                """
+                INSERT INTO run_batches (id, project_id, target_id, plan_id, requested_by)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (batch_id, project_id, payload.target_id, payload.plan_id, payload.requested_by),
+            )
+            cursor.executemany(
+                """
+                INSERT INTO runs
+                    (id, project_id, target_id, tool_id, profile, status, requested_by, batch_id, batch_step)
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s)
+                """,
+                [
+                    (
+                        run_id, project_id, payload.target_id, tool_id,
+                        adapters[tool_id]["profile"], payload.requested_by, batch_id, batch_step,
+                    )
+                    for batch_step, (run_id, tool_id) in enumerate(zip(run_ids, tool_ids), start=1)
+                ],
+            )
+
+    queue = queue_client()
+    queue.rpush(RUN_QUEUE, *[str(run_id) for run_id in run_ids])
+    return {
+        "id": batch_id,
+        "status": "queued",
+        "plan_id": payload.plan_id,
+        "target_id": payload.target_id,
+        "run_ids": run_ids,
+        "tools": tool_ids,
+    }
+
+
+@app.get("/projects/{project_id}/batches")
+def list_batches(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT b.id, b.target_id, b.plan_id, b.requested_by, b.created_at,
+                       COALESCE(array_agg(r.status ORDER BY r.batch_step, r.created_at) FILTER (WHERE r.id IS NOT NULL), '{}')
+                FROM run_batches b LEFT JOIN runs r ON r.batch_id = b.id
+                WHERE b.project_id = %s
+                GROUP BY b.id ORDER BY b.created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {
+        "batches": [
+            {
+                "id": row[0], "target_id": row[1], "plan_id": row[2],
+                "requested_by": row[3], "created_at": row[4],
+                "status": derive_batch_status(list(row[5])),
+                "status_counts": {status: list(row[5]).count(status) for status in sorted(set(row[5]))},
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/batches/{batch_id}")
+def get_batch(batch_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, project_id, target_id, plan_id, requested_by, created_at FROM run_batches WHERE id = %s",
+                (batch_id,),
+            )
+            batch = cursor.fetchone()
+            if batch is None:
+                raise HTTPException(status_code=404, detail="Batch not found")
+            cursor.execute(
+                """
+                SELECT id, project_id, target_id, tool_id, profile, status,
+                       requested_by, error_message, created_at, started_at, finished_at
+                FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
+                """,
+                (batch_id,),
+            )
+            runs = [run_row(row) for row in cursor.fetchall()]
+    return {
+        "id": batch[0], "project_id": batch[1], "target_id": batch[2],
+        "plan_id": batch[3], "requested_by": batch[4], "created_at": batch[5],
+        "status": derive_batch_status([run["status"] for run in runs]), "runs": runs,
+    }
+
+
+@app.post("/batches/{batch_id}/cancel", status_code=202)
+def cancel_batch(batch_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM run_batches WHERE id = %s", (batch_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Batch not found")
+            cursor.execute(
+                """
+                UPDATE runs SET
+                    status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
+                    finished_at = CASE WHEN status = 'queued' THEN NOW() ELSE finished_at END
+                WHERE batch_id = %s AND status IN ('queued', 'running')
+                RETURNING id, status
+                """,
+                (batch_id,),
+            )
+            changed = cursor.fetchall()
+    cache = queue_client()
+    for run_id, _ in changed:
+        cache.publish("security-platform:cancellations", str(run_id))
+    return {"id": batch_id, "changed": [{"run_id": row[0], "status": row[1]} for row in changed]}
 
 
 @app.get("/projects/{project_id}/runs")
