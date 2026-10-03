@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -17,6 +19,7 @@ ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
+RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_IMPLEMENTED_TOOLS = {"arjun", "ffuf", "httpx", "katana", "naabu", "nikto", "nmap", "nuclei-reviewed", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
@@ -132,7 +135,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.28.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.29.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -291,6 +294,43 @@ def health() -> dict[str, str]:
     cache = queue_client()
     cache.ping()
     return {"status": "ok", "database": "ok", "queue": "ok"}
+
+
+@app.get("/platform-status")
+def platform_status() -> dict:
+    with psycopg.connect(DATABASE_URL, connect_timeout=3) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, COUNT(*)
+                FROM runs
+                WHERE status IN ('queued', 'running', 'cancelling')
+                GROUP BY status
+                """
+            )
+            counts = {status: count for status, count in cursor.fetchall()}
+
+    cache = queue_client()
+    heartbeat = cache.get(RUNNER_HEARTBEAT)
+    heartbeat_age = max(0.0, time.time() - float(heartbeat)) if heartbeat else None
+    runner = "ready" if heartbeat_age is not None and heartbeat_age <= 15 else "stale"
+    disk = shutil.disk_usage(EVIDENCE_ROOT)
+    return {
+        "runner": runner,
+        "runner_heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+        "queue_depth": cache.llen(RUN_QUEUE),
+        "runs": {
+            "queued": counts.get("queued", 0),
+            "running": counts.get("running", 0),
+            "cancelling": counts.get("cancelling", 0),
+        },
+        "evidence_disk": {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+            "used_percent": round((disk.used / disk.total) * 100, 1),
+        },
+    }
 
 
 @app.get("/")

@@ -5,6 +5,7 @@ import re
 import io
 import os
 import tarfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -37,7 +38,24 @@ ARJUN_WORDLIST_HOST_PATH = os.getenv(
     "/home/killswitch/security-platform/config/wordlists/parameters-reviewed-small.txt",
 )
 RUN_QUEUE = "security-platform:runs"
+RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
+RUNNER_HEARTBEAT_TTL = 15
 POLL_SECONDS = 1.0
+
+
+def heartbeat_loop() -> None:
+    heartbeat = redis.from_url(
+        REDIS_URL,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        decode_responses=True,
+    )
+    while True:
+        try:
+            heartbeat.set(RUNNER_HEARTBEAT, str(time.time()), ex=RUNNER_HEARTBEAT_TTL)
+        except redis.RedisError as exc:
+            print(f"runner heartbeat error: {exc}", flush=True)
+        time.sleep(5)
 
 
 def load_adapters() -> dict:
@@ -1091,6 +1109,7 @@ def main() -> None:
         decode_responses=True,
     )
     EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=heartbeat_loop, name="runner-heartbeat", daemon=True).start()
     while True:
         try:
             item = queue.blpop(RUN_QUEUE, timeout=5)
