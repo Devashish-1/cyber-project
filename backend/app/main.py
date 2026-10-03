@@ -8,6 +8,7 @@ import psycopg
 import redis
 import yaml
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -108,7 +109,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.21.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.22.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -707,6 +708,105 @@ def get_project_findings(project_id: UUID) -> dict:
             for row in rows
         ],
     }
+
+
+@app.get("/projects/{project_id}/report.md", response_class=PlainTextResponse)
+def get_project_report(project_id: UUID, include_info: bool = False) -> str:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT name, description, created_at FROM projects WHERE id = %s", (project_id,))
+            project = cursor.fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT base_url, allowed_hosts, excluded_paths, authorization_reference
+                FROM targets WHERE project_id = %s ORDER BY created_at
+                """,
+                (project_id,),
+            )
+            targets = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT status, COUNT(*) FROM runs WHERE project_id = %s
+                GROUP BY status ORDER BY status
+                """,
+                (project_id,),
+            )
+            status_counts = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT DISTINCT tool_id FROM runs WHERE project_id = %s ORDER BY tool_id
+                """,
+                (project_id,),
+            )
+            tools = [row[0] for row in cursor.fetchall()]
+
+    finding_data = get_project_findings(project_id)
+    findings = finding_data["findings"]
+    reported = findings if include_info else [item for item in findings if item["severity"] != "info"]
+    severity_counts = {
+        severity: sum(1 for item in findings if item["severity"] == severity)
+        for severity in ("critical", "high", "medium", "low", "info")
+    }
+
+    def md(value: object) -> str:
+        return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+    lines = [
+        f"# Security assessment report — {md(project[0])}",
+        "",
+        f"Project ID: `{project_id}`  ",
+        f"Created: {project[2].isoformat()}  ",
+        f"Description: {md(project[1]) or 'Not provided'}",
+        "",
+        "## Scope and authorization",
+        "",
+    ]
+    if targets:
+        for base_url, allowed_hosts, excluded_paths, authorization_reference in targets:
+            lines.extend([
+                f"- Target: `{md(base_url)}`",
+                f"  - Allowed hosts: {md(', '.join(allowed_hosts))}",
+                f"  - Excluded paths: {md(', '.join(excluded_paths) or 'None recorded')}",
+                f"  - Authorization reference: {md(authorization_reference)}",
+            ])
+    else:
+        lines.append("No targets recorded.")
+    lines.extend([
+        "",
+        "## Automated coverage",
+        "",
+        f"- Tools executed: {md(', '.join(tools) or 'None')}",
+        f"- Run outcomes: {md(', '.join(f'{status}={count}' for status, count in status_counts) or 'None')}",
+        f"- Unique observations: {len(findings)}",
+        f"- Severity totals: critical={severity_counts['critical']}, high={severity_counts['high']}, medium={severity_counts['medium']}, low={severity_counts['low']}, info={severity_counts['info']}",
+        "",
+        "## Findings",
+        "",
+        "| Severity | Finding | Asset | Tool | Occurrences | Review status |",
+        "|---|---|---|---|---:|---|",
+    ])
+    lines.extend(
+        f"| {md(item['severity'])} | {md(item['title'])} | {md(item['asset'])} | {md(item['tool_id'])} | {item['occurrence_count']} | {md(item['review_status'])} |"
+        for item in reported
+    )
+    if not reported:
+        lines.append("| — | No reportable findings | — | — | 0 | — |")
+    lines.extend([
+        "",
+        "## Limitations",
+        "",
+        "- This report covers automated adapters that actually ran; it is not proof that untested vulnerabilities are absent.",
+        "- Business logic, authorization design, multi-step abuse, and exploit chains still require human testing.",
+        "- Findings remain unverified until a reviewer confirms them; false positives and contextual severity changes are possible.",
+        "- Evidence returned by the dashboard is sanitized and size-limited; restricted raw artifacts remain on the server.",
+        "- Third-party services outside each saved target scope were not authorized or tested.",
+        "",
+        "Generated by Security Testing Platform.",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 @app.patch("/observations/{observation_id}")
