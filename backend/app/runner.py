@@ -75,7 +75,12 @@ def get_run(run_id: UUID) -> dict | None:
     }
 
 
-def build_command(tool_id: str, base_url: str, adapter: dict | None = None) -> list[str]:
+def build_command(
+    tool_id: str,
+    base_url: str,
+    adapter: dict | None = None,
+    excluded_paths: list[str] | None = None,
+) -> list[str]:
     if tool_id == "httpx":
         return [
             "-u", base_url,
@@ -149,6 +154,27 @@ def build_command(tool_id: str, base_url: str, adapter: dict | None = None) -> l
             "-nointeractive",
             "-nocheck",
             "-Display", "E",
+        ]
+    if tool_id == "katana":
+        exclusion_args = [
+            value
+            for path in (excluded_paths or [])
+            if path and path.startswith("/")
+            for value in ("-crawl-out-scope", f".*{re.escape(path)}.*")
+        ]
+        return [
+            "-u", base_url,
+            "-jsonl",
+            "-silent",
+            "-omit-raw",
+            "-omit-body",
+            "-depth", "2",
+            "-crawl-duration", "2m",
+            "-rate-limit", "5",
+            "-host-rate-limit", "5",
+            "-field-scope", "fqdn",
+            "-disable-update-check",
+            *exclusion_args,
         ]
     if tool_id == "zap-baseline":
         return [
@@ -333,6 +359,47 @@ def normalize_nikto(run_id: UUID, output_file: Path) -> int:
             fingerprint = hashlib.sha256(f"nikto|{test_id}|{asset}|{message}".encode()).hexdigest()
             records.append((uuid4(), run_id, "nikto-finding", "Nikto web-server finding", severity, asset, json.dumps(details), fingerprint))
     except OSError:
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_katana(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            request = item.get("request") or {}
+            response = item.get("response") or {}
+            endpoint = str(request.get("endpoint") or "")[:2000]
+            if not endpoint:
+                continue
+            method = str(request.get("method") or "GET")[:20]
+            details = {
+                "method": method,
+                "status_code": response.get("status_code"),
+                "content_type": (response.get("headers") or {}).get("Content-Type"),
+                "content_length": response.get("content_length"),
+            }
+            fingerprint = hashlib.sha256(f"endpoint|{method}|{endpoint}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "http-endpoint", "HTTP endpoint discovered", "info", endpoint, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
     if not records:
         return 0
@@ -541,7 +608,9 @@ def execute_run(run_id: UUID) -> None:
         cpus = float(resources.get("cpus", 0.5))
         pids = int(resources.get("pids", 128))
         timeout_seconds = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
-        command = build_command(run["tool_id"], run["base_url"], adapter)
+        command = build_command(
+            run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
+        )
         container = client.containers.run(
             adapter["image"],
             command=command,
@@ -569,7 +638,7 @@ def execute_run(run_id: UUID) -> None:
                             "/root/.config": "rw,nosuid,nodev,noexec,size=16m",
                             "/root/.cache": "rw,nosuid,nodev,noexec,size=64m",
                         }
-                        if run["tool_id"] in {"nuclei-reviewed", "subfinder"}
+                        if run["tool_id"] in {"katana", "nuclei-reviewed", "subfinder"}
                         else {}
                     ),
                 }
@@ -623,7 +692,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

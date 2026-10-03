@@ -22,6 +22,18 @@ adapters:
     capabilities: [status-code, title, technology, tls, redirect, ip, cname]
     state: verified-image
 
+  katana:
+    version: v1.7.0
+    image: projectdiscovery/katana@sha256:4e9fce12c507e1ca455baf493e14b899db5f2e0ed22ba62591aa42300487a947
+    profile: controlled-active
+    approval: scope-required
+    timeout_seconds: 180
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: sanitized-jsonl
+    capabilities: [same-host-crawl, endpoint-discovery, response-metadata]
+    controls: [depth-2, duration-2-minutes, rate-limit-5, fqdn-scope, excluded-paths, omit-raw, omit-body]
+    state: verified-image
+
   nikto:
     version: 2.6.1
     image: ghcr.io/sullo/nikto@sha256:f65dd97be358e8260d97a00e784c05c5f37d2ed69b9a9611b14d3889c2b54efa
