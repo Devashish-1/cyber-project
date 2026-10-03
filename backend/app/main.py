@@ -108,7 +108,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.20.1", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.21.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -652,6 +652,57 @@ def get_run_observations(run_id: UUID) -> dict:
                 "fingerprint": row[6], "created_at": row[7],
                 "review_status": row[8], "review_notes": row[9],
                 "reviewed_by": row[10], "reviewed_at": row[11],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/projects/{project_id}/findings")
+def get_project_findings(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT o.id, o.run_id, r.tool_id, o.observation_type, o.title, o.severity,
+                           o.asset, o.details, o.fingerprint, o.created_at, o.review_status,
+                           o.review_notes, o.reviewed_by, o.reviewed_at,
+                           COUNT(*) OVER (PARTITION BY o.fingerprint) AS occurrence_count,
+                           MIN(o.created_at) OVER (PARTITION BY o.fingerprint) AS first_seen,
+                           MAX(o.created_at) OVER (PARTITION BY o.fingerprint) AS last_seen,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY o.fingerprint ORDER BY o.created_at DESC, o.id DESC
+                           ) AS recency_rank
+                    FROM observations o
+                    JOIN runs r ON r.id = o.run_id
+                    WHERE r.project_id = %s
+                )
+                SELECT id, run_id, tool_id, observation_type, title, severity, asset, details,
+                       fingerprint, review_status, review_notes, reviewed_by, reviewed_at,
+                       occurrence_count, first_seen, last_seen
+                FROM ranked WHERE recency_rank = 1
+                ORDER BY CASE severity
+                    WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4 ELSE 5 END, last_seen DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {
+        "project_id": project_id,
+        "unique_count": len(rows),
+        "findings": [
+            {
+                "id": row[0], "run_id": row[1], "tool_id": row[2], "type": row[3],
+                "title": row[4], "severity": row[5], "asset": row[6],
+                "details": sanitize_evidence(row[7]), "fingerprint": row[8],
+                "review_status": row[9], "review_notes": row[10],
+                "reviewed_by": row[11], "reviewed_at": row[12],
+                "occurrence_count": row[13], "first_seen": row[14], "last_seen": row[15],
             }
             for row in rows
         ],
