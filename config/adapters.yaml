@@ -46,6 +46,18 @@ adapters:
     controls: [tuning-1-2-3-only, pause-50ms, max-time-5-minutes, no-update, no-interactive]
     state: verified-image
 
+  wapiti:
+    version: 3.3.2
+    image: security-platform/wapiti:3.3.2
+    profile: extended-active
+    approval: explicit-run-and-scope-required
+    timeout_seconds: 180
+    resources: {cpus: 1.0, memory: 1g, pids: 192}
+    output: json
+    capabilities: [technology-fingerprint, http-methods, csrf-review]
+    controls: [explicit-modules, url-scope, duration-2-minutes, tasks-2, no-bugreport]
+    state: local-hardened-image
+
   nuclei-reviewed:
     version: v3.11.1
     image: projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb

@@ -176,6 +176,21 @@ def build_command(
             "-disable-update-check",
             *exclusion_args,
         ]
+    if tool_id == "wapiti":
+        return [
+            "-u", base_url,
+            "--scope", "url",
+            "-m", "wapp,methods,csrf",
+            "--max-scan-time", "120",
+            "--max-links-per-page", "50",
+            "--max-files-per-dir", "50",
+            "--tasks", "2",
+            "-t", "10",
+            "-f", "json",
+            "-o", "/tmp/report.json",
+            "--no-bugreport",
+            "-v", "0",
+        ]
     if tool_id == "zap-baseline":
         return [
             "-t", base_url,
@@ -419,6 +434,61 @@ def normalize_katana(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_wapiti(run_id: UUID, output_file: Path) -> int:
+    severity_map = {0: "info", 1: "low", 2: "medium", 3: "high", 4: "critical"}
+    section_types = {
+        "vulnerabilities": "wapiti-vulnerability",
+        "anomalies": "wapiti-anomaly",
+        "additionals": "wapiti-additional",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for section, observation_type in section_types.items():
+            for category, findings in (report.get(section) or {}).items():
+                for finding in findings or []:
+                    method = str(finding.get("method") or "GET")[:20]
+                    path = str(finding.get("path") or "/")[:2000]
+                    module = str(finding.get("module") or "wapiti")[:200]
+                    raw_info = finding.get("info")
+                    try:
+                        parsed_info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
+                    except json.JSONDecodeError:
+                        parsed_info = raw_info
+                    severity = severity_map.get(int(finding.get("level") or 0), "info")
+                    details = {
+                        "category": category,
+                        "module": module,
+                        "method": method,
+                        "path": path,
+                        "parameter": finding.get("parameter"),
+                        "info": parsed_info,
+                        "wstg": finding.get("wstg") or [],
+                    }
+                    fingerprint = hashlib.sha256(
+                        f"wapiti|{section}|{category}|{module}|{method}|{path}".encode()
+                    ).hexdigest()
+                    records.append((uuid4(), run_id, observation_type, str(category)[:500], severity, path, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def capture_testssl_output(container, output_file: Path) -> None:
     stream, _ = container.get_archive("/tmp")
     archive = io.BytesIO(b"".join(stream))
@@ -618,7 +688,7 @@ def execute_run(run_id: UUID) -> None:
             detach=True,
             # testssl and ZAP need ephemeral writable image layers for their own runtimes.
             # They remain non-root, capability-free, resource-limited, and are removed after each run.
-            read_only=run["tool_id"] not in {"testssl", "zap-baseline", "zap-full"},
+            read_only=run["tool_id"] not in {"testssl", "wapiti", "zap-baseline", "zap-full"},
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             mem_limit=memory,
@@ -630,7 +700,7 @@ def execute_run(run_id: UUID) -> None:
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
-                None if run["tool_id"] in {"testssl", "zap-baseline", "zap-full"}
+                None if run["tool_id"] in {"testssl", "wapiti", "zap-baseline", "zap-full"}
                 else {
                     "/tmp": "rw,nosuid,nodev,noexec,size=64m",
                     **(
@@ -688,11 +758,17 @@ def execute_run(run_id: UUID) -> None:
                 capture_json_output(container, "/zap/wrk/report.json", output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "wapiti":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code == 0:
+                capture_json_output(container, "/tmp/report.json", output_file)
+            else:
+                output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"httpx": normalize_httpx, "katana": normalize_katana, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
