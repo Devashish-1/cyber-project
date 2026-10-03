@@ -6,6 +6,7 @@ import io
 import os
 import tarfile
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
@@ -120,6 +121,24 @@ def build_command(
             "-json",
             "-silent",
             "-disable-update-check",
+        ]
+    if tool_id == "nmap":
+        hostname = urlsplit(base_url).hostname
+        if not hostname:
+            raise ValueError("Nmap target does not contain a hostname")
+        return [
+            "-sT",
+            "-sV",
+            "--version-light",
+            "-T2",
+            "--max-rate", "20",
+            "--max-retries", "1",
+            "--host-timeout", "120s",
+            "--top-ports", "20",
+            "-Pn",
+            "-n",
+            "-oX", "-",
+            hostname,
         ]
     if tool_id == "testssl":
         return [
@@ -331,6 +350,64 @@ def normalize_naabu(run_id: UUID, output_file: Path) -> int:
             fingerprint = hashlib.sha256(f"open-port|{ip}|{port}|tcp".encode()).hexdigest()
             records.append((uuid4(), run_id, "open-port", "TCP port observed open", "info", asset, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_nmap(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        raw = output_file.read_text(encoding="utf-8", errors="replace")
+        xml_start = raw.find("<?xml")
+        if xml_start < 0:
+            return 0
+        root = ET.fromstring(raw[xml_start:])
+        for host_node in root.findall("host"):
+            address_node = host_node.find("address")
+            address = (address_node.get("addr") if address_node is not None else "") or "network-target"
+            for port_node in host_node.findall("./ports/port"):
+                state_node = port_node.find("state")
+                if state_node is None or state_node.get("state") != "open":
+                    continue
+                port = int(port_node.get("portid") or 0)
+                protocol = port_node.get("protocol") or "tcp"
+                if not (1 <= port <= 65535):
+                    continue
+                service_node = port_node.find("service")
+                service = service_node.attrib if service_node is not None else {}
+                product = " ".join(
+                    str(service.get(key) or "").strip()
+                    for key in ("product", "version", "extrainfo")
+                ).strip()
+                asset = f"{address}:{port}"[:2000]
+                details = {
+                    "address": address,
+                    "port": port,
+                    "protocol": protocol,
+                    "service": service.get("name"),
+                    "product": product,
+                    "tunnel": service.get("tunnel"),
+                    "method": service.get("method"),
+                    "confidence": service.get("conf"),
+                }
+                fingerprint = hashlib.sha256(f"network-service|{address}|{port}|{protocol}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "network-service", "TCP service identified", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, ET.ParseError, TypeError, ValueError):
         return 0
     if not records:
         return 0
@@ -833,6 +910,7 @@ def execute_run(run_id: UUID) -> None:
             nano_cpus=int(cpus * 1_000_000_000),
             pids_limit=pids,
             network_mode="bridge",
+            user=adapter.get("user"),
             working_dir="/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
             entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
@@ -913,7 +991,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "nikto": normalize_nikto, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"ffuf": normalize_ffuf, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
