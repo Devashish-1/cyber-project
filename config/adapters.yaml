@@ -1,4 +1,18 @@
 adapters:
+  trufflehog:
+    version: 3.97.9
+    image: trufflesecurity/trufflehog@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 300
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: redacted-json
+    capabilities: [secret-pattern-detection, credential-leak-review, detector-specific-scanning]
+    controls: [read-only-source, network-disabled, verification-disabled, updates-disabled-at-runtime, concurrency-1, archives-skipped, binaries-skipped, secrets-redacted-before-storage, pinned-image]
+    state: verified-image
+
   bandit:
     version: 1.9.4
     image: ghcr.io/pycqa/bandit/bandit@sha256:ae35c5239f93da4e5a7b150524db8bfaafcd9dc41084f1d2235f8e6e780f4436

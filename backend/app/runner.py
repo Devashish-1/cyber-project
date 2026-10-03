@@ -128,6 +128,17 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "trufflehog":
+        return [
+            "--json",
+            "--no-verification",
+            "--no-update",
+            "--concurrency=1",
+            "--results=unverified",
+            "--force-skip-binaries",
+            "--force-skip-archives",
+            "filesystem", "/src",
+        ]
     if tool_id == "bandit":
         return [
             "-r", "/src",
@@ -993,6 +1004,75 @@ def write_bandit_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_trufflehog_output(raw_output: bytes, output_file: Path) -> None:
+    sanitized = []
+    for line in raw_output.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            finding = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        filesystem = (((finding.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {})
+        path = str(filesystem.get("file") or "source")
+        if path.startswith("/src/"):
+            path = path[5:]
+        sanitized.append(
+            {
+                "detector_name": finding.get("DetectorName"),
+                "decoder_name": finding.get("DecoderName"),
+                "verified": bool(finding.get("Verified")),
+                "verification_attempted": False,
+                "file": path,
+                "line": filesystem.get("line"),
+                "secret": "[REDACTED]",
+            }
+        )
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_trufflehog(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for finding in report if isinstance(report, list) else []:
+            detector = str(finding.get("detector_name") or "Secret")[:200]
+            decoder = str(finding.get("decoder_name") or "PLAIN")[:100]
+            path = str(finding.get("file") or "source")[:2000]
+            line = int(finding.get("line") or 0)
+            asset = f"{path}:{line}" if line else path
+            title = f"Potential {detector} secret detected"
+            details = {
+                "detector": detector,
+                "decoder": decoder,
+                "file": path,
+                "line": line,
+                "verified": False,
+                "verification_attempted": False,
+                "secret": "[REDACTED]",
+            }
+            fingerprint = hashlib.sha256(f"trufflehog|{detector}|{path}|{line}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "secret-detection", title, "high", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def normalize_bandit(run_id: UUID, output_file: Path) -> int:
     severity_map = {"HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
     records = []
@@ -1554,6 +1634,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "bandit" else
                 {"HOME": "/tmp/checkov-home", "USER": "scanner"}
                 if run["tool_id"] == "checkov" else
+                {"HOME": "/tmp"}
+                if run["tool_id"] == "trufflehog" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
@@ -1687,6 +1769,12 @@ def execute_run(run_id: UUID) -> None:
                 write_bandit_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "trufflehog":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_trufflehog_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text("[]\n", encoding="utf-8")
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
@@ -1695,7 +1783,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
