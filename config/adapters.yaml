@@ -1,4 +1,18 @@
 adapters:
+  osv-scanner:
+    version: 2.6.0
+    image: ghcr.io/google/osv-scanner@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 600
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 2g, pids: 192}
+    output: sanitized-json
+    capabilities: [dependency-vulnerabilities, lockfile-analysis, osv-advisory-matching]
+    controls: [read-only-source, read-only-local-database, network-disabled, offline-vulnerability-matching, recursive-lockfile-discovery, database-updates-disabled-at-runtime, call-analysis-disabled-by-offline-mode, pinned-image]
+    state: verified-image
+
   trufflehog:
     version: 3.97.9
     image: trufflesecurity/trufflehog@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db

@@ -28,6 +28,10 @@ TRIVY_CACHE_HOST_PATH = os.getenv(
     "TRIVY_CACHE_HOST_PATH",
     "/home/killswitch/security-platform/data/trivy-cache",
 )
+OSV_CACHE_HOST_PATH = os.getenv(
+    "OSV_CACHE_HOST_PATH",
+    "/home/killswitch/security-platform/data/osv-cache",
+)
 SEMGREP_RULES_HOST_PATH = os.getenv(
     "SEMGREP_RULES_HOST_PATH",
     "/home/killswitch/security-platform/config/semgrep-reviewed.yaml",
@@ -128,6 +132,16 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "osv-scanner":
+        return [
+            "scan", "source",
+            "--offline",
+            "--offline-vulnerabilities",
+            "--recursive",
+            "--format", "json",
+            "--verbosity", "error",
+            "/src",
+        ]
     if tool_id == "trufflehog":
         return [
             "--json",
@@ -1031,6 +1045,75 @@ def write_trufflehog_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def write_osv_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    results = []
+    for result in payload.get("results", []) if isinstance(payload, dict) else []:
+        source = result.get("source") or {}
+        path = str(source.get("path") or "source")
+        if path.startswith("/src/"):
+            path = path[5:]
+        packages = []
+        for item in result.get("packages") or []:
+            package = item.get("package") or {}
+            groups = []
+            for group in item.get("groups") or []:
+                groups.append(
+                    {
+                        "ids": group.get("ids") or [],
+                        "aliases": group.get("aliases") or [],
+                        "max_severity": group.get("max_severity"),
+                    }
+                )
+            packages.append({"package": package, "groups": groups})
+        results.append({"source": {"path": path, "type": source.get("type")}, "packages": packages})
+    output_file.write_text(json.dumps({"results": results}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_osv(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for result in report.get("results", []):
+            path = str((result.get("source") or {}).get("path") or "source")[:2000]
+            for item in result.get("packages") or []:
+                package = item.get("package") or {}
+                name = str(package.get("name") or "package")[:300]
+                version = str(package.get("version") or "unknown")[:200]
+                ecosystem = str(package.get("ecosystem") or "unknown")[:100]
+                for group in item.get("groups") or []:
+                    ids = [str(value)[:200] for value in (group.get("ids") or [])]
+                    aliases = [str(value)[:200] for value in (group.get("aliases") or [])]
+                    advisory = ids[0] if ids else (aliases[0] if aliases else "OSV advisory")
+                    try:
+                        score = float(group.get("max_severity") or 0)
+                    except (TypeError, ValueError):
+                        score = 0.0
+                    severity = "critical" if score >= 9 else "high" if score >= 7 else "medium" if score >= 4 else "low"
+                    title = f"{advisory} affects {name} {version}"
+                    details = {"advisory_ids": ids, "aliases": aliases, "package": name, "version": version, "ecosystem": ecosystem, "max_cvss": score, "manifest": path}
+                    fingerprint = hashlib.sha256(f"osv|{ecosystem}|{name}|{version}|{advisory}|{path}".encode()).hexdigest()
+                    records.append((uuid4(), run_id, "dependency-vulnerability", title, severity, f"{path}:{name}@{version}", json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def normalize_trufflehog(run_id: UUID, output_file: Path) -> int:
     records = []
     try:
@@ -1636,6 +1719,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "checkov" else
                 {"HOME": "/tmp"}
                 if run["tool_id"] == "trufflehog" else
+                {"HOME": "/tmp", "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/cache"}
+                if run["tool_id"] == "osv-scanner" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
@@ -1676,6 +1761,10 @@ def execute_run(run_id: UUID) -> None:
                     **(
                         {TRIVY_CACHE_HOST_PATH: {"bind": "/cache", "mode": "ro"}}
                         if run["tool_id"] == "trivy" else {}
+                    ),
+                    **(
+                        {OSV_CACHE_HOST_PATH: {"bind": "/cache", "mode": "ro"}}
+                        if run["tool_id"] == "osv-scanner" else {}
                     ),
                 }
                 if input_type == "source"
@@ -1775,15 +1864,21 @@ def execute_run(run_id: UUID) -> None:
                 write_trufflehog_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text("[]\n", encoding="utf-8")
+        elif run["tool_id"] == "osv-scanner":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code in {0, 1}:
+                write_osv_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "osv-scanner"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
