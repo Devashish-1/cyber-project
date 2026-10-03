@@ -1,5 +1,6 @@
 import json
 import hashlib
+import ipaddress
 import io
 import os
 import tarfile
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 import docker
 import psycopg
@@ -117,6 +119,26 @@ def build_command(tool_id: str, base_url: str, adapter: dict | None = None) -> l
             "-timeout", "10",
             "-retries", "1",
         ]
+    if tool_id == "subfinder":
+        hostname = urlsplit(base_url).hostname
+        if not hostname:
+            raise ValueError("Subfinder target does not contain a hostname")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Subfinder requires an authorized DNS domain, not an IP address")
+        return [
+            "-d", hostname,
+            "-json",
+            "-collect-sources",
+            "-silent",
+            "-disable-update-check",
+            "-rate-limit", "5",
+            "-timeout", "15",
+            "-max-time", "5",
+        ]
     if tool_id == "zap-baseline":
         return [
             "-t", base_url,
@@ -221,6 +243,43 @@ def normalize_nuclei(run_id: UUID, output_file: Path) -> int:
                 f"nuclei|{template_id}|{matcher}|{asset}".encode()
             ).hexdigest()
             records.append((uuid4(), run_id, "nuclei-finding", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_subfinder(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            hostname = str(item.get("host") or "").lower().rstrip(".")[:2000]
+            root_domain = str(item.get("input") or "").lower().rstrip(".")[:2000]
+            if not hostname or not root_domain or not (
+                hostname == root_domain or hostname.endswith(f".{root_domain}")
+            ):
+                continue
+            sources = item.get("sources") or ([item.get("source")] if item.get("source") else [])
+            details = {"root_domain": root_domain, "sources": sources}
+            fingerprint = hashlib.sha256(f"subdomain|{hostname}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "subdomain", "Subdomain discovered", "info", hostname, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
     if not records:
@@ -458,7 +517,7 @@ def execute_run(run_id: UUID) -> None:
                             "/root/.config": "rw,nosuid,nodev,noexec,size=16m",
                             "/root/.cache": "rw,nosuid,nodev,noexec,size=64m",
                         }
-                        if run["tool_id"] == "nuclei-reviewed"
+                        if run["tool_id"] in {"nuclei-reviewed", "subfinder"}
                         else {}
                     ),
                 }
@@ -512,7 +571,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"httpx": normalize_httpx, "nuclei-reviewed": normalize_nuclei, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
