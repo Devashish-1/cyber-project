@@ -400,6 +400,16 @@ def build_command(
             "--disable-redirects",
             "-q",
         ]
+    if tool_id == "zap-passive":
+        return [
+            "-t", base_url,
+            "-J", "report.json",
+            "-m", "0",
+            "-T", "3",
+            "-I",
+            "-s",
+            "--autooff",
+        ]
     if tool_id == "zap-baseline":
         return [
             "-t", base_url,
@@ -1698,7 +1708,7 @@ def execute_run(run_id: UUID) -> None:
             detach=True,
             # testssl and ZAP need ephemeral writable image layers for their own runtimes.
             # They remain non-root, capability-free, resource-limited, and are removed after each run.
-            read_only=run["tool_id"] not in {"testssl", "wapiti", "zap-baseline", "zap-full"},
+            read_only=run["tool_id"] not in {"testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"},
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             mem_limit=memory,
@@ -1724,12 +1734,12 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
-            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh"}.get(run["tool_id"]),
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
-                None if run["tool_id"] in {"testssl", "wapiti", "zap-baseline", "zap-full"}
+                None if run["tool_id"] in {"testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
                 else {
                     "/tmp": "rw,nosuid,nodev,noexec,size=64m",
                     **(
@@ -1813,7 +1823,7 @@ def execute_run(run_id: UUID) -> None:
                 capture_testssl_output(container, output_file)
             else:
                 output_file.write_bytes(logs)
-        elif run["tool_id"] in {"zap-baseline", "zap-full"}:
+        elif run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"}:
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code in {0, 1, 2}:
                 capture_json_output(container, "/zap/wrk/report.json", output_file)
@@ -1876,9 +1886,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "osv-scanner"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "osv-scanner"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

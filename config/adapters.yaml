@@ -232,6 +232,18 @@ adapters:
     capabilities: [protocols, ciphers, certificate, vulnerabilities, headers]
     state: verified-image
 
+  zap-passive:
+    version: 2.17.0
+    image: security-platform/zap-runner:2.17.0
+    profile: observe
+    approval: scope-required
+    timeout_seconds: 600
+    resources: {cpus: 1.0, memory: 3g, pids: 384}
+    output: json
+    capabilities: [passive-http-analysis, response-header-analysis, passive-rule-observations]
+    controls: [passive-rules-only, zero-minute-spider, short-total-time-limit, no-active-scan, operator-cancellable, local-hardened-image]
+    state: verified-image
+
   zap-baseline:
     version: 2.17.0
     image: security-platform/zap-runner:2.17.0
