@@ -73,6 +73,7 @@ def init_database() -> None:
                 );
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS retest_of_observation UUID;
                 CREATE INDEX IF NOT EXISTS runs_batch_step_idx
                     ON runs(batch_id, batch_step, created_at);
                 CREATE INDEX IF NOT EXISTS runs_project_created_idx
@@ -131,7 +132,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.23.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.24.1", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -166,6 +167,11 @@ class ObservationReview(BaseModel):
     status: str = Field(pattern="^(new|confirmed|false_positive|accepted_risk|resolved)$")
     reviewed_by: str = Field(min_length=2, max_length=120)
     notes: str = Field(default="", max_length=2000)
+
+
+class RetestCreate(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    approval_confirmed: bool
 
 
 def load_registry() -> dict:
@@ -214,6 +220,7 @@ def run_row(row: tuple) -> dict:
         "created_at": row[8],
         "started_at": row[9],
         "finished_at": row[10],
+        "retest_of_observation": row[11] if len(row) > 11 else None,
     }
 
 
@@ -570,7 +577,8 @@ def get_batch(batch_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
-                       requested_by, error_message, created_at, started_at, finished_at
+                       requested_by, error_message, created_at, started_at, finished_at,
+                       retest_of_observation
                 FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
                 """,
                 (batch_id,),
@@ -619,7 +627,8 @@ def list_runs(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
-                       requested_by, error_message, created_at, started_at, finished_at
+                       requested_by, error_message, created_at, started_at, finished_at,
+                       retest_of_observation
                 FROM runs WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -635,7 +644,8 @@ def get_run(run_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
-                       requested_by, error_message, created_at, started_at, finished_at
+                       requested_by, error_message, created_at, started_at, finished_at,
+                       retest_of_observation
                 FROM runs WHERE id = %s
                 """,
                 (run_id,),
@@ -899,6 +909,56 @@ def get_project_audit_events(project_id: UUID, limit: int = 100) -> dict:
             }
             for row in rows
         ],
+    }
+
+
+@app.post("/observations/{observation_id}/retest", status_code=202)
+def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
+    if not payload.approval_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit retest approval is required")
+    run_id = uuid4()
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT r.project_id, r.target_id, r.tool_id, r.profile, t.authorization_confirmed
+                FROM observations o
+                JOIN runs r ON r.id = o.run_id
+                JOIN targets t ON t.id = r.target_id
+                WHERE o.id = %s
+                """,
+                (observation_id,),
+            )
+            origin = cursor.fetchone()
+            if origin is None:
+                raise HTTPException(status_code=404, detail="Observation not found")
+            project_id, target_id, tool_id, profile, target_authorized = origin
+            registry_tool = load_registry().get("tools", {}).get(tool_id)
+            adapter = load_adapters().get("adapters", {}).get(tool_id)
+            if not target_authorized:
+                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            if registry_tool is None or adapter is None or tool_id not in RUNNER_IMPLEMENTED_TOOLS:
+                raise HTTPException(status_code=422, detail="Original adapter is no longer available")
+            if registry_tool.get("execution") in {"disabled", "manual"} or adapter.get("profile") != profile:
+                raise HTTPException(status_code=422, detail="Original adapter policy no longer permits this retest")
+            cursor.execute(
+                """
+                INSERT INTO runs
+                    (id, project_id, target_id, tool_id, profile, status, requested_by, retest_of_observation)
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)
+                """,
+                (run_id, project_id, target_id, tool_id, profile, payload.requested_by, observation_id),
+            )
+            record_audit(
+                cursor, project_id, "finding.retest_approved", payload.requested_by,
+                "observation", observation_id,
+                {"run_id": str(run_id), "target_id": str(target_id), "tool_id": tool_id, "profile": profile},
+            )
+    queue_client().rpush(RUN_QUEUE, str(run_id))
+    return {
+        "id": run_id, "status": "queued", "project_id": project_id,
+        "target_id": target_id, "tool_id": tool_id, "profile": profile,
+        "retest_of_observation": observation_id,
     }
 
 
