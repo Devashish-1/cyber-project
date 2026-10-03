@@ -13,7 +13,7 @@ import psycopg
 import redis
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -23,7 +23,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
-RUNNER_IMPLEMENTED_TOOLS = {"arjun", "ffuf", "gitleaks", "httpx", "katana", "naabu", "nikto", "nmap", "nuclei-reviewed", "semgrep", "subfinder", "testssl", "wapiti", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"arjun", "ffuf", "gitleaks", "httpx", "katana", "naabu", "nikto", "nmap", "nuclei-reviewed", "semgrep", "subfinder", "testssl", "trivy", "wapiti", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "controlled-web": ["naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.32.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.33.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -1015,6 +1015,26 @@ def get_run_observations(run_id: UUID) -> dict:
             for row in rows
         ],
     }
+
+
+@app.get("/runs/{run_id}/sbom")
+def get_run_sbom(run_id: UUID) -> FileResponse:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT tool_id, status FROM runs WHERE id = %s", (run_id,))
+            run = cursor.fetchone()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run[0] != "trivy":
+        raise HTTPException(status_code=409, detail="This run does not produce an SBOM")
+    sbom_path = EVIDENCE_ROOT / str(run_id) / "sbom.cdx.json"
+    if not sbom_path.is_file():
+        raise HTTPException(status_code=404, detail="SBOM is not available for this run")
+    return FileResponse(
+        sbom_path,
+        media_type="application/vnd.cyclonedx+json",
+        filename=f"security-platform-{run_id}-sbom.cdx.json",
+    )
 
 
 @app.get("/projects/{project_id}/findings")

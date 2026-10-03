@@ -24,6 +24,10 @@ ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 SOURCE_HOST_ROOT = Path(os.getenv("SOURCE_HOST_ROOT", "/home/killswitch/security-platform/data/sources"))
+TRIVY_CACHE_HOST_PATH = os.getenv(
+    "TRIVY_CACHE_HOST_PATH",
+    "/home/killswitch/security-platform/data/trivy-cache",
+)
 SEMGREP_RULES_HOST_PATH = os.getenv(
     "SEMGREP_RULES_HOST_PATH",
     "/home/killswitch/security-platform/config/semgrep-reviewed.yaml",
@@ -153,6 +157,19 @@ def build_command(
             "--exclude", "vendor",
             "--exclude", "*.min.js",
             "/src",
+        ]
+    if tool_id == "trivy":
+        return [
+            "-c",
+            "set -eu; "
+            "trivy fs --cache-dir /cache --skip-db-update --skip-java-db-update "
+            "--skip-check-update --offline-scan --scanners vuln,misconfig,secret,license "
+            "--format json --output /tmp/trivy.json --parallel 1 --timeout 5m "
+            "--exit-code 0 /src; "
+            "trivy fs --cache-dir /cache --skip-db-update --skip-java-db-update "
+            "--skip-check-update --offline-scan --scanners vuln --format cyclonedx "
+            "--output /tmp/sbom.cdx.json --parallel 1 --timeout 5m /src; "
+            "touch /tmp/.reports-ready; sleep 600",
         ]
     if tool_id == "httpx":
         return [
@@ -897,6 +914,151 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
+    def read_container_json(container_path: str) -> dict:
+        result = container.exec_run(["cat", container_path])
+        if result.exit_code != 0:
+            raise RuntimeError(f"Trivy output could not be read: {container_path}")
+        payload = json.loads(result.output.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Trivy output is not a JSON object: {container_path}")
+        return payload
+
+    raw = read_container_json("/tmp/trivy.json")
+    sanitized_results = []
+    for result in raw.get("Results", []):
+        if not isinstance(result, dict):
+            continue
+        clean = {
+            "Target": result.get("Target"),
+            "Class": result.get("Class"),
+            "Type": result.get("Type"),
+        }
+        vulnerabilities = []
+        for item in result.get("Vulnerabilities") or []:
+            vulnerabilities.append({key: item.get(key) for key in (
+                "VulnerabilityID", "PkgName", "InstalledVersion", "FixedVersion",
+                "Severity", "Title", "PrimaryURL", "Status",
+            )})
+        misconfigurations = []
+        for item in result.get("Misconfigurations") or []:
+            misconfigurations.append({key: item.get(key) for key in (
+                "ID", "Title", "Message", "Resolution", "Severity", "PrimaryURL",
+            )})
+        secrets = []
+        for item in result.get("Secrets") or []:
+            secrets.append({
+                **{key: item.get(key) for key in (
+                    "RuleID", "Category", "Title", "Severity", "StartLine", "EndLine",
+                )},
+                "Match": "[REDACTED]",
+                "Secret": "[REDACTED]",
+            })
+        licenses = []
+        for item in result.get("Licenses") or []:
+            licenses.append({key: item.get(key) for key in (
+                "Name", "Category", "Severity", "PkgName", "FilePath",
+            )})
+        if vulnerabilities:
+            clean["Vulnerabilities"] = vulnerabilities
+        if misconfigurations:
+            clean["Misconfigurations"] = misconfigurations
+        if secrets:
+            clean["Secrets"] = secrets
+        if licenses:
+            clean["Licenses"] = licenses
+        sanitized_results.append(clean)
+    sanitized = {
+        "SchemaVersion": raw.get("SchemaVersion"),
+        "ArtifactName": "approved-source",
+        "ArtifactType": raw.get("ArtifactType"),
+        "Results": sanitized_results,
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+    sbom = read_container_json("/tmp/sbom.cdx.json")
+    sbom_file.write_text(json.dumps(sbom, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_trivy(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium",
+        "LOW": "low", "UNKNOWN": "info",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for result in report.get("Results", []):
+            target = str(result.get("Target") or "source")[:2000]
+            for item in result.get("Vulnerabilities") or []:
+                finding_id = str(item.get("VulnerabilityID") or "dependency-vulnerability")[:300]
+                package = str(item.get("PkgName") or "package")[:500]
+                details = {
+                    "finding": item.get("Title") or f"{finding_id} affects {package}",
+                    "vulnerability_id": finding_id,
+                    "package": package,
+                    "installed_version": item.get("InstalledVersion"),
+                    "fixed_version": item.get("FixedVersion"),
+                    "status": item.get("Status"),
+                    "reference": item.get("PrimaryURL"),
+                }
+                fingerprint = hashlib.sha256(f"trivy|vuln|{finding_id}|{package}|{target}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "dependency-vulnerability", f"{finding_id}: {package}", severity_map.get(str(item.get("Severity") or "UNKNOWN").upper(), "info"), target, json.dumps(details), fingerprint))
+            for item in result.get("Misconfigurations") or []:
+                finding_id = str(item.get("ID") or "misconfiguration")[:300]
+                title = str(item.get("Title") or "Configuration issue")[:500]
+                details = {
+                    "finding": item.get("Message") or title,
+                    "check_id": finding_id,
+                    "resolution": item.get("Resolution"),
+                    "reference": item.get("PrimaryURL"),
+                    "source_excerpt": "[OMITTED]",
+                }
+                fingerprint = hashlib.sha256(f"trivy|misconfig|{finding_id}|{target}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "configuration", title, severity_map.get(str(item.get("Severity") or "UNKNOWN").upper(), "info"), target, json.dumps(details), fingerprint))
+            for item in result.get("Secrets") or []:
+                finding_id = str(item.get("RuleID") or "secret")[:300]
+                line = int(item.get("StartLine") or 0)
+                asset = f"{target}:{line}" if line else target
+                title = str(item.get("Title") or "Potential secret detected")[:500]
+                details = {
+                    "finding": title,
+                    "rule_id": finding_id,
+                    "category": item.get("Category"),
+                    "start_line": line,
+                    "end_line": int(item.get("EndLine") or line),
+                    "secret": "[REDACTED]",
+                    "match": "[REDACTED]",
+                    "source_excerpt": "[OMITTED]",
+                }
+                fingerprint = hashlib.sha256(f"trivy|secret|{finding_id}|{target}|{line}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "secret-detection", title, severity_map.get(str(item.get("Severity") or "HIGH").upper(), "high"), asset, json.dumps(details), fingerprint))
+            for item in result.get("Licenses") or []:
+                name = str(item.get("Name") or "unknown-license")[:300]
+                package = str(item.get("PkgName") or "package")[:500]
+                asset = str(item.get("FilePath") or target)[:2000]
+                details = {"finding": f"License {name} detected for {package}", "license": name, "category": item.get("Category"), "package": package}
+                fingerprint = hashlib.sha256(f"trivy|license|{name}|{package}|{asset}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "license", f"License detected: {name}", severity_map.get(str(item.get("Severity") or "UNKNOWN").upper(), "info"), asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def normalize_testssl(run_id: UUID, output_file: Path) -> int:
     severity_map = {
         "OK": "info", "INFO": "info", "LOW": "low", "MEDIUM": "medium",
@@ -1179,6 +1341,7 @@ def execute_run(run_id: UUID) -> None:
     append_event(event_file, {"event": "started", "time": time.time()})
     client = None
     container = None
+    trivy_captured = False
     try:
         client = docker.from_env()
         resources = adapter.get("resources", {})
@@ -1210,10 +1373,12 @@ def execute_run(run_id: UUID) -> None:
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
                     "SEMGREP_SETTINGS_FILE": "/tmp/semgrep-settings.yml",
                 }
-                if run["tool_id"] == "semgrep" else None
+                if run["tool_id"] == "semgrep" else
+                {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
+                if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py"}.get(run["tool_id"]),
+            entrypoint={"zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
@@ -1246,6 +1411,10 @@ def execute_run(run_id: UUID) -> None:
                         {SEMGREP_RULES_HOST_PATH: {"bind": "/rules/semgrep-reviewed.yaml", "mode": "ro"}}
                         if run["tool_id"] == "semgrep" else {}
                     ),
+                    **(
+                        {TRIVY_CACHE_HOST_PATH: {"bind": "/cache", "mode": "ro"}}
+                        if run["tool_id"] == "trivy" else {}
+                    ),
                 }
                 if input_type == "source"
                 else {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
@@ -1273,13 +1442,20 @@ def execute_run(run_id: UUID) -> None:
                 set_status(run_id, "failed", message)
                 append_event(event_file, {"event": "timeout", "timeout_seconds": timeout_seconds, "time": time.time()})
                 return
+            if run["tool_id"] == "trivy" and container.status == "running":
+                marker = container.exec_run(["test", "-f", "/tmp/.reports-ready"])
+                if marker.exit_code == 0:
+                    capture_trivy_outputs(container, output_file, run_dir / "sbom.cdx.json")
+                    trivy_captured = True
+                    container.stop(timeout=2)
+                    break
             if container.status in {"exited", "dead"}:
                 break
             time.sleep(POLL_SECONDS)
 
         result = container.wait(timeout=10)
         logs = container.logs(stdout=True, stderr=True)
-        exit_code = int(result.get("StatusCode", 1))
+        exit_code = 0 if trivy_captured else int(result.get("StatusCode", 1))
         if run["tool_id"] == "testssl":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code == 0:
@@ -1319,11 +1495,15 @@ def execute_run(run_id: UUID) -> None:
                 write_semgrep_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "trivy":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code != 0:
+                output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] == "gitleaks" else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "wapiti": normalize_wapiti, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

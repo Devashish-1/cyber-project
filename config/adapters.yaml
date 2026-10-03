@@ -27,6 +27,20 @@ adapters:
     controls: [read-only-source, reviewed-local-rules-only, network-disabled, metrics-off, version-check-disabled, jobs-1, per-file-timeout-5s, max-memory-768mb, max-target-1mb, no-code-excerpts, no-metavariables, pinned-image]
     state: verified-image
 
+  trivy:
+    version: 0.74.0
+    image: aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 900
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 1536m, pids: 192}
+    output: [sanitized-json, cyclonedx-json]
+    capabilities: [dependency-vulnerabilities, misconfiguration, secret-patterns, license-inventory, cyclonedx-sbom]
+    controls: [read-only-source, read-only-local-database, network-disabled, offline-scan, database-updates-disabled-at-runtime, checks-update-disabled, parallelism-1, timeout-5-minutes-per-pass, secrets-redacted, code-excerpts-omitted, pinned-image]
+    state: verified-image
+
   arjun:
     version: 2.2.7
     image: security-platform/arjun@sha256:0e40a6259a32dc0881f3a58e400c6a3de17412cc74ed2b5e228d0c275f44df4f
