@@ -190,6 +190,17 @@ def build_command(
         return ["--json", "/src"]
     if tool_id == "brakeman":
         return ["-p", "/src", "-f", "json", "--no-progress", "--no-threads", "--no-pager", "--no-color", "--force-scan"]
+    if tool_id == "kics":
+        return [
+            "-c",
+            "set +e; mkdir -p /tmp/kics-output; "
+            "/app/bin/kics scan -p /src -o /tmp/kics-output --output-name results "
+            "--report-formats json --no-progress --minimal-ui --parallel 1 "
+            "--max-file-size 2 --timeout 20 --disable-full-descriptions "
+            "--disable-secrets --ignore-on-exit results; code=$?; "
+            "printf '%s' \"$code\" > /tmp/.kics-exit; "
+            "touch /tmp/.reports-ready; while :; do sleep 1; done",
+        ]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -945,6 +956,21 @@ def capture_json_output(container, container_path: str, output_file: Path) -> No
     output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
+def capture_kics_output(container, output_file: Path) -> None:
+    result = container.exec_run(["cat", "/tmp/kics-output/results.json"])
+    if result.exit_code != 0:
+        raise RuntimeError("KICS JSON output could not be read")
+    payload = json.loads(result.output.decode("utf-8"))
+    for query in payload.get("queries", []) if isinstance(payload, dict) else []:
+        for finding in query.get("files", []) if isinstance(query, dict) else []:
+            if not isinstance(finding, dict):
+                continue
+            for key in ("actual_value", "search_key", "search_value"):
+                if key in finding:
+                    finding[key] = "[OMITTED]"
+    output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def write_gitleaks_output(raw_output: bytes, output_file: Path) -> None:
     payload = json.loads(raw_output.decode("utf-8"))
     if isinstance(payload, list):
@@ -1281,6 +1307,78 @@ def normalize_checkov(run_id: UUID, output_file: Path) -> int:
                     title = EXCLUDED.title, severity = EXCLUDED.severity,
                     asset = EXCLUDED.asset, details = EXCLUDED.details
                 """,
+                records,
+            )
+    return len(records)
+
+
+def normalize_kics(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "CRITICAL": "critical",
+        "HIGH": "high",
+        "MEDIUM": "medium",
+        "LOW": "low",
+        "INFO": "info",
+        "TRACE": "info",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for query in report.get("queries") or []:
+            query_id = str(query.get("query_id") or "kics-query")[:200]
+            title = str(query.get("query_name") or "Infrastructure-as-code issue")[:500]
+            severity = severity_map.get(str(query.get("severity") or "INFO").upper(), "info")
+            for finding in query.get("files") or []:
+                raw_path = str(finding.get("file_name") or "source").replace("\\", "/")
+                path = raw_path
+                for prefix in ("../../src/", "../src/", "/src/"):
+                    if path.startswith(prefix):
+                        path = path[len(prefix):]
+                        break
+                path = path.lstrip("/") or "source"
+                line = int(finding.get("line") or finding.get("search_line") or 0)
+                asset = f"{path}:{line}" if line else path
+                details = {
+                    "finding": str(query.get("description") or title)[:2000],
+                    "query_id": query_id,
+                    "platform": query.get("platform"),
+                    "cwe": query.get("cwe"),
+                    "risk_score": query.get("risk_score"),
+                    "cloud_provider": query.get("cloud_provider"),
+                    "category": query.get("category"),
+                    "resource_type": finding.get("resource_type"),
+                    "resource_name": finding.get("resource_name"),
+                    "issue_type": finding.get("issue_type"),
+                    "file": path,
+                    "line": line,
+                    "expected_value": finding.get("expected_value"),
+                    "reference": query.get("query_url"),
+                    "actual_value": "[OMITTED]",
+                    "search_key": "[OMITTED]",
+                    "search_value": "[OMITTED]",
+                    "source_excerpt": "[OMITTED]",
+                }
+                similarity = str(finding.get("similarity_id") or "")
+                fingerprint = hashlib.sha256(
+                    f"kics|{query_id}|{similarity}|{path}|{line}".encode()
+                ).hexdigest()
+                records.append((
+                    uuid4(), run_id, "iac-misconfiguration", title, severity,
+                    asset, json.dumps(details), fingerprint,
+                ))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
                 records,
             )
     return len(records)
@@ -1915,6 +2013,8 @@ def execute_run(run_id: UUID) -> None:
     client = None
     container = None
     trivy_captured = False
+    kics_captured = False
+    kics_exit_code = 1
     try:
         client = docker.from_env()
         resources = adapter.get("resources", {})
@@ -1992,13 +2092,17 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh"}.get(run["tool_id"]),
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
                 None if run["tool_id"] in {"testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
                 else {
-                    "/tmp": "rw,nosuid,nodev,noexec,size=64m",
+                    "/tmp": (
+                        "rw,nosuid,nodev,noexec,size=128m"
+                        if run["tool_id"] == "kics"
+                        else "rw,nosuid,nodev,noexec,size=64m"
+                    ),
                     **(
                         {
                             "/root/.config": "rw,nosuid,nodev,noexec,size=16m",
@@ -2043,13 +2147,29 @@ def execute_run(run_id: UUID) -> None:
                     trivy_captured = True
                     container.stop(timeout=2)
                     break
+            if run["tool_id"] == "kics" and container.status == "running":
+                marker = container.exec_run(["test", "-f", "/tmp/.reports-ready"])
+                if marker.exit_code == 0:
+                    status = container.exec_run(["cat", "/tmp/.kics-exit"])
+                    if status.exit_code != 0:
+                        raise RuntimeError("KICS exit status marker could not be read")
+                    kics_exit_code = int(status.output.decode("utf-8").strip())
+                    if kics_exit_code == 0:
+                        capture_kics_output(container, output_file)
+                    kics_captured = True
+                    container.stop(timeout=2)
+                    break
             if container.status in {"exited", "dead"}:
                 break
             time.sleep(POLL_SECONDS)
 
         result = container.wait(timeout=10)
         logs = container.logs(stdout=True, stderr=True)
-        exit_code = 0 if trivy_captured else int(result.get("StatusCode", 1))
+        exit_code = (
+            0 if trivy_captured else
+            kics_exit_code if kics_captured else
+            int(result.get("StatusCode", 1))
+        )
         if run["tool_id"] == "testssl":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code == 0:
@@ -2125,6 +2245,10 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(container.logs(stdout=True, stderr=False))
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "kics":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code != 0:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
@@ -2133,7 +2257,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

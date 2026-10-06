@@ -111,6 +111,20 @@ adapters:
     controls: [read-only-source, network-disabled, single-threaded, source-code-omitted, user-input-omitted, pinned-image]
     state: verified-image
 
+  kics:
+    version: 2.1.20
+    image: checkmarx/kics@sha256:3e5a268eb8adda2e5a483c9359ddfc4cd520ab856a7076dc0b1d8784a37e2602
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 600
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 1g, pids: 192}
+    output: sanitized-json
+    capabilities: [infrastructure-as-code, terraform, kubernetes, docker, cloudformation, openapi]
+    controls: [read-only-source, network-disabled, single-worker, max-file-2mb, query-timeout-20s, secrets-scan-disabled, experimental-queries-disabled, raw-values-omitted, pinned-image]
+    state: verified-image
+
   gitleaks:
     version: 8.30.1
     image: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f

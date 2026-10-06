@@ -23,7 +23,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
-RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "ffuf", "gitleaks", "hadolint", "httpx", "katana", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "semgrep", "shellcheck", "subfinder", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "ffuf", "gitleaks", "hadolint", "httpx", "katana", "kics", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "semgrep", "shellcheck", "subfinder", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "controlled-web": ["naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.42.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.43.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
