@@ -114,7 +114,7 @@ def get_run(run_id: UUID) -> dict | None:
             cursor.execute(
                 """
                 SELECT r.status, r.tool_id, r.profile, t.base_url, t.allowed_hosts,
-                       t.excluded_paths,
+                       t.excluded_paths, t.dns_resolver,
                        COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
                        r.source_artifact_id, s.filename, s.sha256
                 FROM runs r
@@ -134,10 +134,11 @@ def get_run(run_id: UUID) -> dict | None:
         "base_url": row[3],
         "allowed_hosts": row[4],
         "excluded_paths": row[5],
-        "authorization_confirmed": row[6],
-        "source_artifact_id": row[7],
-        "source_filename": row[8],
-        "source_sha256": row[9],
+        "dns_resolver": row[6],
+        "authorization_confirmed": row[7],
+        "source_artifact_id": row[8],
+        "source_filename": row[9],
+        "source_sha256": row[10],
     }
 
 
@@ -146,7 +147,26 @@ def build_command(
     base_url: str | None,
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
+    dns_resolver: str | None = None,
 ) -> list[str]:
+    if tool_id == "dnsx":
+        if not dns_resolver:
+            raise ValueError("dnsx requires an explicitly approved DNS resolver")
+        return [
+            "-l", "/input/hosts.txt",
+            "-resolver", dns_resolver,
+            "-a",
+            "-resp",
+            "-json",
+            "-omit-raw",
+            "-silent",
+            "-retry", "1",
+            "-threads", "1",
+            "-rate-limit", "2",
+            "-auth=false",
+            "-disable-update-check",
+            "-no-color",
+        ]
     if tool_id == "kiterunner":
         return [
             "brute", base_url.rstrip("/"),
@@ -1296,6 +1316,83 @@ def normalize_feroxbuster(run_id: UUID, output_file: Path) -> int:
             }
             fingerprint = hashlib.sha256(f"feroxbuster|{method}|{path}|{status}".encode()).hexdigest()
             records.append((uuid4(), run_id, "recursive-http-content", title, severity, path, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
+def write_dnsx_output(raw_output: bytes, output_file: Path) -> None:
+    results = []
+    for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            item = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        host = str(item.get("host") or "").lower().rstrip(".")[:253]
+        if not host:
+            continue
+        addresses = []
+        for raw_address in (item.get("a") or [])[:32]:
+            try:
+                addresses.append(str(ipaddress.ip_address(str(raw_address))))
+            except ValueError:
+                continue
+        results.append({
+            "host": host,
+            "record_type": "A",
+            "addresses": sorted(set(addresses)),
+            "status_code": str(item.get("status_code") or "")[:32],
+            "ttl": int(item.get("ttl") or 0),
+        })
+        if len(results) >= 100:
+            break
+    output_file.write_text(
+        json.dumps({"results": results}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_dnsx(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            host = str(finding.get("host") or "").lower().rstrip(".")[:253]
+            addresses = finding.get("addresses") or []
+            if not host or not isinstance(addresses, list):
+                continue
+            title = f"DNS A record observed: {host}"[:500]
+            details = {
+                "finding": title,
+                "record_type": "A",
+                "addresses": addresses[:32],
+                "status_code": finding.get("status_code"),
+                "ttl": finding.get("ttl"),
+                "resolver": "[OMITTED]",
+                "raw_response": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"dnsx|{host}|A|{','.join(sorted(addresses))}".encode()
+            ).hexdigest()
+            records.append((
+                uuid4(), run_id, "dns-record", title, "info", host,
+                json.dumps(details), fingerprint,
+            ))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return 0
     if not records:
@@ -2851,6 +2948,26 @@ def prepare_schemathesis_schema(run: dict, run_dir: Path) -> Path:
     return schema_file
 
 
+def prepare_dnsx_input(run: dict, run_dir: Path) -> Path:
+    if not run.get("dns_resolver"):
+        raise ValueError("dnsx requires an explicitly approved DNS resolver")
+    host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("dnsx target must contain a hostname")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("dnsx requires a DNS hostname, not an IP literal")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+        raise ValueError("dnsx target hostname is invalid")
+    input_file = run_dir / "dnsx-hosts.txt"
+    input_file.write_text(host + "\n", encoding="utf-8")
+    input_file.chmod(0o644)
+    return input_file
+
+
 def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
     routes = []
     for raw_line in KITERUNNER_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines():
@@ -2952,6 +3069,7 @@ def execute_run(run_id: UUID) -> None:
                 "image": adapter["image"],
                 "allowed_hosts": run["allowed_hosts"] if input_type == "target" else [],
                 "excluded_paths": run["excluded_paths"] if input_type == "target" else [],
+                "dns_resolver": run["dns_resolver"] if input_type == "target" else None,
             },
             indent=2,
         ),
@@ -2975,10 +3093,12 @@ def execute_run(run_id: UUID) -> None:
         schemathesis_schema_file = None
         if run["tool_id"] == "schemathesis":
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
+        if run["tool_id"] == "dnsx":
+            prepare_dnsx_input(run, run_dir)
         if run["tool_id"] == "kiterunner":
             prepare_kiterunner_wordlist(run, run_dir)
         command = build_command(
-            run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
+            run["tool_id"], run["base_url"], adapter, run["excluded_paths"], run["dns_resolver"]
         )
         if run["tool_id"] == "shellcheck":
             shell_files = sorted(
@@ -3002,6 +3122,11 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
         elif run["tool_id"] == "schemathesis":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "schema.json")] = {"bind": "/schema/openapi.json", "mode": "ro"}
+        elif run["tool_id"] == "dnsx":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsx-hosts.txt")] = {
+                "bind": "/input/hosts.txt",
+                "mode": "ro",
+            }
         elif run["tool_id"] in {"feroxbuster", "ffuf", "gobuster"}:
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
         elif run["tool_id"] == "kiterunner":
@@ -3036,6 +3161,8 @@ def execute_run(run_id: UUID) -> None:
             network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
             environment=(
+                {"HOME": "/tmp"}
+                if run["tool_id"] == "dnsx" else
                 {
                     "HOME": "/tmp/semgrep-home",
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
@@ -3197,6 +3324,15 @@ def execute_run(run_id: UUID) -> None:
                 write_feroxbuster_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "dnsx":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_dnsx_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "dnsx execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "kiterunner":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -3290,7 +3426,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

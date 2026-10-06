@@ -1,6 +1,8 @@
 import json
 import hashlib
+import ipaddress
 import os
+import re
 import shutil
 import stat
 import time
@@ -23,10 +25,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
-RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "dalfox", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "dalfox", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
-    "controlled-web": ["naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
+    "controlled-web": ["dnsx", "naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster", "feroxbuster", "kiterunner", "wapiti", "sqlmap-controlled"],
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
@@ -56,10 +58,12 @@ def init_database() -> None:
                     base_url TEXT NOT NULL,
                     allowed_hosts JSONB NOT NULL,
                     excluded_paths JSONB NOT NULL,
+                    dns_resolver TEXT,
                     authorization_reference TEXT NOT NULL,
                     authorization_confirmed BOOLEAN NOT NULL CHECK (authorization_confirmed),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS dns_resolver TEXT;
                 CREATE TABLE IF NOT EXISTS runs (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -171,7 +175,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.52.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.53.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -183,6 +187,7 @@ class TargetCreate(BaseModel):
     base_url: HttpUrl
     allowed_hosts: list[str] = Field(min_length=1, max_length=50)
     excluded_paths: list[str] = Field(default_factory=list, max_length=100)
+    dns_resolver: str | None = Field(default=None, max_length=80)
     authorization_reference: str = Field(min_length=3, max_length=500)
     authorization_confirmed: bool
 
@@ -217,6 +222,30 @@ class RetestCreate(BaseModel):
 class EmergencyStopCreate(BaseModel):
     requested_by: str = Field(min_length=2, max_length=120)
     confirmation: str = Field(pattern="^STOP ALL RUNS$")
+
+
+def normalize_dns_resolver(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    candidate = value.strip()
+    if candidate.startswith("["):
+        match = re.fullmatch(r"\[([^]]+)](?::([0-9]{1,5}))?", candidate)
+        if not match:
+            raise HTTPException(status_code=422, detail="DNS resolver must be an IP address with optional port")
+        host, raw_port = match.groups()
+    elif candidate.count(":") == 1 and candidate.rsplit(":", 1)[1].isdigit():
+        host, raw_port = candidate.rsplit(":", 1)
+    else:
+        host, raw_port = candidate, None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="DNS resolver must be an IP address, not a hostname") from exc
+    port = int(raw_port or 53)
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=422, detail="DNS resolver port must be between 1 and 65535")
+    formatted = f"[{address}]" if address.version == 6 else str(address)
+    return f"{formatted}:{port}"
 
 
 def load_registry() -> dict:
@@ -678,6 +707,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
     normalized_allowed_hosts = {host.lower().rstrip(".") for host in payload.allowed_hosts}
     if not base_host or base_host not in normalized_allowed_hosts:
         raise HTTPException(status_code=422, detail="Base URL host must be present in allowed_hosts")
+    dns_resolver = normalize_dns_resolver(payload.dns_resolver)
 
     target_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
@@ -688,9 +718,9 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
             cursor.execute(
                 """
                 INSERT INTO targets
-                    (id, project_id, base_url, allowed_hosts, excluded_paths,
+                    (id, project_id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                      authorization_reference, authorization_confirmed)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, TRUE)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, TRUE)
                 """,
                 (
                     target_id,
@@ -698,14 +728,24 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     str(payload.base_url),
                     Jsonb(payload.allowed_hosts),
                     Jsonb(payload.excluded_paths),
+                    dns_resolver,
                     payload.authorization_reference,
                 ),
             )
             record_audit(
                 cursor, project_id, "target.authorized", "system", "target", target_id,
-                {"base_url": str(payload.base_url), "authorization_reference": payload.authorization_reference},
+                {
+                    "base_url": str(payload.base_url),
+                    "dns_resolver": dns_resolver,
+                    "authorization_reference": payload.authorization_reference,
+                },
             )
-    return {"id": target_id, "project_id": project_id, **payload.model_dump(mode="json")}
+    return {
+        "id": target_id,
+        "project_id": project_id,
+        **payload.model_dump(mode="json", exclude={"dns_resolver"}),
+        "dns_resolver": dns_resolver,
+    }
 
 
 @app.get("/projects/{project_id}/targets")
@@ -714,7 +754,7 @@ def list_targets(project_id: UUID) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, base_url, allowed_hosts, excluded_paths,
+                SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                        authorization_reference, authorization_confirmed, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at DESC
                 """,
@@ -725,8 +765,9 @@ def list_targets(project_id: UUID) -> dict:
         "targets": [
             {
                 "id": row[0], "base_url": row[1], "allowed_hosts": row[2],
-                "excluded_paths": row[3], "authorization_reference": row[4],
-                "authorization_confirmed": row[5], "created_at": row[6],
+                "excluded_paths": row[3], "dns_resolver": row[4],
+                "authorization_reference": row[5],
+                "authorization_confirmed": row[6], "created_at": row[7],
             }
             for row in rows
         ]
@@ -1154,7 +1195,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 raise HTTPException(status_code=404, detail="Project not found")
             cursor.execute(
                 """
-                SELECT base_url, allowed_hosts, excluded_paths, authorization_reference
+                SELECT base_url, allowed_hosts, excluded_paths, dns_resolver, authorization_reference
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -1198,11 +1239,12 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
     ]
     if targets:
-        for base_url, allowed_hosts, excluded_paths, authorization_reference in targets:
+        for base_url, allowed_hosts, excluded_paths, dns_resolver, authorization_reference in targets:
             lines.extend([
                 f"- Target: `{md(base_url)}`",
                 f"  - Allowed hosts: {md(', '.join(allowed_hosts))}",
                 f"  - Excluded paths: {md(', '.join(excluded_paths) or 'None recorded')}",
+                f"  - Approved DNS resolver: {md(dns_resolver or 'None recorded')}",
                 f"  - Authorization reference: {md(authorization_reference)}",
             ])
     else:
