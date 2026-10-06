@@ -1,0 +1,7 @@
+/api
+/api/v1
+/api/v1/users
+/graphql
+/health
+/openapi.json
+/swagger.json

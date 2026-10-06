@@ -1,0 +1,12 @@
+diff --git a/cmd/kiterunner/cmd/brute.go b/cmd/kiterunner/cmd/brute.go
+--- a/cmd/kiterunner/cmd/brute.go
++++ b/cmd/kiterunner/cmd/brute.go
+@@ -107 +107 @@ func init() {
+-	bruteCmd.Flags().StringSliceVarP(&headers, "header", "H", []string{"x-forwarded-for: 127.0.0.1"}, "headers to add to requests")
++	bruteCmd.Flags().StringSliceVarP(&headers, "header", "H", nil, "headers to add to requests")
+diff --git a/cmd/kiterunner/cmd/scan.go b/cmd/kiterunner/cmd/scan.go
+--- a/cmd/kiterunner/cmd/scan.go
++++ b/cmd/kiterunner/cmd/scan.go
+@@ -132 +132 @@ func init() {
+-	scanCmd.Flags().StringSliceVarP(&headers, "header", "H", []string{"x-forwarded-for: 127.0.0.1"}, "headers to add to requests")
++	scanCmd.Flags().StringSliceVarP(&headers, "header", "H", nil, "headers to add to requests")

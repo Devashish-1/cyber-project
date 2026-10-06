@@ -61,6 +61,10 @@ ARJUN_WORDLIST_HOST_PATH = os.getenv(
     "ARJUN_WORDLIST_HOST_PATH",
     "/home/killswitch/security-platform/config/wordlists/parameters-reviewed-small.txt",
 )
+KITERUNNER_WORDLIST_RUNNER_PATH = Path(os.getenv(
+    "KITERUNNER_WORDLIST_RUNNER_PATH",
+    "/app/config/wordlists/api-routes-reviewed-small.txt",
+))
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_HEARTBEAT_TTL = 15
@@ -143,6 +147,23 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "kiterunner":
+        return [
+            "brute", base_url.rstrip("/"),
+            "-w", "/wordlists/routes.txt",
+            "-x", "2",
+            "-j", "1",
+            "--delay", "250ms",
+            "--max-redirects", "0",
+            "-d", "0",
+            "--success-status-codes", "200,204,301,302,307,308,401,403,405",
+            "-t", "5s",
+            "--user-agent", "Security-Platform-Kiterunner/1.0",
+            "--wildcard-detection=false",
+            "--progress=false",
+            "-o", "json",
+            "-q",
+        ]
     if tool_id == "sqlmap-controlled":
         target = urlsplit(base_url)
         if target.scheme not in {"http", "https"} or not target.netloc:
@@ -1275,6 +1296,89 @@ def normalize_feroxbuster(run_id: UUID, output_file: Path) -> int:
             }
             fingerprint = hashlib.sha256(f"feroxbuster|{method}|{path}|{status}".encode()).hexdigest()
             records.append((uuid4(), run_id, "recursive-http-content", title, severity, path, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
+def write_kiterunner_output(raw_output: bytes, output_file: Path) -> None:
+    results = []
+    for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            item = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        method = str(item.get("method") or "")[:20]
+        path = str(item.get("path") or "")[:1000]
+        responses = item.get("responses")
+        if not method or not path.startswith("/") or not isinstance(responses, list):
+            continue
+        for response in responses[:5]:
+            if not isinstance(response, dict):
+                continue
+            results.append({
+                "method": method,
+                "path": path,
+                "status": int(response.get("sc") or 0),
+                "content_length": int(response.get("len") or 0),
+            })
+            if len(results) >= 1000:
+                break
+        if len(results) >= 1000:
+            break
+    output_file.write_text(
+        json.dumps({"results": results}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_kiterunner(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        seen = set()
+        for finding in report.get("results") or []:
+            method = str(finding.get("method") or "GET")[:20]
+            path = str(finding.get("path") or "")[:1000]
+            status = int(finding.get("status") or 0)
+            key = (method, path, status)
+            if not path.startswith("/") or key in seen:
+                continue
+            seen.add(key)
+            severity = "low" if status in {200, 204} else "info"
+            title = f"API route discovered: {method} {path}"[:500]
+            details = {
+                "finding": title,
+                "method": method,
+                "path": path,
+                "status_code": status,
+                "content_length": finding.get("content_length"),
+                "request_headers": "[OMITTED]",
+                "response_headers": "[OMITTED]",
+                "response_body": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"kiterunner|{method}|{path}|{status}".encode()
+            ).hexdigest()
+            records.append((
+                uuid4(), run_id, "api-route", title, severity, path,
+                json.dumps(details), fingerprint,
+            ))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return 0
     if not records:
@@ -2747,6 +2851,36 @@ def prepare_schemathesis_schema(run: dict, run_dir: Path) -> Path:
     return schema_file
 
 
+def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
+    routes = []
+    for raw_line in KITERUNNER_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        route = "/" + line.lstrip("/")
+        route = route.rstrip("/") or "/"
+        routes.append(route)
+
+    excluded = []
+    for raw_path in run.get("excluded_paths") or []:
+        path = "/" + str(raw_path).lstrip("/")
+        excluded.append(path.rstrip("/") or "/")
+
+    filtered = [
+        route for route in routes
+        if not any(
+            blocked == "/" or route == blocked or route.startswith(blocked + "/")
+            for blocked in excluded
+        )
+    ]
+    if not filtered:
+        raise ValueError("No reviewed Kiterunner routes remain after applying exclusions")
+    wordlist = run_dir / "kiterunner-routes.txt"
+    wordlist.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    wordlist.chmod(0o644)
+    return wordlist
+
+
 def execute_run(run_id: UUID) -> None:
     run = get_run(run_id)
     if run is None or run["status"] != "queued":
@@ -2841,6 +2975,8 @@ def execute_run(run_id: UUID) -> None:
         schemathesis_schema_file = None
         if run["tool_id"] == "schemathesis":
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
+        if run["tool_id"] == "kiterunner":
+            prepare_kiterunner_wordlist(run, run_dir)
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
         )
@@ -2868,6 +3004,11 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "schema.json")] = {"bind": "/schema/openapi.json", "mode": "ro"}
         elif run["tool_id"] in {"feroxbuster", "ffuf", "gobuster"}:
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
+        elif run["tool_id"] == "kiterunner":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "kiterunner-routes.txt")] = {
+                "bind": "/wordlists/routes.txt",
+                "mode": "ro",
+            }
         elif run["tool_id"] == "arjun":
             container_volumes[ARJUN_WORDLIST_HOST_PATH] = {"bind": "/wordlists/parameters.txt", "mode": "ro"}
         if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} and run["excluded_paths"]:
@@ -2943,6 +3084,11 @@ def execute_run(run_id: UUID) -> None:
                     **(
                         {"/home/scanner/.config": "rw,nosuid,nodev,noexec,size=16m"}
                         if run["tool_id"] == "ffuf"
+                        else {}
+                    ),
+                    **(
+                        {"/home/scanner": "rw,nosuid,nodev,noexec,size=8m,uid=1000,gid=1000,mode=0700"}
+                        if run["tool_id"] == "kiterunner"
                         else {}
                     ),
                 }
@@ -3051,6 +3197,15 @@ def execute_run(run_id: UUID) -> None:
                 write_feroxbuster_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "kiterunner":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_kiterunner_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "Kiterunner execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "semgrep":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -3135,7 +3290,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

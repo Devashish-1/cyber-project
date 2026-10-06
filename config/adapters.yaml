@@ -302,6 +302,20 @@ adapters:
     controls: [reviewed-small-wordlist, exclusions-preflight-and-runtime, depth-2, scan-limit-1, two-threads, rate-limit-4-rps, timeout-5s, total-time-90s, response-limit-1m, redirects-disabled, link-extraction-disabled, extensions-disabled, backup-collection-disabled, word-collection-disabled, state-disabled, auto-bail, response-headers-omitted, pinned-image]
     state: verified-image
 
+  kiterunner:
+    version: 1.0.2-safe
+    image: security-platform/kiterunner-safe@sha256:c1f2ab65fc2ab3425da3819f23b465369659a94f6e9b47830ab727f21b6a3801
+    input: target
+    profile: extended-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 120
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 384m, pids: 128}
+    output: sanitized-json
+    capabilities: [reviewed-api-route-discovery, method-aware-route-cross-check]
+    controls: [reviewed-seven-route-wordlist, exclusions-filtered-before-run, two-connections-per-host, one-parallel-host, delay-250ms, timeout-5s, redirects-disabled, depth-0-preflight, wildcard-detection-disabled, controlled-user-agent, request-and-response-content-omitted, unsafe-default-x-forwarded-for-removed, non-root-read-only-container, pinned-source-commit, pinned-image]
+    state: verified-local-patched-image
+
   httpx:
     version: v1.12.0
     image: projectdiscovery/httpx@sha256:f8275a7c6aaec187249df9eaf4ad9196f4677adfc6a51a47b4aaa1d4db4f8ffc
