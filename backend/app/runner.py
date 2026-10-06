@@ -492,6 +492,31 @@ def build_command(
             "-mc", "all",
             "-fc", "404",
         ]
+    if tool_id == "gobuster":
+        candidates = [
+            f"/{line.strip().lstrip('/')}"
+            for line in FFUF_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        for excluded in (excluded_paths or []):
+            normalized = excluded.rstrip("/") or "/"
+            if any(candidate == normalized or candidate.startswith(f"{normalized}/") for candidate in candidates):
+                raise ValueError(f"Reviewed Gobuster wordlist intersects excluded path: {excluded}")
+        return [
+            "dir",
+            "--url", base_url.rstrip("/") + "/",
+            "--wordlist", "/wordlists/content.txt",
+            "--threads", "2",
+            "--delay", "250ms",
+            "--timeout", "5s",
+            "--status-codes", "200,204,301,302,307,308,401,403,405",
+            "--status-codes-blacklist", "",
+            "--useragent", "Security-Platform-Gobuster/1.0",
+            "--quiet",
+            "--no-progress",
+            "--no-error",
+            "--no-color",
+        ]
     if tool_id == "arjun":
         return [
             "-u", base_url,
@@ -1099,6 +1124,62 @@ def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
                     title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
                     details = EXCLUDED.details
                 """,
+                records,
+            )
+    return len(records)
+
+
+def write_gobuster_output(raw_output: bytes, output_file: Path) -> None:
+    findings = []
+    pattern = re.compile(r"^/?(\S+)\s+\(Status:\s*(\d{3})\)\s*(?:\[Size:\s*(\d+)\])?")
+    for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
+        match = pattern.match(raw_line.strip())
+        if not match:
+            continue
+        findings.append({
+            "path": ("/" + match.group(1).lstrip("/"))[:1000],
+            "status": int(match.group(2)),
+            "size": int(match.group(3)) if match.group(3) else None,
+        })
+        if len(findings) >= 1000:
+            break
+    output_file.write_text(
+        json.dumps({"results": findings}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_gobuster(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            path = str(finding.get("path") or "/")[:1000]
+            status = int(finding.get("status") or 0)
+            size = finding.get("size")
+            severity = "low" if status in {200, 204} else "info"
+            title = f"HTTP content discovered: {path}"[:500]
+            details = {
+                "finding": title,
+                "path": path,
+                "status_code": status,
+                "content_length": size,
+            }
+            fingerprint = hashlib.sha256(f"gobuster|{path}|{status}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "http-content", title, severity, path, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
                 records,
             )
     return len(records)
@@ -2677,7 +2758,7 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
         elif run["tool_id"] == "schemathesis":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "schema.json")] = {"bind": "/schema/openapi.json", "mode": "ro"}
-        elif run["tool_id"] == "ffuf":
+        elif run["tool_id"] in {"ffuf", "gobuster"}:
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
         elif run["tool_id"] == "arjun":
             container_volumes[ARJUN_WORDLIST_HOST_PATH] = {"bind": "/wordlists/parameters.txt", "mode": "ro"}
@@ -2850,6 +2931,12 @@ def execute_run(run_id: UUID) -> None:
                 write_gitleaks_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "gobuster":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_gobuster_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "semgrep":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -2934,7 +3021,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

@@ -274,6 +274,20 @@ adapters:
     controls: [domain-only, scope-filtered-output, rate-limit-5, max-time-5-minutes]
     state: verified-image
 
+  gobuster:
+    version: 3.8.2
+    image: ghcr.io/oj/gobuster@sha256:2a1563afaa089aa242d391914d01018cc7edb3f06b5eb723d8acb910212f40c6
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 150
+    user: "1000:1000"
+    resources: {cpus: 0.5, memory: 256m, pids: 96}
+    output: sanitized-json
+    capabilities: [reviewed-content-discovery, independent-path-cross-check]
+    controls: [reviewed-small-wordlist, exclusions-preflight, two-threads, delay-250ms-per-thread, timeout-5s, retries-disabled, redirects-disabled, backup-discovery-disabled, extensions-disabled, no-recursion, errors-omitted, pinned-image]
+    state: verified-image
+
   httpx:
     version: v1.12.0
     image: projectdiscovery/httpx@sha256:f8275a7c6aaec187249df9eaf4ad9196f4677adfc6a51a47b4aaa1d4db4f8ffc
