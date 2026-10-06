@@ -4,7 +4,7 @@ ARG CODEQL_VERSION=2.27.1
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl git unzip \
+       ca-certificates curl git nodejs python3 unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL \
