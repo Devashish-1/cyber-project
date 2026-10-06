@@ -143,6 +143,30 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "sqlmap-controlled":
+        target = urlsplit(base_url)
+        if target.scheme not in {"http", "https"} or not target.netloc:
+            raise ValueError("SQLmap target URL must be HTTP(S)")
+        if not target.query:
+            raise ValueError("Controlled SQLmap requires an authorized URL with a query parameter")
+        return [
+            "-u", base_url,
+            "--batch",
+            "--level", "1",
+            "--risk", "1",
+            "--technique", "BEU",
+            "--threads", "1",
+            "--delay", "0.5",
+            "--timeout", "5",
+            "--retries", "0",
+            "--time-sec", "2",
+            "--skip-waf",
+            "--ignore-redirects",
+            "--flush-session",
+            "--output-dir", "/tmp/sqlmap",
+            "--user-agent", "Security-Platform-SQLmap/1.0",
+            "--disable-coloring",
+        ]
     if tool_id == "schemathesis":
         target = urlsplit(base_url)
         if target.scheme not in {"http", "https"} or not target.netloc:
@@ -935,6 +959,91 @@ def normalize_dalfox(run_id: UUID, output_file: Path) -> int:
             records.append((
                 uuid4(), run_id, "cross-site-scripting", title, severity,
                 f"{method} {location} parameter {parameter}", json.dumps(details), fingerprint,
+            ))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
+def write_sqlmap_output(raw_output: bytes, output_file: Path) -> None:
+    text = raw_output.decode("utf-8", errors="replace")
+    findings = []
+    current = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^Parameter:\s+(.+?)\s+\(([A-Z]+)\)$", line)
+        if match:
+            current = {
+                "parameter": match.group(1)[:300],
+                "method": match.group(2)[:20],
+                "techniques": [],
+            }
+            findings.append(current)
+            continue
+        if current is None:
+            continue
+        if line.startswith("Type:"):
+            technique = line.split(":", 1)[1].strip()[:200]
+            if technique and technique not in current["techniques"]:
+                current["techniques"].append(technique)
+        elif line.startswith("Title:"):
+            title = line.split(":", 1)[1].strip()[:300]
+            if title:
+                current.setdefault("titles", []).append(title)
+    output_file.write_text(
+        json.dumps(
+            {
+                "findings": findings,
+                "summary": {
+                    "injectable_parameters": len(findings),
+                    "raw_console": "[OMITTED]",
+                    "payloads": "[OMITTED]",
+                },
+            },
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_sqlmap(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("findings") or []:
+            parameter = str(finding.get("parameter") or "unknown")[:300]
+            method = str(finding.get("method") or "GET")[:20]
+            techniques = [str(item)[:200] for item in finding.get("techniques") or []][:10]
+            titles = [str(item)[:300] for item in finding.get("titles") or []][:10]
+            title = f"SQL injection detected in {method} parameter {parameter}"[:500]
+            details = {
+                "finding": title,
+                "parameter": parameter,
+                "method": method,
+                "techniques": techniques,
+                "test_titles": titles,
+                "payloads": "[OMITTED]",
+                "raw_console": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"sqlmap|{method}|{parameter}|{'|'.join(techniques)}".encode()
+            ).hexdigest()
+            records.append((
+                uuid4(), run_id, "sql-injection", title, "high",
+                f"{method} parameter {parameter}", json.dumps(details), fingerprint,
             ))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return 0
@@ -2614,7 +2723,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp", "GRYPE_CHECK_FOR_APP_UPDATE": "false", "GRYPE_DB_AUTO_UPDATE": "false", "GRYPE_DB_CACHE_DIR": "/cache"}
                 if run["tool_id"] == "grype" else
                 {"HOME": "/tmp"}
-                if run["tool_id"] == "schemathesis" else
+                if run["tool_id"] in {"schemathesis", "sqlmap-controlled"} else
                 {"HOME": "/tmp", "SYFT_CHECK_FOR_APP_UPDATE": "false", "SYFT_CACHE_DIR": "/tmp"}
                 if run["tool_id"] == "syft" else
                 {"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "SEMGREP_SETTINGS_FILE": "/tmp/settings.yml", "SEMGREP_SEND_METRICS": "off"}
@@ -2622,7 +2731,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
-            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
             entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
@@ -2753,6 +2862,18 @@ def execute_run(run_id: UUID) -> None:
                 write_dalfox_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "sqlmap-controlled":
+            (run_dir / "tool.log").write_text(
+                "SQLmap raw console output omitted; findings and payloads sanitized.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0:
+                write_sqlmap_output(logs, output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"findings": [], "error": "SQLmap execution failed; raw console omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "syft":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -2813,7 +2934,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

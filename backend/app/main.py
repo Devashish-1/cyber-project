@@ -23,11 +23,11 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
-RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "dalfox", "ffuf", "gitleaks", "grype", "hadolint", "httpx", "katana", "kics", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "schemathesis", "semgrep", "shellcheck", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "dalfox", "ffuf", "gitleaks", "grype", "hadolint", "httpx", "katana", "kics", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "controlled-web": ["naabu", "nmap", "httpx", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
-    "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti"],
+    "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "wapiti", "sqlmap-controlled"],
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.47.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.48.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):

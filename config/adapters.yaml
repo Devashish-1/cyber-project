@@ -181,6 +181,20 @@ adapters:
     controls: [single-worker, rate-limit-2-rps, injection-timeout-30s, redirects-disabled, parameter-mining-disabled, remote-payloads-disabled, blind-oob-disabled, waf-probe-disabled, payloads-omitted, evidence-excerpts-omitted, pinned-image]
     state: verified-image
 
+  sqlmap-controlled:
+    version: "1.10"
+    image: security-platform/sqlmap@sha256:1ca27da5569c83da2700f8187ec86839deb3b6fc3351fcc3ff1a659d173ce21f
+    input: target
+    profile: extended-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 180
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 512m, pids: 128}
+    output: sanitized-json
+    capabilities: [bounded-sql-injection-detection, query-parameter-testing]
+    controls: [exact-url-only, query-parameter-required, redirects-disabled, level-1, risk-1, single-thread, delay-500ms, timeout-5s, retries-disabled, time-based-tests-disabled, stacked-queries-disabled, crawling-disabled, forms-disabled, data-enumeration-disabled, data-dumping-disabled, os-shell-disabled, file-access-disabled, out-of-band-disabled, update-disabled, payloads-omitted, raw-console-omitted, pinned-image]
+    state: verified-image
+
   gitleaks:
     version: 8.30.1
     image: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
