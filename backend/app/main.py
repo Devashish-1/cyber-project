@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.50.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.51.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -428,6 +428,62 @@ def profiles() -> dict:
 def adapters() -> dict:
     configured = load_adapters().get("adapters", {})
     return {"adapters": {name: value for name, value in configured.items() if name in RUNNER_IMPLEMENTED_TOOLS}}
+
+
+@app.get("/coverage")
+def coverage() -> dict:
+    registry = load_registry().get("tools", {})
+    configured = load_adapters().get("adapters", {})
+    eligible_modes = {"adapter", "approval-gated"}
+    eligible = {
+        name: metadata for name, metadata in registry.items()
+        if metadata.get("execution") in eligible_modes
+    }
+    implemented_names = sorted(
+        name for name in eligible
+        if name in configured and name in RUNNER_IMPLEMENTED_TOOLS
+    )
+    pending_names = sorted(
+        (name for name in eligible if name not in implemented_names),
+        key=lambda name: (
+            0 if eligible[name].get("availability") == "core" else 1,
+            eligible[name].get("risk", ""),
+            name,
+        ),
+    )
+    by_category: dict[str, dict[str, int]] = {}
+    for name, metadata in eligible.items():
+        category = str(metadata.get("category") or "uncategorized")
+        counts = by_category.setdefault(category, {"registered": 0, "implemented": 0})
+        counts["registered"] += 1
+        if name in implemented_names:
+            counts["implemented"] += 1
+    by_profile: dict[str, int] = {}
+    by_input: dict[str, int] = {}
+    for name in implemented_names:
+        adapter = configured[name]
+        profile = str(adapter.get("profile") or "unknown")
+        input_type = str(adapter.get("input") or "target")
+        by_profile[profile] = by_profile.get(profile, 0) + 1
+        by_input[input_type] = by_input.get(input_type, 0) + 1
+    eligible_count = len(eligible)
+    implemented_count = len(implemented_names)
+    return {
+        "totals": {
+            "catalogued": len(registry),
+            "adapter_eligible": eligible_count,
+            "implemented": implemented_count,
+            "pending": len(pending_names),
+            "coverage_percent": round((implemented_count / eligible_count) * 100, 1) if eligible_count else 0,
+        },
+        "by_profile": dict(sorted(by_profile.items())),
+        "by_input": dict(sorted(by_input.items())),
+        "by_category": dict(sorted(by_category.items())),
+        "pending": [
+            {"id": name, **eligible[name]}
+            for name in pending_names
+        ],
+    }
 
 
 @app.get("/run-plans")
