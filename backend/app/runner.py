@@ -149,6 +149,8 @@ def build_command(
     excluded_paths: list[str] | None = None,
     dns_resolver: str | None = None,
 ) -> list[str]:
+    if tool_id == "playwright":
+        return ["/input/browser-observe.js", "/input/browser-config.json"]
     if tool_id == "dnsx":
         if not dns_resolver:
             raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -1409,6 +1411,76 @@ def normalize_dnsx(run_id: UUID, output_file: Path) -> int:
                 records,
             )
     return len(records)
+
+
+def write_playwright_output(raw_output: bytes, output_file: Path) -> None:
+    result = None
+    for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("kind") == "browser-observation":
+            result = {
+                "kind": "browser-observation",
+                "requested_url": str(item.get("requested_url") or "")[:2000],
+                "final_url": str(item.get("final_url") or "")[:2000],
+                "title": str(item.get("title") or "")[:500],
+                "status_code": int(item.get("status_code") or 0),
+                "content_type": str(item.get("content_type") or "")[:200],
+                "same_origin_requests": min(max(int(item.get("same_origin_requests") or 0), 0), 10000),
+                "blocked_requests": min(max(int(item.get("blocked_requests") or 0), 0), 10000),
+                "failed_requests": min(max(int(item.get("failed_requests") or 0), 0), 10000),
+                "console_errors": min(max(int(item.get("console_errors") or 0), 0), 10000),
+                "page_errors": min(max(int(item.get("page_errors") or 0), 0), 10000),
+            }
+    output_file.write_text(
+        json.dumps(result or {"kind": "browser-observation", "error": "sanitized browser result unavailable"}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_playwright(run_id: UUID, output_file: Path) -> int:
+    try:
+        item = json.loads(output_file.read_text(encoding="utf-8"))
+        if item.get("error"):
+            return 0
+        asset = str(item.get("final_url") or item.get("requested_url") or "")[:2000]
+        status = int(item.get("status_code") or 0)
+        if not asset or not (100 <= status <= 599):
+            return 0
+        title = f"Browser page observed: HTTP {status}"[:500]
+        details = {
+            "finding": title,
+            "title": item.get("title"),
+            "status_code": status,
+            "content_type": item.get("content_type"),
+            "same_origin_requests": item.get("same_origin_requests"),
+            "blocked_requests": item.get("blocked_requests"),
+            "failed_requests": item.get("failed_requests"),
+            "console_errors": item.get("console_errors"),
+            "page_errors": item.get("page_errors"),
+            "request_headers": "[OMITTED]",
+            "response_headers": "[OMITTED]",
+            "response_body": "[OMITTED]",
+            "cookies": "[OMITTED]",
+        }
+        fingerprint = hashlib.sha256(f"playwright|{asset}|{status}".encode()).hexdigest()
+        record = (uuid4(), run_id, "browser-page", title, "info", asset, json.dumps(details), fingerprint)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                record,
+            )
+    return 1
 
 
 def write_kiterunner_output(raw_output: bytes, output_file: Path) -> None:
@@ -2968,6 +3040,79 @@ def prepare_dnsx_input(run: dict, run_dir: Path) -> Path:
     return input_file
 
 
+def prepare_playwright_input(run: dict, run_dir: Path) -> tuple[Path, Path]:
+    target = urlsplit(run["base_url"])
+    target_host = (target.hostname or "").lower().rstrip(".")
+    if target.scheme not in {"http", "https"} or not target_host:
+        raise ValueError("Playwright target must be an HTTP(S) URL")
+    excluded = []
+    for raw_path in run.get("excluded_paths") or []:
+        path = "/" + str(raw_path).lstrip("/")
+        excluded.append(path.rstrip("/") or "/")
+    target_path = target.path or "/"
+    if any(blocked == "/" or target_path == blocked or target_path.startswith(blocked + "/") for blocked in excluded):
+        raise ValueError("Playwright target URL is inside an excluded path")
+    config_file = run_dir / "browser-config.json"
+    config_file.write_text(json.dumps({
+        "target": run["base_url"],
+        "allowed_host": target_host,
+        "excluded_paths": excluded,
+        "navigation_timeout_ms": 15000,
+    }, separators=(",", ":")) + "\n", encoding="utf-8")
+    config_file.chmod(0o644)
+    script_file = run_dir / "browser-observe.js"
+    script_file.write_text(r'''const fs = require("fs");
+const { chromium } = require("/usr/lib/node_modules/playwright");
+const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const cleanUrl = value => { const u = new URL(value); return `${u.protocol}//${u.host}${u.pathname}`; };
+const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pathname === p || pathname.startsWith(p + "/"));
+(async () => {
+  let browser;
+  const metrics = { same_origin_requests: 0, blocked_requests: 0, failed_requests: 0, console_errors: 0, page_errors: 0 };
+  try {
+    browser = await chromium.launch({headless: true, args: ["--disable-dev-shm-usage"]});
+    const context = await browser.newContext({serviceWorkers: "block", acceptDownloads: false});
+    const page = await context.newPage();
+    page.on("console", message => { if (message.type() === "error") metrics.console_errors += 1; });
+    page.on("pageerror", () => { metrics.page_errors += 1; });
+    page.on("requestfailed", () => { metrics.failed_requests += 1; });
+    await page.route("**/*", async route => {
+      try {
+        const u = new URL(route.request().url());
+        const host = u.hostname.toLowerCase().replace(/\.$/, "");
+        if ((u.protocol === "http:" || u.protocol === "https:") && host === config.allowed_host && !blockedPath(u.pathname)) {
+          metrics.same_origin_requests += 1;
+          return route.continue();
+        }
+      } catch (_) {}
+      metrics.blocked_requests += 1;
+      return route.abort("blockedbyclient");
+    });
+    const response = await page.goto(config.target, {waitUntil: "domcontentloaded", timeout: config.navigation_timeout_ms});
+    await page.waitForTimeout(500);
+    const result = {
+      kind: "browser-observation",
+      requested_url: cleanUrl(config.target),
+      final_url: cleanUrl(page.url()),
+      title: (await page.title()).slice(0, 500),
+      status_code: response ? response.status() : 0,
+      content_type: response ? String((await response.allHeaders())["content-type"] || "").slice(0, 200) : "",
+      ...metrics,
+    };
+    console.log(JSON.stringify(result));
+    await context.close();
+  } catch (error) {
+    console.error(JSON.stringify({kind: "browser-error", name: String(error && error.name || "Error").slice(0, 80)}));
+    process.exitCode = 1;
+  } finally {
+    if (browser) await browser.close();
+  }
+})();
+''', encoding="utf-8")
+    script_file.chmod(0o644)
+    return script_file, config_file
+
+
 def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
     routes = []
     for raw_line in KITERUNNER_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines():
@@ -3062,7 +3207,11 @@ def execute_run(run_id: UUID) -> None:
                 "tool_id": run["tool_id"],
                 "profile": run["profile"],
                 "input_type": input_type,
-                "target": run["base_url"] if input_type == "target" else None,
+                "target": (
+                    urlsplit(run["base_url"])._replace(query="", fragment="").geturl()
+                    if input_type == "target" and run["tool_id"] == "playwright"
+                    else run["base_url"] if input_type == "target" else None
+                ),
                 "source_artifact_id": str(run["source_artifact_id"]) if run["source_artifact_id"] else None,
                 "source_filename": run["source_filename"],
                 "source_sha256": run["source_sha256"],
@@ -3095,6 +3244,8 @@ def execute_run(run_id: UUID) -> None:
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
         if run["tool_id"] == "dnsx":
             prepare_dnsx_input(run, run_dir)
+        if run["tool_id"] == "playwright":
+            prepare_playwright_input(run, run_dir)
         if run["tool_id"] == "kiterunner":
             prepare_kiterunner_wordlist(run, run_dir)
         command = build_command(
@@ -3126,6 +3277,13 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsx-hosts.txt")] = {
                 "bind": "/input/hosts.txt",
                 "mode": "ro",
+            }
+        elif run["tool_id"] == "playwright":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "browser-observe.js")] = {
+                "bind": "/input/browser-observe.js", "mode": "ro",
+            }
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "browser-config.json")] = {
+                "bind": "/input/browser-config.json", "mode": "ro",
             }
         elif run["tool_id"] in {"feroxbuster", "ffuf", "gobuster"}:
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
@@ -3161,6 +3319,8 @@ def execute_run(run_id: UUID) -> None:
             network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
             environment=(
+                {"HOME": "/tmp", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
+                if run["tool_id"] == "playwright" else
                 {"HOME": "/tmp"}
                 if run["tool_id"] == "dnsx" else
                 {
@@ -3189,7 +3349,7 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox"}.get(run["tool_id"]),
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
@@ -3333,6 +3493,15 @@ def execute_run(run_id: UUID) -> None:
                     json.dumps({"results": [], "error": "dnsx execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
+        elif run["tool_id"] == "playwright":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_playwright_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"kind": "browser-observation", "error": "Playwright execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "kiterunner":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -3426,7 +3595,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
@@ -3443,6 +3612,12 @@ def execute_run(run_id: UUID) -> None:
                 container.remove(force=True)
             except docker.errors.DockerException:
                 pass
+        if run["tool_id"] == "playwright":
+            for temporary_name in ("browser-observe.js", "browser-config.json"):
+                try:
+                    (run_dir / temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
         if client is not None:
             client.close()
 

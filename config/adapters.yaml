@@ -288,6 +288,20 @@ adapters:
     controls: [single-authorized-host, hostname-only-no-ip-literals, explicit-approved-ip-resolver-required, no-public-resolver-fallback, a-record-only, one-thread, rate-limit-2-rps, one-retry, pdcp-auth-disabled, update-check-disabled, raw-dns-omitted, tool-output-resolver-omitted, approved-resolver-recorded-in-audit-metadata, non-root-read-only-container, pinned-image]
     state: verified-image
 
+  playwright:
+    version: 1.63.0
+    image: security-platform/playwright@sha256:7d6a323f9a3eb0a46b87402846e684fb2fedeff92660dea555fcba7cd6cccf06
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 45
+    user: pwuser
+    resources: {cpus: 1.0, memory: 1g, pids: 192}
+    output: sanitized-json
+    capabilities: [javascript-rendered-page-observation, browser-console-health, same-origin-resource-observation]
+    controls: [single-approved-navigation, same-host-only-request-routing, cross-host-requests-blocked, excluded-paths-blocked-before-and-during-run, downloads-disabled, service-workers-blocked, navigation-timeout-15s, post-load-wait-500ms, no-user-supplied-scripts, no-authentication-material, request-and-response-content-omitted, cookies-omitted, target-query-omitted-from-metadata, ephemeral-browser-inputs-removed, non-root-read-only-container, pinned-image]
+    state: verified-local-image
+
   gobuster:
     version: 3.8.2
     image: ghcr.io/oj/gobuster@sha256:2a1563afaa089aa242d391914d01018cc7edb3f06b5eb723d8acb910212f40c6
