@@ -186,6 +186,8 @@ def build_command(
         ]
     if tool_id == "shellcheck":
         return ["-f", "json1", "/dev/null"]
+    if tool_id == "njsscan":
+        return ["--json", "/src"]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -1389,6 +1391,54 @@ def normalize_shellcheck(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_njsscan(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        if report.get("errors"):
+            raise RuntimeError("njsscan reported an internal analysis error")
+        for category in ("nodejs", "templates"):
+            for rule_id, rule in (report.get(category) or {}).items():
+                metadata = rule.get("metadata") or {}
+                title = str(metadata.get("description") or rule_id)[:500]
+                severity = severity_map.get(str(metadata.get("severity") or "INFO").upper(), "info")
+                for finding in rule.get("files") or []:
+                    path = str(finding.get("file_path") or "source")[:2000]
+                    lines = finding.get("match_lines") or []
+                    start_line = int(lines[0]) if lines else 0
+                    asset = f"{path}:{start_line}" if start_line else path
+                    details = {
+                        "finding": title,
+                        "rule_id": str(rule_id)[:200],
+                        "category": category,
+                        "file": path,
+                        "start_line": start_line,
+                        "end_line": int(lines[-1]) if lines else start_line,
+                        "cwe": metadata.get("cwe"),
+                        "owasp": metadata.get("owasp-web"),
+                        "source_excerpt": "[OMITTED]",
+                    }
+                    fingerprint = hashlib.sha256(f"njsscan|{category}|{rule_id}|{path}|{start_line}".encode()).hexdigest()
+                    records.append((uuid4(), run_id, "javascript-static-analysis", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
         result = container.exec_run(["cat", container_path])
@@ -1909,6 +1959,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trufflehog" else
                 {"HOME": "/tmp", "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/cache"}
                 if run["tool_id"] == "osv-scanner" else
+                {"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "SEMGREP_SETTINGS_FILE": "/tmp/settings.yml", "SEMGREP_SEND_METRICS": "off"}
+                if run["tool_id"] == "njsscan" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
@@ -2034,15 +2086,21 @@ def execute_run(run_id: UUID) -> None:
                 write_osv_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "njsscan":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                output_file.write_bytes(container.logs(stdout=True, stderr=False))
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "osv-scanner", "shellcheck"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
