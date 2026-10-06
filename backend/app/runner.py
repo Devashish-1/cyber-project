@@ -190,6 +190,20 @@ def build_command(
         return ["--json", "/src"]
     if tool_id == "brakeman":
         return ["-p", "/src", "-f", "json", "--no-progress", "--no-threads", "--no-pager", "--no-color", "--force-scan"]
+    if tool_id == "dalfox":
+        return [
+            "url", "--url", base_url,
+            "--format", "json",
+            "--workers", "1",
+            "--rate-limit", "2",
+            "--timeout", "30",
+            "--silence",
+            "--skip-mining",
+            "--skip-mining-dict",
+            "--skip-mining-dom",
+            "--skip-waf-probe",
+            "--only-poc", "v,r",
+        ]
     if tool_id == "kics":
         return [
             "-c",
@@ -842,6 +856,63 @@ def normalize_wapiti(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_dalfox(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium",
+        "LOW": "low", "INFO": "info",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("findings") or []:
+            finding_type = str(finding.get("type") or "XSS")[:40]
+            parameter = str(finding.get("param") or "unknown")[:300]
+            method = str(finding.get("method") or "GET")[:20]
+            location = str(finding.get("location") or "input")[:100]
+            confidence = str(finding.get("confidence") or "unknown")[:40]
+            title = f"Confirmed XSS in {location} parameter {parameter}"[:500]
+            details = {
+                "finding": finding.get("type_description") or title,
+                "finding_type": finding_type,
+                "parameter": parameter,
+                "method": method,
+                "location": location,
+                "confidence": confidence,
+                "confidence_reason": finding.get("confidence_reason"),
+                "detection_method": finding.get("detection_method"),
+                "injection_context": finding.get("inject_type"),
+                "cwe": finding.get("cwe"),
+                "message_id": finding.get("message_id"),
+                "payload": "[OMITTED]",
+                "evidence": "[OMITTED]",
+                "proof_url": "[OMITTED]",
+            }
+            severity = severity_map.get(str(finding.get("severity") or "HIGH").upper(), "high")
+            fingerprint = hashlib.sha256(
+                f"dalfox|{finding_type}|{method}|{location}|{parameter}|{finding.get('message_id')}".encode()
+            ).hexdigest()
+            records.append((
+                uuid4(), run_id, "cross-site-scripting", title, severity,
+                f"{method} {location} parameter {parameter}", json.dumps(details), fingerprint,
+            ))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
 def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
     records = []
     try:
@@ -1016,6 +1087,44 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
         ],
     }
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def write_dalfox_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    sanitized_findings = []
+    for finding in payload.get("findings", []) if isinstance(payload, dict) else []:
+        if not isinstance(finding, dict):
+            continue
+        sanitized_findings.append({
+            "confidence": finding.get("confidence"),
+            "confidence_reason": finding.get("confidence_reason"),
+            "cwe": finding.get("cwe"),
+            "detection_method": finding.get("detection_method"),
+            "inject_type": finding.get("inject_type"),
+            "location": finding.get("location"),
+            "message_id": finding.get("message_id"),
+            "method": finding.get("method"),
+            "param": finding.get("param"),
+            "severity": finding.get("severity"),
+            "type": finding.get("type"),
+            "type_description": finding.get("type_description"),
+            "data": "[OMITTED]",
+            "evidence": "[OMITTED]",
+            "message_str": "[OMITTED]",
+            "payload": "[OMITTED]",
+        })
+    meta = payload.get("meta") or {} if isinstance(payload, dict) else {}
+    sanitized_meta = {
+        key: meta.get(key)
+        for key in (
+            "dalfox_version", "dedup_mode", "failed_requests", "findings_count",
+            "incomplete", "scan_duration_ms", "targets_deduplicated", "total_requests",
+        )
+    }
+    output_file.write_text(
+        json.dumps({"findings": sanitized_findings, "meta": sanitized_meta}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
 
 def write_checkov_output(raw_output: bytes, output_file: Path) -> None:
@@ -2092,7 +2201,7 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh"}.get(run["tool_id"]),
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
@@ -2209,6 +2318,12 @@ def execute_run(run_id: UUID) -> None:
                 write_semgrep_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "dalfox":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code in {0, 1}:
+                write_dalfox_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "checkov":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -2255,9 +2370,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
