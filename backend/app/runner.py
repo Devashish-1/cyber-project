@@ -22,6 +22,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
+EVIDENCE_HOST_ROOT = Path(os.getenv(
+    "EVIDENCE_HOST_ROOT",
+    "/home/killswitch/security-platform/evidence/runs",
+))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 SOURCE_HOST_ROOT = Path(os.getenv("SOURCE_HOST_ROOT", "/home/killswitch/security-platform/data/sources"))
 TRIVY_CACHE_HOST_PATH = os.getenv(
@@ -401,9 +405,11 @@ def build_command(
             "-q",
         ]
     if tool_id == "zap-passive":
+        scope_args = ["-c", "scope.conf", "--hook", "scope-hook.py"] if excluded_paths else []
         return [
             "-t", base_url,
             "-J", "report.json",
+            *scope_args,
             "-m", "0",
             "-T", "3",
             "-I",
@@ -411,9 +417,11 @@ def build_command(
             "--autooff",
         ]
     if tool_id == "zap-baseline":
+        scope_args = ["-c", "scope.conf", "--hook", "scope-hook.py"] if excluded_paths else []
         return [
             "-t", base_url,
             "-J", "report.json",
+            *scope_args,
             "-m", "1",
             "-T", "5",
             "-I",
@@ -421,9 +429,11 @@ def build_command(
             "--autooff",
         ]
     if tool_id == "zap-full":
+        scope_args = ["-c", "scope.conf", "--hook", "scope-hook.py"] if excluded_paths else []
         return [
             "-t", base_url,
             "-J", "report.json",
+            *scope_args,
             "-m", "2",
             "-T", "15",
             "-I",
@@ -1666,6 +1676,27 @@ def execute_run(run_id: UUID) -> None:
     metadata_file = run_dir / "metadata.json"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    zap_scope_file = run_dir / "zap-scope.conf"
+    zap_scope_hook = run_dir / "zap-scope-hook.py"
+    if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} and run["excluded_paths"]:
+        target = urlsplit(run["base_url"])
+        origin = f"{target.scheme}://{target.netloc}"
+        rules = []
+        for excluded_path in run["excluded_paths"]:
+            normalized = "/" + str(excluded_path).lstrip("/")
+            normalized = normalized.rstrip("/") or "/"
+            pattern = rf"^{re.escape(origin)}{re.escape(normalized)}(?:/.*)?(?:[?#].*)?$"
+            rules.append(f"*\tOUTOFSCOPE\t{pattern}")
+        zap_scope_file.write_text("\n".join(rules) + "\n", encoding="utf-8")
+        hook_patterns = [rule.split("\t", 2)[2] for rule in rules]
+        zap_scope_hook.write_text(
+            "EXCLUDED_PATTERNS = " + json.dumps(hook_patterns) + "\n\n"
+            "def zap_started(zap, target):\n"
+            "    for pattern in EXCLUDED_PATTERNS:\n"
+            "        zap.spider.exclude_from_scan(pattern)\n",
+            encoding="utf-8",
+        )
+
     metadata_file.write_text(
         json.dumps(
             {
@@ -1701,6 +1732,30 @@ def execute_run(run_id: UUID) -> None:
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
         )
+        container_volumes = {}
+        if input_type == "source":
+            container_volumes[str(source_host_path)] = {"bind": "/src", "mode": "ro"}
+            if run["tool_id"] == "semgrep":
+                container_volumes[SEMGREP_RULES_HOST_PATH] = {"bind": "/rules/semgrep-reviewed.yaml", "mode": "ro"}
+            if run["tool_id"] == "trivy":
+                container_volumes[TRIVY_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
+            if run["tool_id"] == "osv-scanner":
+                container_volumes[OSV_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
+        elif run["tool_id"] == "nuclei-reviewed":
+            container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
+        elif run["tool_id"] == "ffuf":
+            container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
+        elif run["tool_id"] == "arjun":
+            container_volumes[ARJUN_WORDLIST_HOST_PATH] = {"bind": "/wordlists/parameters.txt", "mode": "ro"}
+        if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} and run["excluded_paths"]:
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "zap-scope.conf")] = {
+                "bind": "/zap/wrk/scope.conf",
+                "mode": "ro",
+            }
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "zap-scope-hook.py")] = {
+                "bind": "/zap/wrk/scope-hook.py",
+                "mode": "ro",
+            }
         container = client.containers.run(
             adapter["image"],
             command=command,
@@ -1761,31 +1816,7 @@ def execute_run(run_id: UUID) -> None:
                 "security-platform.run-id": str(run_id),
                 "security-platform.tool": run["tool_id"],
             },
-            volumes=(
-                {
-                    str(source_host_path): {"bind": "/src", "mode": "ro"},
-                    **(
-                        {SEMGREP_RULES_HOST_PATH: {"bind": "/rules/semgrep-reviewed.yaml", "mode": "ro"}}
-                        if run["tool_id"] == "semgrep" else {}
-                    ),
-                    **(
-                        {TRIVY_CACHE_HOST_PATH: {"bind": "/cache", "mode": "ro"}}
-                        if run["tool_id"] == "trivy" else {}
-                    ),
-                    **(
-                        {OSV_CACHE_HOST_PATH: {"bind": "/cache", "mode": "ro"}}
-                        if run["tool_id"] == "osv-scanner" else {}
-                    ),
-                }
-                if input_type == "source"
-                else {NUCLEI_TEMPLATES_HOST_PATH: {"bind": "/templates", "mode": "ro"}}
-                if run["tool_id"] == "nuclei-reviewed"
-                else {FFUF_WORDLIST_HOST_PATH: {"bind": "/wordlists/content.txt", "mode": "ro"}}
-                if run["tool_id"] == "ffuf"
-                else {ARJUN_WORDLIST_HOST_PATH: {"bind": "/wordlists/parameters.txt", "mode": "ro"}}
-                if run["tool_id"] == "arjun"
-                else None
-            ),
+            volumes=container_volumes or None,
         )
 
         deadline = time.monotonic() + timeout_seconds

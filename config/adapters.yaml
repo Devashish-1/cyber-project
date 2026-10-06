@@ -241,7 +241,7 @@ adapters:
     resources: {cpus: 1.0, memory: 3g, pids: 384}
     output: json
     capabilities: [passive-http-analysis, response-header-analysis, passive-rule-observations]
-    controls: [passive-rules-only, zero-minute-spider, short-total-time-limit, no-active-scan, operator-cancellable, local-hardened-image]
+    controls: [passive-rules-only, zero-minute-spider, short-total-time-limit, saved-excluded-paths, no-active-scan, operator-cancellable, local-hardened-image]
     state: verified-image
 
   zap-baseline:
@@ -252,7 +252,7 @@ adapters:
     timeout_seconds: 1200
     resources: {cpus: 1.5, memory: 4g, pids: 512}
     output: [json, html]
-    controls: [baseline-only, passive-rules, spider-time-limit, no-active-scan]
+    controls: [baseline-only, passive-rules, spider-time-limit, saved-excluded-paths, no-active-scan]
     state: local-hardened-image
 
   zap-full:
@@ -263,5 +263,5 @@ adapters:
     timeout_seconds: 1200
     resources: {cpus: 2.0, memory: 6g, pids: 512}
     output: json
-    controls: [active-scan, spider-time-limit, total-time-limit, rate-bounded, operator-cancellable]
+    controls: [active-scan, spider-time-limit, total-time-limit, saved-excluded-paths, rate-bounded, operator-cancellable]
     state: local-hardened-image

@@ -171,7 +171,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.38.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.38.1", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
