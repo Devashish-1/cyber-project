@@ -2,7 +2,7 @@ profiles:
   observe: {description: Passive production checks, max_concurrency: 2, tools: [httpx, testssl, zap-passive]}
   controlled-active: {description: Reviewed active checks, max_concurrency: 1, tools: [subfinder, dnsx, katana, nuclei-reviewed, zap-baseline, nikto, schemathesis]}
   extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox]}
-  source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, trivy, gitleaks, trufflehog, osv-scanner, checkov, hadolint, shellcheck]}
+  source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, trivy, gitleaks, trufflehog, osv-scanner, checkov, hadolint, shellcheck]}
 
 tools:
   amass: {category: recon, risk: medium, availability: optional, execution: adapter}
@@ -48,6 +48,7 @@ tools:
   hadolint: {category: dockerfile, risk: low, availability: core, execution: adapter}
   shellcheck: {category: shell-sast, risk: low, availability: core, execution: adapter}
   njsscan: {category: sast-javascript, risk: low, availability: core, execution: adapter}
+  brakeman: {category: sast-ruby, risk: low, availability: core, execution: adapter}
   prowler: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
   scoutsuite: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
   kube-bench: {category: kubernetes, risk: low, availability: optional, execution: adapter}

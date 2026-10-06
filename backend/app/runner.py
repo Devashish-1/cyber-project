@@ -188,6 +188,8 @@ def build_command(
         return ["-f", "json1", "/dev/null"]
     if tool_id == "njsscan":
         return ["--json", "/src"]
+    if tool_id == "brakeman":
+        return ["-p", "/src", "-f", "json", "--no-progress", "--no-threads", "--no-pager", "--no-color", "--force-scan"]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -1439,6 +1441,31 @@ def normalize_njsscan(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_brakeman(run_id: UUID, output_file: Path) -> int:
+    confidence_map = {"High": "high", "Medium": "medium", "Weak": "low"}
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        if report.get("errors"):
+            raise RuntimeError("Brakeman reported an internal analysis error")
+        for item in report.get("warnings") or []:
+            check = str(item.get("check_name") or "brakeman")[:100]
+            warning_type = str(item.get("warning_type") or "Ruby security issue")[:200]
+            message = str(item.get("message") or warning_type)[:500]
+            path, line = str(item.get("file") or "source")[:2000], int(item.get("line") or 0)
+            details = {"finding": message, "check": check, "warning_type": warning_type, "file": path, "line": line, "confidence": item.get("confidence"), "cwe_ids": item.get("cwe_id") or [], "reference": item.get("link"), "source_excerpt": "[OMITTED]", "user_input": "[OMITTED]"}
+            fingerprint = str(item.get("fingerprint") or hashlib.sha256(f"brakeman|{check}|{path}|{line}".encode()).hexdigest())[:128]
+            records.append((uuid4(), run_id, "ruby-static-analysis", f"{warning_type}: {message}", confidence_map.get(str(item.get("confidence")), "medium"), f"{path}:{line}", json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany("""INSERT INTO observations (id,run_id,observation_type,title,severity,asset,details,fingerprint) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (run_id,fingerprint) DO UPDATE SET title=EXCLUDED.title,severity=EXCLUDED.severity,asset=EXCLUDED.asset,details=EXCLUDED.details""", records)
+    return len(records)
+
+
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
         result = container.exec_run(["cat", container_path])
@@ -2092,15 +2119,21 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(container.logs(stdout=True, stderr=False))
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "brakeman":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code in {0, 3}:
+                output_file.write_bytes(container.logs(stdout=True, stderr=False))
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code != 0:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
