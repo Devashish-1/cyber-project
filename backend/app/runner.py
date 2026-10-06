@@ -177,6 +177,13 @@ def build_command(
             "--download-external-modules", "false",
             "--soft-fail",
         ]
+    if tool_id == "hadolint":
+        return [
+            "-c",
+            "find /src -type f "
+            "\\( -name Dockerfile -o -name '*.dockerfile' \\) "
+            "-exec hadolint -f json {} +",
+        ]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -1273,6 +1280,73 @@ def normalize_checkov(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_hadolint(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "error": "high",
+        "warning": "medium",
+        "info": "low",
+        "style": "info",
+        "ignore": "info",
+    }
+    records = []
+    try:
+        raw = output_file.read_text(encoding="utf-8")
+        batches = []
+        decoder = json.JSONDecoder()
+        offset = 0
+        while offset < len(raw):
+            while offset < len(raw) and raw[offset].isspace():
+                offset += 1
+            if offset >= len(raw):
+                break
+            payload, offset = decoder.raw_decode(raw, offset)
+            if isinstance(payload, list):
+                batches.extend(payload)
+        for finding in batches:
+            rule_id = str(finding.get("code") or "hadolint-rule")[:100]
+            path = str(finding.get("file") or "Dockerfile")[:2000]
+            line = int(finding.get("line") or 0)
+            column = int(finding.get("column") or 0)
+            level = str(finding.get("level") or "warning").lower()
+            message = str(finding.get("message") or "Dockerfile lint issue")[:500]
+            asset = f"{path}:{line}" if line else path
+            details = {
+                "finding": message,
+                "rule_id": rule_id,
+                "file": path,
+                "line": line,
+                "column": column,
+                "level": level,
+                "reference": f"https://github.com/hadolint/hadolint/wiki/{rule_id}",
+                "source_excerpt": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(
+                f"hadolint|{rule_id}|{path}|{line}|{column}".encode()
+            ).hexdigest()
+            records.append((
+                uuid4(), run_id, "dockerfile-lint", f"{rule_id}: {message}",
+                severity_map.get(level, "info"), asset, json.dumps(details), fingerprint,
+            ))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
         result = container.exec_run(["cat", container_path])
@@ -1790,7 +1864,7 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh"}.get(run["tool_id"]),
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
@@ -1917,9 +1991,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "osv-scanner"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "osv-scanner"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

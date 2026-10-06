@@ -55,6 +55,20 @@ adapters:
     controls: [read-only-source, network-disabled, skip-cloud-downloads, external-module-downloads-disabled, quiet-json, compact-output, soft-fail-for-normalization, code-blocks-omitted, pinned-image]
     state: verified-image
 
+  hadolint:
+    version: 2.15.1
+    image: ghcr.io/hadolint/hadolint@sha256:9a3944b7fddcb947d1ffd90829ac1a6e5c30479223358f249d8b96c7d0019e27
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 180
+    user: "1000:1000"
+    resources: {cpus: 0.5, memory: 512m, pids: 96}
+    output: sanitized-json
+    capabilities: [dockerfile-linting, image-pin-review, package-install-review, shell-safety-review]
+    controls: [read-only-source, network-disabled, dockerfiles-only, code-excerpts-omitted, pinned-image]
+    state: verified-image
+
   gitleaks:
     version: 8.30.1
     image: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
