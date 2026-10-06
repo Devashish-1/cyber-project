@@ -1,4 +1,18 @@
 adapters:
+  grype:
+    version: 0.119.0
+    image: anchore/grype@sha256:8c2c9234a345577a6d321a4753aa3ee1276d8975c8452d2344a56b57733ecad3
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 600
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 2g, pids: 192}
+    output: sanitized-json
+    capabilities: [dependency-vulnerabilities, fix-availability, cve-and-ghsa-matching, package-inventory]
+    controls: [read-only-source, read-only-local-database, network-disabled, database-auto-update-disabled, app-update-check-disabled, finding-limit-5000, source-content-omitted, pinned-image]
+    state: verified-image
+
   syft:
     version: 1.52.0
     image: anchore/syft@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02

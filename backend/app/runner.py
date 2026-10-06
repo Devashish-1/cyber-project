@@ -36,6 +36,10 @@ OSV_CACHE_HOST_PATH = os.getenv(
     "OSV_CACHE_HOST_PATH",
     "/home/killswitch/security-platform/data/osv-cache",
 )
+GRYPE_CACHE_HOST_PATH = os.getenv(
+    "GRYPE_CACHE_HOST_PATH",
+    "/home/killswitch/security-platform/data/grype-cache",
+)
 SEMGREP_RULES_HOST_PATH = os.getenv(
     "SEMGREP_RULES_HOST_PATH",
     "/home/killswitch/security-platform/config/semgrep-reviewed.yaml",
@@ -136,6 +140,8 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "grype":
+        return ["dir:/src", "-o", "json"]
     if tool_id == "syft":
         return ["scan", "dir:/src", "-o", "syft-json"]
     if tool_id == "osv-scanner":
@@ -1089,6 +1095,128 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
         ],
     }
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def write_grype_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Grype output is not a JSON object")
+    matches = []
+    for match in (payload.get("matches") or [])[:5000]:
+        if not isinstance(match, dict):
+            continue
+        vulnerability = match.get("vulnerability") or {}
+        artifact = match.get("artifact") or {}
+        fix = vulnerability.get("fix") or {}
+        locations = []
+        for location in (artifact.get("locations") or [])[:20]:
+            if isinstance(location, dict) and location.get("path"):
+                locations.append({"path": str(location.get("path"))[:2000]})
+        details = []
+        for item in (match.get("matchDetails") or [])[:20]:
+            if not isinstance(item, dict):
+                continue
+            found = item.get("found") or {}
+            item_fix = item.get("fix") or {}
+            details.append({
+                "type": item.get("type"),
+                "matcher": item.get("matcher"),
+                "vulnerability_id": found.get("vulnerabilityID"),
+                "version_constraint": found.get("versionConstraint"),
+                "suggested_version": item_fix.get("suggestedVersion"),
+            })
+        matches.append({
+            "vulnerability": {
+                "id": vulnerability.get("id"),
+                "namespace": vulnerability.get("namespace"),
+                "severity": vulnerability.get("severity"),
+                "urls": (vulnerability.get("urls") or [])[:20],
+                "fix": {
+                    "versions": (fix.get("versions") or [])[:20],
+                    "state": fix.get("state"),
+                },
+                "risk": vulnerability.get("risk"),
+            },
+            "artifact": {
+                "name": artifact.get("name"),
+                "version": artifact.get("version"),
+                "type": artifact.get("type"),
+                "purl": artifact.get("purl"),
+                "language": artifact.get("language"),
+                "locations": locations,
+            },
+            "match_details": details,
+        })
+    sanitized = {
+        "schema": "security-platform-grype-v1",
+        "source": {"type": "approved-source"},
+        "match_count": len(matches),
+        "matches_truncated": len(payload.get("matches") or []) > len(matches),
+        "matches": matches,
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_grype(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium",
+        "LOW": "low", "NEGLIGIBLE": "info", "UNKNOWN": "info",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for match in report.get("matches") or []:
+            vulnerability = match.get("vulnerability") or {}
+            artifact = match.get("artifact") or {}
+            vulnerability_id = str(vulnerability.get("id") or "dependency-vulnerability")[:300]
+            name = str(artifact.get("name") or "package")[:500]
+            version = str(artifact.get("version") or "unknown")[:300]
+            package_type = str(artifact.get("type") or "unknown")[:100]
+            purl = str(artifact.get("purl") or "")[:2000]
+            fix = vulnerability.get("fix") or {}
+            locations = [
+                str(location.get("path") or "")[:2000]
+                for location in (artifact.get("locations") or [])[:20]
+                if isinstance(location, dict) and location.get("path")
+            ]
+            details = {
+                "finding": f"{vulnerability_id} affects {name} {version}",
+                "vulnerability_id": vulnerability_id,
+                "namespace": vulnerability.get("namespace"),
+                "package": name,
+                "installed_version": version,
+                "package_type": package_type,
+                "purl": purl or None,
+                "fixed_versions": (fix.get("versions") or [])[:20],
+                "fix_state": fix.get("state"),
+                "references": (vulnerability.get("urls") or [])[:20],
+                "risk": vulnerability.get("risk"),
+                "locations": locations,
+                "match_details": (match.get("match_details") or [])[:20],
+                "source_content": "[OMITTED]",
+            }
+            asset = purl or f"{package_type}:{name}@{version}"
+            fingerprint = hashlib.sha256(f"grype|{vulnerability_id}|{package_type}|{name}|{version}|{purl}".encode()).hexdigest()
+            severity = severity_map.get(str(vulnerability.get("severity") or "UNKNOWN").upper(), "info")
+            records.append((uuid4(), run_id, "dependency-vulnerability", f"{vulnerability_id}: {name} {version}", severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
 
 
 def write_syft_output(raw_output: bytes, output_file: Path) -> None:
@@ -2236,6 +2364,8 @@ def execute_run(run_id: UUID) -> None:
                 container_volumes[TRIVY_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
             if run["tool_id"] == "osv-scanner":
                 container_volumes[OSV_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
+            if run["tool_id"] == "grype":
+                container_volumes[GRYPE_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
         elif run["tool_id"] == "nuclei-reviewed":
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
         elif run["tool_id"] == "ffuf":
@@ -2281,6 +2411,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trufflehog" else
                 {"HOME": "/tmp", "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/cache"}
                 if run["tool_id"] == "osv-scanner" else
+                {"HOME": "/tmp", "GRYPE_CHECK_FOR_APP_UPDATE": "false", "GRYPE_DB_AUTO_UPDATE": "false", "GRYPE_DB_CACHE_DIR": "/cache"}
+                if run["tool_id"] == "grype" else
                 {"HOME": "/tmp", "SYFT_CHECK_FOR_APP_UPDATE": "false", "SYFT_CACHE_DIR": "/tmp"}
                 if run["tool_id"] == "syft" else
                 {"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "SEMGREP_SETTINGS_FILE": "/tmp/settings.yml", "SEMGREP_SEND_METRICS": "off"}
@@ -2418,6 +2550,12 @@ def execute_run(run_id: UUID) -> None:
                 write_syft_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "grype":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_grype_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "checkov":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -2466,7 +2604,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
