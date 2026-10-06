@@ -8,6 +8,8 @@ import tarfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+import urllib.error
+import urllib.request
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
@@ -63,6 +65,7 @@ RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_HEARTBEAT_TTL = 15
 POLL_SECONDS = 1.0
+MAX_API_SCHEMA_BYTES = 5 * 1024 * 1024
 
 
 def heartbeat_loop() -> None:
@@ -140,6 +143,36 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "schemathesis":
+        target = urlsplit(base_url)
+        if target.scheme not in {"http", "https"} or not target.netloc:
+            raise ValueError("Schemathesis schema URL must be HTTP(S)")
+        origin = f"{target.scheme}://{target.netloc}"
+        command = [
+            "run", "/schema/openapi.json",
+            "--url", origin,
+            "--phases", "fuzzing",
+            "--workers", "1",
+            "--max-time", "20",
+            "--max-examples", "2",
+            "--max-failures", "3",
+            "--checks", "not_a_server_error,status_code_conformance,content_type_conformance,response_schema_conformance,negative_data_rejection",
+            "--rate-limit", "2/s",
+            "--request-timeout", "5",
+            "--request-retries", "0",
+            "--max-redirects", "0",
+            "--generation-deterministic",
+            "--output-sanitize", "true",
+            "--output-truncate", "true",
+            "--coverage-no-report",
+            "--warnings", "off",
+            "--no-color",
+            "--report", "json",
+            "--report-json-path", "/tmp/report.json",
+        ]
+        for path in excluded_paths or []:
+            command.extend(["--exclude-path", "/" + str(path).lstrip("/")])
+        return command
     if tool_id == "grype":
         return ["dir:/src", "-o", "json"]
     if tool_id == "syft":
@@ -1095,6 +1128,96 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
         ],
     }
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def write_schemathesis_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Schemathesis report is not a JSON object")
+    failures = []
+    for finding in (payload.get("failures") or [])[:200]:
+        if not isinstance(finding, dict):
+            continue
+        failures.append({
+            "type": finding.get("type"),
+            "title": finding.get("title"),
+            "severity": finding.get("severity"),
+            "count": finding.get("count"),
+            "operations": [str(item)[:500] for item in (finding.get("operations") or [])[:100]],
+        })
+    errors = []
+    for error in (payload.get("errors") or [])[:100]:
+        if not isinstance(error, dict):
+            continue
+        errors.append({
+            "type": error.get("type"),
+            "title": error.get("title"),
+        })
+    sanitized = {
+        "schema": "security-platform-schemathesis-v1",
+        "schemathesis_version": payload.get("schemathesis_version"),
+        "running_time": payload.get("running_time"),
+        "stop_reason": payload.get("stop_reason"),
+        "complete": payload.get("complete"),
+        "exit_code": payload.get("exit_code"),
+        "operations": payload.get("operations"),
+        "phases": payload.get("phases"),
+        "test_cases": payload.get("test_cases"),
+        "failure_count": len(failures),
+        "failures": failures,
+        "error_count": len(errors),
+        "errors": errors,
+        "requests": "[OMITTED]",
+        "responses": "[OMITTED]",
+        "payloads": "[OMITTED]",
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_schemathesis(run_id: UUID, output_file: Path) -> int:
+    severity_map = {
+        "CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium",
+        "LOW": "low", "INFO": "info",
+    }
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for failure in report.get("failures") or []:
+            finding_type = str(failure.get("type") or "api-conformance")[:300]
+            title = str(failure.get("title") or "API contract violation")[:500]
+            severity = severity_map.get(str(failure.get("severity") or "MEDIUM").upper(), "medium")
+            operations = failure.get("operations") or ["API operation"]
+            for operation in operations[:100]:
+                asset = str(operation or "API operation")[:2000]
+                details = {
+                    "finding": title,
+                    "failure_type": finding_type,
+                    "operation": asset,
+                    "occurrences": int(failure.get("count") or 1),
+                    "requests": "[OMITTED]",
+                    "responses": "[OMITTED]",
+                    "payloads": "[OMITTED]",
+                }
+                fingerprint = hashlib.sha256(f"schemathesis|{finding_type}|{asset}".encode()).hexdigest()
+                records.append((uuid4(), run_id, "api-contract-violation", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
 
 
 def write_grype_output(raw_output: bytes, output_file: Path) -> None:
@@ -2254,6 +2377,78 @@ def normalize_gitleaks(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def prepare_schemathesis_schema(run: dict, run_dir: Path) -> Path:
+    schema_url = str(run["base_url"])
+    target = urlsplit(schema_url)
+    target_host = (target.hostname or "").lower().rstrip(".")
+    if target.scheme not in {"http", "https"} or not target_host:
+        raise RuntimeError("Schemathesis schema URL must be HTTP(S)")
+    allowed_hosts = {
+        str(host).lower().rstrip(".") for host in (run.get("allowed_hosts") or [])
+    }
+    if target_host not in allowed_hosts:
+        raise RuntimeError("Schemathesis schema host is outside the saved scope")
+
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    request = urllib.request.Request(
+        schema_url,
+        headers={"User-Agent": "security-platform-schema-fetch/1.0", "Accept": "application/json, application/yaml, text/yaml"},
+    )
+    try:
+        with opener.open(request, timeout=10) as response:
+            raw = response.read(MAX_API_SCHEMA_BYTES + 1)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Could not fetch API schema without redirects: {exc}") from exc
+    if len(raw) > MAX_API_SCHEMA_BYTES:
+        raise RuntimeError("API schema exceeds the 5 MiB limit")
+    try:
+        text = raw.decode("utf-8")
+        try:
+            schema = json.loads(text)
+        except json.JSONDecodeError:
+            schema = yaml.safe_load(text)
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise RuntimeError("API schema is not valid UTF-8 JSON/YAML") from exc
+    if not isinstance(schema, dict) or not (schema.get("openapi") or schema.get("swagger")):
+        raise RuntimeError("Target did not return an OpenAPI schema")
+    paths = schema.get("paths") or {}
+    if not isinstance(paths, dict) or len(paths) > 1000:
+        raise RuntimeError("API schema has an invalid or excessive paths section")
+
+    def validate(value) -> None:
+        if isinstance(value, dict):
+            reference = value.get("$ref")
+            if isinstance(reference, str):
+                parsed = urlsplit(reference)
+                if parsed.scheme or parsed.netloc:
+                    raise RuntimeError("Remote OpenAPI references are not permitted")
+            servers = value.get("servers")
+            if isinstance(servers, list):
+                for server in servers:
+                    if not isinstance(server, dict) or not isinstance(server.get("url"), str):
+                        continue
+                    parsed = urlsplit(server["url"])
+                    server_host = (parsed.hostname or "").lower().rstrip(".")
+                    if server_host and server_host != target_host:
+                        raise RuntimeError("OpenAPI server URL is outside the authorized host")
+            for child in value.values():
+                validate(child)
+        elif isinstance(value, list):
+            for child in value:
+                validate(child)
+
+    validate(schema)
+    schema_file = run_dir / "schema.json"
+    schema_file.write_text(json.dumps(schema, separators=(",", ":")) + "\n", encoding="utf-8")
+    schema_file.chmod(0o644)
+    return schema_file
+
+
 def execute_run(run_id: UUID) -> None:
     run = get_run(run_id)
     if run is None or run["status"] != "queued":
@@ -2345,6 +2540,9 @@ def execute_run(run_id: UUID) -> None:
         cpus = float(resources.get("cpus", 0.5))
         pids = int(resources.get("pids", 128))
         timeout_seconds = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
+        schemathesis_schema_file = None
+        if run["tool_id"] == "schemathesis":
+            schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
         )
@@ -2368,6 +2566,8 @@ def execute_run(run_id: UUID) -> None:
                 container_volumes[GRYPE_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
         elif run["tool_id"] == "nuclei-reviewed":
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
+        elif run["tool_id"] == "schemathesis":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "schema.json")] = {"bind": "/schema/openapi.json", "mode": "ro"}
         elif run["tool_id"] == "ffuf":
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
         elif run["tool_id"] == "arjun":
@@ -2388,7 +2588,7 @@ def execute_run(run_id: UUID) -> None:
             detach=True,
             # testssl and ZAP need ephemeral writable image layers for their own runtimes.
             # They remain non-root, capability-free, resource-limited, and are removed after each run.
-            read_only=run["tool_id"] not in {"testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"},
+            read_only=run["tool_id"] not in {"schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"},
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             mem_limit=memory,
@@ -2413,6 +2613,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "osv-scanner" else
                 {"HOME": "/tmp", "GRYPE_CHECK_FOR_APP_UPDATE": "false", "GRYPE_DB_AUTO_UPDATE": "false", "GRYPE_DB_CACHE_DIR": "/cache"}
                 if run["tool_id"] == "grype" else
+                {"HOME": "/tmp"}
+                if run["tool_id"] == "schemathesis" else
                 {"HOME": "/tmp", "SYFT_CHECK_FOR_APP_UPDATE": "false", "SYFT_CACHE_DIR": "/tmp"}
                 if run["tool_id"] == "syft" else
                 {"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "SEMGREP_SETTINGS_FILE": "/tmp/settings.yml", "SEMGREP_SEND_METRICS": "off"}
@@ -2420,12 +2622,12 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
-            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] == "testssl" else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
             entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
-                None if run["tool_id"] in {"testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+                None if run["tool_id"] in {"schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
                 else {
                     "/tmp": (
                         "rw,nosuid,nodev,noexec,size=128m"
@@ -2503,6 +2705,13 @@ def execute_run(run_id: UUID) -> None:
             (run_dir / "tool.log").write_bytes(logs)
             if exit_code == 0:
                 capture_testssl_output(container, output_file)
+            else:
+                output_file.write_bytes(logs)
+        elif run["tool_id"] == "schemathesis":
+            (run_dir / "tool.log").write_bytes(logs)
+            if exit_code in {0, 1}:
+                capture_json_output(container, "/tmp/report.json", output_file)
+                write_schemathesis_output(output_file.read_bytes(), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"}:
@@ -2602,9 +2811,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

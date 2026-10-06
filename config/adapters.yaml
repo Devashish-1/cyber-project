@@ -1,4 +1,18 @@
 adapters:
+  schemathesis:
+    version: 4.28.0
+    image: ghcr.io/schemathesis/schemathesis@sha256:0a71757c60ccdba270c154a859d9dd3d019625f782f23ab36ad604771e15f78b
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 90
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 1g, pids: 192}
+    output: sanitized-json-summary
+    capabilities: [openapi-schema-validation, response-conformance, negative-data-rejection, bounded-property-testing]
+    controls: [schema-size-limit-5m, redirects-disabled, external-schema-refs-rejected, external-server-urls-rejected, same-origin-api-base, single-worker, rate-limit-2-rps, max-time-20s, max-examples-2, max-failures-3, deterministic-generation, payloads-omitted, responses-omitted, pinned-image]
+    state: verified-image
+
   grype:
     version: 0.119.0
     image: anchore/grype@sha256:8c2c9234a345577a6d321a4753aa3ee1276d8975c8452d2344a56b57733ecad3
