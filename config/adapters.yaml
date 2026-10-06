@@ -288,6 +288,20 @@ adapters:
     controls: [reviewed-small-wordlist, exclusions-preflight, two-threads, delay-250ms-per-thread, timeout-5s, retries-disabled, redirects-disabled, backup-discovery-disabled, extensions-disabled, no-recursion, errors-omitted, pinned-image]
     state: verified-image
 
+  feroxbuster:
+    version: 2.13.1
+    image: security-platform/feroxbuster@sha256:c8f7d2125fb3cbf30901667ca816e17209f481cb25d4aa177fe66471bfa4578c
+    input: target
+    profile: extended-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 120
+    user: scanner
+    resources: {cpus: 0.75, memory: 384m, pids: 128}
+    output: sanitized-json
+    capabilities: [bounded-recursive-content-discovery, nested-path-cross-check]
+    controls: [reviewed-small-wordlist, exclusions-preflight-and-runtime, depth-2, scan-limit-1, two-threads, rate-limit-4-rps, timeout-5s, total-time-90s, response-limit-1m, redirects-disabled, link-extraction-disabled, extensions-disabled, backup-collection-disabled, word-collection-disabled, state-disabled, auto-bail, response-headers-omitted, pinned-image]
+    state: verified-image
+
   httpx:
     version: v1.12.0
     image: projectdiscovery/httpx@sha256:f8275a7c6aaec187249df9eaf4ad9196f4677adfc6a51a47b4aaa1d4db4f8ffc
