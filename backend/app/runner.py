@@ -184,6 +184,8 @@ def build_command(
             "\\( -name Dockerfile -o -name '*.dockerfile' \\) "
             "-exec hadolint -f json {} +",
         ]
+    if tool_id == "shellcheck":
+        return ["-f", "json1", "/dev/null"]
     if tool_id == "gitleaks":
         return [
             "detect",
@@ -1347,6 +1349,46 @@ def normalize_hadolint(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def normalize_shellcheck(run_id: UUID, output_file: Path) -> int:
+    severity_map = {"error": "high", "warning": "medium", "info": "low", "style": "info"}
+    records = []
+    try:
+        raw, decoder, offset, findings = output_file.read_text(encoding="utf-8"), json.JSONDecoder(), 0, []
+        while offset < len(raw):
+            while offset < len(raw) and raw[offset].isspace():
+                offset += 1
+            if offset >= len(raw):
+                break
+            payload, offset = decoder.raw_decode(raw, offset)
+            if isinstance(payload, dict):
+                findings.extend(payload.get("comments") or [])
+        for item in findings:
+            code = f"SC{int(item.get('code') or 0):04d}"
+            path = str(item.get("file") or "script.sh")[:2000]
+            line, column = int(item.get("line") or 0), int(item.get("column") or 0)
+            level = str(item.get("level") or "info").lower()
+            message = str(item.get("message") or "Shell issue")[:500]
+            details = {"finding": message, "rule_id": code, "file": path, "line": line, "column": column, "reference": f"https://www.shellcheck.net/wiki/{code}", "source_excerpt": "[OMITTED]"}
+            fingerprint = hashlib.sha256(f"shellcheck|{code}|{path}|{line}|{column}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "shell-static-analysis", f"{code}: {message}", severity_map.get(level, "info"), f"{path}:{line}", json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
         result = container.exec_run(["cat", container_path])
@@ -1806,6 +1848,13 @@ def execute_run(run_id: UUID) -> None:
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"]
         )
+        if run["tool_id"] == "shellcheck":
+            shell_files = sorted(
+                f"/src/{path.relative_to(source_container_path).as_posix()}"
+                for path in source_container_path.rglob("*.sh")
+                if path.is_file()
+            )
+            command = ["-f", "json1", *(shell_files or ["/dev/null"])]
         container_volumes = {}
         if input_type == "source":
             container_volumes[str(source_host_path)] = {"bind": "/src", "mode": "ro"}
@@ -1991,9 +2040,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "osv-scanner"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 1} if run["tool_id"] in {"gitleaks", "hadolint", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "checkov": normalize_checkov, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "naabu": normalize_naabu, "nikto": normalize_nikto, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
