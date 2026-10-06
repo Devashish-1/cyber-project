@@ -2,7 +2,7 @@ profiles:
   observe: {description: Passive production checks, max_concurrency: 2, tools: [httpx, testssl, zap-passive]}
   controlled-active: {description: Reviewed active checks, max_concurrency: 1, tools: [subfinder, dnsx, katana, nuclei-reviewed, zap-baseline, nikto, schemathesis]}
   extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox]}
-  source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, trivy, gitleaks, trufflehog, osv-scanner, checkov, kics, hadolint, shellcheck]}
+  source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, syft, trivy, gitleaks, trufflehog, osv-scanner, checkov, kics, hadolint, shellcheck]}
 
 tools:
   amass: {category: recon, risk: medium, availability: optional, execution: adapter}
@@ -40,6 +40,7 @@ tools:
   semgrep: {category: sast, risk: low, availability: core, execution: adapter}
   bandit: {category: sast-python, risk: low, availability: core, execution: adapter}
   codeql: {category: sast, risk: low, availability: optional, execution: adapter}
+  syft: {category: sbom, risk: low, availability: core, execution: adapter}
   trivy: {category: supply-chain, risk: low, availability: core, execution: adapter}
   gitleaks: {category: secrets, risk: low, availability: core, execution: adapter}
   trufflehog: {category: secrets, risk: low, availability: core, execution: adapter}

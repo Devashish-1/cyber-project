@@ -136,6 +136,8 @@ def build_command(
     adapter: dict | None = None,
     excluded_paths: list[str] | None = None,
 ) -> list[str]:
+    if tool_id == "syft":
+        return ["scan", "dir:/src", "-o", "syft-json"]
     if tool_id == "osv-scanner":
         return [
             "scan", "source",
@@ -1087,6 +1089,90 @@ def write_semgrep_output(raw_output: bytes, output_file: Path) -> None:
         ],
     }
     output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def write_syft_output(raw_output: bytes, output_file: Path) -> None:
+    payload = json.loads(raw_output.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Syft output is not a JSON object")
+    artifacts = []
+    for artifact in (payload.get("artifacts") or [])[:5000]:
+        if not isinstance(artifact, dict):
+            continue
+        locations = []
+        for location in (artifact.get("locations") or [])[:20]:
+            if not isinstance(location, dict):
+                continue
+            path = str(location.get("path") or location.get("accessPath") or "")
+            if path:
+                locations.append({"path": path[:2000]})
+        artifacts.append({
+            "name": artifact.get("name"),
+            "version": artifact.get("version"),
+            "type": artifact.get("type"),
+            "purl": artifact.get("purl"),
+            "cpes": (artifact.get("cpes") or [])[:20],
+            "licenses": (artifact.get("licenses") or [])[:20],
+            "language": artifact.get("language"),
+            "locations": locations,
+        })
+    sanitized = {
+        "schema": {"version": (payload.get("schema") or {}).get("version")},
+        "source": {"type": "approved-source"},
+        "artifact_count": len(artifacts),
+        "artifacts_truncated": len(payload.get("artifacts") or []) > len(artifacts),
+        "artifacts": artifacts,
+    }
+    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_syft(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        for artifact in report.get("artifacts") or []:
+            name = str(artifact.get("name") or "unnamed-component")[:500]
+            version = str(artifact.get("version") or "unknown")[:300]
+            package_type = str(artifact.get("type") or "unknown")[:100]
+            purl = str(artifact.get("purl") or "")[:2000]
+            locations = [
+                str(location.get("path") or "")[:2000]
+                for location in (artifact.get("locations") or [])[:20]
+                if isinstance(location, dict) and location.get("path")
+            ]
+            asset = purl or f"{package_type}:{name}@{version}"
+            details = {
+                "finding": f"Software component {name} {version} detected",
+                "component": name,
+                "version": version,
+                "package_type": package_type,
+                "purl": purl or None,
+                "cpes": (artifact.get("cpes") or [])[:20],
+                "licenses": (artifact.get("licenses") or [])[:20],
+                "language": artifact.get("language"),
+                "locations": locations,
+                "source_content": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"syft|{package_type}|{name}|{version}|{purl}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "software-component", f"Component detected: {name} {version}", "info", asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
 
 
 def write_dalfox_output(raw_output: bytes, output_file: Path) -> None:
@@ -2195,6 +2281,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trufflehog" else
                 {"HOME": "/tmp", "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/cache"}
                 if run["tool_id"] == "osv-scanner" else
+                {"HOME": "/tmp", "SYFT_CHECK_FOR_APP_UPDATE": "false", "SYFT_CACHE_DIR": "/tmp"}
+                if run["tool_id"] == "syft" else
                 {"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "SEMGREP_SETTINGS_FILE": "/tmp/settings.yml", "SEMGREP_SEND_METRICS": "off"}
                 if run["tool_id"] == "njsscan" else
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
@@ -2324,6 +2412,12 @@ def execute_run(run_id: UUID) -> None:
                 write_dalfox_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "syft":
+            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            if exit_code == 0:
+                write_syft_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_bytes(logs)
         elif run["tool_id"] == "checkov":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -2372,7 +2466,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})

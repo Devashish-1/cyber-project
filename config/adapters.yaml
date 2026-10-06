@@ -1,4 +1,18 @@
 adapters:
+  syft:
+    version: 1.52.0
+    image: anchore/syft@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 300
+    user: "1000:1000"
+    resources: {cpus: 0.75, memory: 768m, pids: 128}
+    output: sanitized-sbom-json
+    capabilities: [software-bill-of-materials, package-inventory, purl-inventory, license-inventory]
+    controls: [read-only-source, network-disabled, update-check-disabled, ephemeral-cache, source-content-omitted, component-limit-5000, pinned-image]
+    state: verified-image
+
   osv-scanner:
     version: 2.6.0
     image: ghcr.io/google/osv-scanner@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa
