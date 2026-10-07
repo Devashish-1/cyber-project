@@ -19,6 +19,7 @@ import docker
 import psycopg
 import redis
 import yaml
+from psycopg.types.json import Jsonb
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
@@ -80,6 +81,7 @@ KITERUNNER_WORDLIST_RUNNER_PATH = Path(os.getenv(
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
+RUNNER_RECOVERY = "security-platform:runner:recovery"
 RUNNER_HEARTBEAT_TTL = 15
 RUNNER_READINESS_TTL = 180
 POLL_SECONDS = 1.0
@@ -142,6 +144,101 @@ def adapter_readiness_loop() -> None:
             if client is not None:
                 client.close()
         time.sleep(60)
+
+
+def recover_runner_state(queue) -> None:
+    client = None
+    removed_containers = []
+    cleanup_errors = []
+    try:
+        client = docker.from_env()
+        for container in client.containers.list(
+            all=True, filters={"label": "security-platform.run-id"}
+        ):
+            labels = container.labels or {}
+            run_id_text = labels.get("security-platform.run-id", "")
+            if not container.name.startswith("security-run-"):
+                continue
+            try:
+                UUID(run_id_text)
+                container.remove(force=True)
+                removed_containers.append(run_id_text)
+            except (ValueError, docker.errors.DockerException) as exc:
+                cleanup_errors.append({"run_id": run_id_text[:36], "detail": str(exc)[:200]})
+    finally:
+        if client is not None:
+            client.close()
+
+    recovered = []
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, project_id, status
+                FROM runs
+                WHERE status IN ('running', 'cancelling')
+                ORDER BY created_at
+                FOR UPDATE
+                """
+            )
+            interrupted = cursor.fetchall()
+            for run_id, project_id, previous_status in interrupted:
+                next_status = "cancelled" if previous_status == "cancelling" else "failed"
+                message = (
+                    "Cancellation completed during runner restart recovery"
+                    if next_status == "cancelled"
+                    else "Runner restarted before the tool completed"
+                )
+                cursor.execute(
+                    """
+                    UPDATE runs
+                    SET status = %s, error_message = %s, finished_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (next_status, message, run_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO audit_events
+                        (id, project_id, event_type, actor, object_type, object_id, details)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        uuid4(), project_id, "run.recovered_after_restart", "runner-recovery",
+                        "run", str(run_id),
+                        Jsonb({"previous_status": previous_status, "status": next_status}),
+                    ),
+                )
+                recovered.append((run_id, next_status))
+            cursor.execute("SELECT id FROM runs WHERE status = 'queued' ORDER BY created_at")
+            queued_ids = [str(row[0]) for row in cursor.fetchall()]
+
+    existing_queue = set(queue.lrange(RUN_QUEUE, 0, -1))
+    requeued = [run_id for run_id in queued_ids if run_id not in existing_queue]
+    if requeued:
+        queue.rpush(RUN_QUEUE, *requeued)
+
+    for run_id, next_status in recovered:
+        run_dir = EVIDENCE_ROOT / str(run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        append_event(
+            run_dir / "events.jsonl",
+            {"event": "recovered_after_restart", "status": next_status, "time": time.time()},
+        )
+        try:
+            seal_evidence(run_id, run_dir)
+        except (OSError, ValueError, psycopg.Error) as exc:
+            print(f"recovery evidence sealing error for {run_id}: {exc}", flush=True)
+
+    result = {
+        "checked_at": time.time(),
+        "interrupted_runs": len(recovered),
+        "requeued_runs": len(requeued),
+        "removed_containers": len(removed_containers),
+        "cleanup_errors": cleanup_errors,
+    }
+    queue.set(RUNNER_RECOVERY, json.dumps(result, separators=(",", ":")))
+    print(f"runner recovery: {json.dumps(result, separators=(',', ':'))}", flush=True)
 
 
 def load_adapters() -> dict:
@@ -4294,6 +4391,7 @@ def main() -> None:
         decode_responses=True,
     )
     EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
+    recover_runner_state(queue)
     threading.Thread(target=heartbeat_loop, name="runner-heartbeat", daemon=True).start()
     threading.Thread(target=adapter_readiness_loop, name="runner-readiness", daemon=True).start()
     while True:

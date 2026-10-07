@@ -30,6 +30,7 @@ if len(CONTROL_PLANE_TOKEN) < 32:
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
+RUNNER_RECOVERY = "security-platform:runner:recovery"
 RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
@@ -182,7 +183,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.62.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.63.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -458,11 +459,17 @@ def platform_status() -> dict:
         readiness["age_seconds"] = round(max(0.0, time.time() - readiness["checked_at"]), 1)
     else:
         readiness = None
+    recovery_raw = cache.get(RUNNER_RECOVERY)
+    try:
+        recovery = json.loads(recovery_raw) if recovery_raw else None
+    except (json.JSONDecodeError, TypeError):
+        recovery = None
     disk = shutil.disk_usage(EVIDENCE_ROOT)
     return {
         "runner": runner,
         "runner_heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
         "adapter_readiness": readiness,
+        "runner_recovery": recovery,
         "queue_depth": cache.llen(RUN_QUEUE),
         "runs": {
             "queued": counts.get("queued", 0),
