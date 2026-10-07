@@ -127,6 +127,60 @@ def heartbeat_loop() -> None:
         time.sleep(5)
 
 
+def collect_adapter_readiness(adapters: dict, client, checked_at: float | None = None) -> dict:
+    ready = []
+    missing = []
+    errors = []
+    inventory = []
+    for tool_id, adapter in sorted(adapters.items()):
+        image = adapter.get("image")
+        record = {
+            "tool_id": tool_id,
+            "version": adapter.get("version"),
+            "profile": adapter.get("profile"),
+            "input": adapter.get("input", "target"),
+            "image": image,
+            "state": "error",
+            "image_id": None,
+            "size_bytes": None,
+        }
+        if not isinstance(image, str) or not image:
+            detail = "image is not configured"
+            record["detail"] = detail
+            errors.append({"tool_id": tool_id, "detail": detail})
+            inventory.append(record)
+            continue
+        try:
+            local_image = client.images.get(image)
+            attrs = local_image.attrs if isinstance(local_image.attrs, dict) else {}
+            image_id = str(local_image.id or attrs.get("Id") or "")
+            size = attrs.get("Size")
+            record.update(
+                {
+                    "state": "ready",
+                    "image_id": image_id or None,
+                    "size_bytes": int(size) if isinstance(size, (int, float)) else None,
+                }
+            )
+            ready.append(tool_id)
+        except docker.errors.ImageNotFound:
+            record["state"] = "missing"
+            missing.append(tool_id)
+        except docker.errors.APIError as exc:
+            detail = str(exc)[:200]
+            record["detail"] = detail
+            errors.append({"tool_id": tool_id, "detail": detail})
+        inventory.append(record)
+    return {
+        "checked_at": checked_at if checked_at is not None else time.time(),
+        "total": len(adapters),
+        "ready": len(ready),
+        "missing": missing,
+        "errors": errors,
+        "adapters": inventory,
+    }
+
+
 def adapter_readiness_loop() -> None:
     cache = redis.from_url(
         REDIS_URL,
@@ -139,28 +193,7 @@ def adapter_readiness_loop() -> None:
         try:
             adapters = load_adapters()
             client = docker.from_env()
-            ready = []
-            missing = []
-            errors = []
-            for tool_id, adapter in sorted(adapters.items()):
-                image = adapter.get("image")
-                if not isinstance(image, str) or not image:
-                    errors.append({"tool_id": tool_id, "detail": "image is not configured"})
-                    continue
-                try:
-                    client.images.get(image)
-                    ready.append(tool_id)
-                except docker.errors.ImageNotFound:
-                    missing.append(tool_id)
-                except docker.errors.APIError as exc:
-                    errors.append({"tool_id": tool_id, "detail": str(exc)[:200]})
-            payload = {
-                "checked_at": time.time(),
-                "total": len(adapters),
-                "ready": len(ready),
-                "missing": missing,
-                "errors": errors,
-            }
+            payload = collect_adapter_readiness(adapters, client)
             cache.set(RUNNER_READINESS, json.dumps(payload, separators=(",", ":")), ex=RUNNER_READINESS_TTL)
         except (OSError, yaml.YAMLError, redis.RedisError, docker.errors.DockerException) as exc:
             print(f"adapter readiness error: {exc}", flush=True)
