@@ -89,6 +89,7 @@ MAX_API_SCHEMA_BYTES = 5 * 1024 * 1024
 MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
 MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
 MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
+MAX_CONTAINER_ARCHIVE_BYTES = MAX_TOOL_OUTPUT_BYTES + 2 * 1024 * 1024
 LOG_TRUNCATION_MARKER = b"[security-platform: earlier tool output truncated]\n"
 if not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024:
     raise RuntimeError("MAX_TOOL_OUTPUT_BYTES must be between 1 KiB and 64 MiB")
@@ -922,6 +923,39 @@ def capture_container_logs(container, *, stdout: bool = True, stderr: bool = Tru
 
 def write_tool_log(path: Path, data: bytes) -> None:
     path.write_bytes(bounded_bytes(data, MAX_TOOL_LOG_BYTES))
+
+
+def write_bounded_report(path: Path, data: bytes) -> None:
+    if len(data) > MAX_TOOL_OUTPUT_BYTES:
+        raise RuntimeError(f"Normalized report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes")
+    path.write_bytes(data)
+
+
+def read_container_file(container, container_path: str) -> bytes:
+    stream, stat = container.get_archive(container_path)
+    declared_size = stat.get("size") if isinstance(stat, dict) else None
+    if isinstance(declared_size, int) and declared_size > MAX_TOOL_OUTPUT_BYTES:
+        raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
+    chunks = []
+    archive_size = 0
+    for chunk in stream:
+        archive_size += len(chunk)
+        if archive_size > MAX_CONTAINER_ARCHIVE_BYTES:
+            raise RuntimeError(f"Container report archive is oversized: {container_path}")
+        chunks.append(chunk)
+    with tarfile.open(fileobj=io.BytesIO(b"".join(chunks)), mode="r:*") as archive:
+        member = next((item for item in archive.getmembers() if item.isfile()), None)
+        if member is None:
+            raise RuntimeError(f"Container report was not found: {container_path}")
+        if member.size > MAX_TOOL_OUTPUT_BYTES:
+            raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise RuntimeError(f"Container report could not be read: {container_path}")
+        data = extracted.read(MAX_TOOL_OUTPUT_BYTES + 1)
+    if len(data) > MAX_TOOL_OUTPUT_BYTES:
+        raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
+    return data
 
 
 def normalize_httpx(run_id: UUID, output_file: Path) -> int:
@@ -2164,42 +2198,24 @@ def normalize_arjun(run_id: UUID, output_file: Path) -> int:
 
 
 def capture_testssl_output(container, output_file: Path) -> None:
-    stream, _ = container.get_archive("/tmp")
-    archive = io.BytesIO(b"".join(stream))
-    with tarfile.open(fileobj=archive, mode="r:*") as tar:
-        member = next((item for item in tar.getmembers() if item.isfile() and item.name.lower().endswith(".json")), None)
-        if member is None:
-            raise RuntimeError("testssl JSON output was not found in /tmp")
-        extracted = tar.extractfile(member)
-        if extracted is None:
-            raise RuntimeError("testssl JSON output could not be read")
-        payload = json.loads(extracted.read().decode("utf-8"))
+    payload = json.loads(read_container_file(container, "/tmp/testssl.json").decode("utf-8"))
     records = payload if isinstance(payload, list) else [payload]
-    output_file.write_text(
-        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
-        encoding="utf-8",
+    write_bounded_report(
+        output_file,
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records).encode("utf-8"),
     )
 
 
 def capture_json_output(container, container_path: str, output_file: Path) -> None:
-    stream, _ = container.get_archive(container_path)
-    archive = io.BytesIO(b"".join(stream))
-    with tarfile.open(fileobj=archive, mode="r:*") as tar:
-        member = next((item for item in tar.getmembers() if item.isfile()), None)
-        if member is None:
-            raise RuntimeError(f"JSON output was not found: {container_path}")
-        extracted = tar.extractfile(member)
-        if extracted is None:
-            raise RuntimeError(f"JSON output could not be read: {container_path}")
-        payload = json.loads(extracted.read().decode("utf-8"))
-    output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+    payload = json.loads(read_container_file(container, container_path).decode("utf-8"))
+    write_bounded_report(
+        output_file,
+        (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"),
+    )
 
 
 def capture_kics_output(container, output_file: Path) -> None:
-    result = container.exec_run(["cat", "/tmp/kics-output/results.json"])
-    if result.exit_code != 0:
-        raise RuntimeError("KICS JSON output could not be read")
-    payload = json.loads(result.output.decode("utf-8"))
+    payload = json.loads(read_container_file(container, "/tmp/kics-output/results.json").decode("utf-8"))
     for query in payload.get("queries", []) if isinstance(payload, dict) else []:
         for finding in query.get("files", []) if isinstance(query, dict) else []:
             if not isinstance(finding, dict):
@@ -2207,7 +2223,10 @@ def capture_kics_output(container, output_file: Path) -> None:
             for key in ("actual_value", "search_key", "search_value"):
                 if key in finding:
                     finding[key] = "[OMITTED]"
-    output_file.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+    write_bounded_report(
+        output_file,
+        (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"),
+    )
 
 
 def write_gitleaks_output(raw_output: bytes, output_file: Path) -> None:
@@ -3217,10 +3236,7 @@ def normalize_brakeman(run_id: UUID, output_file: Path) -> int:
 
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
-        result = container.exec_run(["cat", container_path])
-        if result.exit_code != 0:
-            raise RuntimeError(f"Trivy output could not be read: {container_path}")
-        payload = json.loads(result.output.decode("utf-8"))
+        payload = json.loads(read_container_file(container, container_path).decode("utf-8"))
         if not isinstance(payload, dict):
             raise RuntimeError(f"Trivy output is not a JSON object: {container_path}")
         return payload
@@ -3275,9 +3291,15 @@ def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None
         "ArtifactType": raw.get("ArtifactType"),
         "Results": sanitized_results,
     }
-    output_file.write_text(json.dumps(sanitized, separators=(",", ":")) + "\n", encoding="utf-8")
+    write_bounded_report(
+        output_file,
+        (json.dumps(sanitized, separators=(",", ":")) + "\n").encode("utf-8"),
+    )
     sbom = read_container_json("/tmp/sbom.cdx.json")
-    sbom_file.write_text(json.dumps(sbom, separators=(",", ":")) + "\n", encoding="utf-8")
+    write_bounded_report(
+        sbom_file,
+        (json.dumps(sbom, separators=(",", ":")) + "\n").encode("utf-8"),
+    )
 
 
 def normalize_trivy(run_id: UUID, output_file: Path) -> int:
