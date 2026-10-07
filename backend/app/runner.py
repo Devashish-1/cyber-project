@@ -89,6 +89,8 @@ MAX_API_SCHEMA_BYTES = 5 * 1024 * 1024
 MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
 MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
 MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
+MAX_RUN_EVIDENCE_BYTES = int(os.getenv("MAX_RUN_EVIDENCE_BYTES", str(64 * 1024 * 1024)))
+MAX_RUN_EVIDENCE_FILES = int(os.getenv("MAX_RUN_EVIDENCE_FILES", "32"))
 MAX_CONTAINER_ARCHIVE_BYTES = MAX_TOOL_OUTPUT_BYTES + 2 * 1024 * 1024
 LOG_TRUNCATION_MARKER = b"[security-platform: earlier tool output truncated]\n"
 if not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024:
@@ -97,6 +99,10 @@ if not len(LOG_TRUNCATION_MARKER) <= MAX_TOOL_LOG_BYTES <= MAX_TOOL_OUTPUT_BYTES
     raise RuntimeError("MAX_TOOL_LOG_BYTES must fit the truncation marker and not exceed MAX_TOOL_OUTPUT_BYTES")
 if not 1 <= MAX_TOOL_LOG_LINES <= 100_000:
     raise RuntimeError("MAX_TOOL_LOG_LINES must be between 1 and 100000")
+if not MAX_TOOL_OUTPUT_BYTES <= MAX_RUN_EVIDENCE_BYTES <= 1024 * 1024 * 1024:
+    raise RuntimeError("MAX_RUN_EVIDENCE_BYTES must be between the output cap and 1 GiB")
+if not 4 <= MAX_RUN_EVIDENCE_FILES <= 256:
+    raise RuntimeError("MAX_RUN_EVIDENCE_FILES must be between 4 and 256")
 
 
 def heartbeat_loop() -> None:
@@ -275,10 +281,23 @@ def set_status(run_id: UUID, status: str, error: str | None = None) -> None:
 
 def seal_evidence(run_id: UUID, run_dir: Path) -> None:
     manifest_path = run_dir / "integrity.json"
+    evidence_paths = [
+        path for path in sorted(run_dir.iterdir(), key=lambda item: item.name)
+        if path.name not in {manifest_path.name, "integrity.json.tmp"}
+        and not path.is_symlink()
+        and path.is_file()
+    ]
+    if len(evidence_paths) > MAX_RUN_EVIDENCE_FILES:
+        raise ValueError(
+            f"Run evidence contains {len(evidence_paths)} files; limit is {MAX_RUN_EVIDENCE_FILES}"
+        )
+    total_bytes = sum(path.stat().st_size for path in evidence_paths)
+    if total_bytes > MAX_RUN_EVIDENCE_BYTES:
+        raise ValueError(
+            f"Run evidence uses {total_bytes} bytes; limit is {MAX_RUN_EVIDENCE_BYTES}"
+        )
     files = []
-    for path in sorted(run_dir.iterdir(), key=lambda item: item.name):
-        if path.name in {manifest_path.name, "integrity.json.tmp"} or path.is_symlink() or not path.is_file():
-            continue
+    for path in evidence_paths:
         digest = hashlib.sha256()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -293,6 +312,11 @@ def seal_evidence(run_id: UUID, run_dir: Path) -> None:
         "algorithm": "sha256",
         "run_id": str(run_id),
         "sealed_at": time.time(),
+        "total_bytes": total_bytes,
+        "limits": {
+            "max_total_bytes": MAX_RUN_EVIDENCE_BYTES,
+            "max_files": MAX_RUN_EVIDENCE_FILES,
+        },
         "files": files,
     }
     encoded = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -3922,6 +3946,8 @@ def execute_run(run_id: UUID) -> None:
                     "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,
                     "max_log_bytes": MAX_TOOL_LOG_BYTES,
                     "max_log_lines": MAX_TOOL_LOG_LINES,
+                    "max_run_evidence_bytes": MAX_RUN_EVIDENCE_BYTES,
+                    "max_run_evidence_files": MAX_RUN_EVIDENCE_FILES,
                 },
             },
             indent=2,
