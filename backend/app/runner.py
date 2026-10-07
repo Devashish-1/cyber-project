@@ -4147,6 +4147,13 @@ def execute_run(run_id: UUID) -> None:
             },
             volumes=container_volumes or None,
         )
+        append_event(event_file, {
+            "event": "tool_started",
+            "tool_id": run["tool_id"],
+            "timeout_seconds": timeout_seconds,
+            "resources": {"memory": memory, "cpus": cpus, "pids": pids},
+            "time": time.time(),
+        })
 
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -4193,6 +4200,7 @@ def execute_run(run_id: UUID) -> None:
             kics_exit_code if kics_captured else
             int(result.get("StatusCode", 1))
         )
+        append_event(event_file, {"event": "tool_finished", "exit_code": exit_code, "time": time.time()})
         if run["tool_id"] == "testssl":
             write_tool_log(run_dir / "tool.log", logs)
             if exit_code == 0:

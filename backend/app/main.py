@@ -204,7 +204,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.70.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.71.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -448,6 +448,31 @@ def read_jsonl_file(path: Path) -> list[dict]:
     except (UnicodeDecodeError, OSError):
         return []
     return records
+
+
+def read_jsonl_since(path: Path, after: int) -> tuple[list[dict], int]:
+    if not path.is_file():
+        return [], after
+    if path.stat().st_size > MAX_EVIDENCE_BYTES:
+        return [{"event": "omitted", "reason": "Event stream exceeded the display limit"}], after
+    records = []
+    next_after = 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index < after:
+                    next_after = index + 1
+                    continue
+                if len(records) >= MAX_EVIDENCE_LINES:
+                    break
+                next_after = index + 1
+                try:
+                    records.append(sanitize_evidence(json.loads(line)))
+                except json.JSONDecodeError:
+                    records.append({"event": "omitted", "reason": "Malformed event record"})
+    except (UnicodeDecodeError, OSError):
+        return [{"event": "unavailable", "reason": "Event stream could not be read"}], after
+    return records, max(after, next_after)
 
 
 def verify_evidence_integrity(
@@ -1263,6 +1288,35 @@ def get_run(run_id: UUID) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run_row(row)
+
+
+@app.get("/runs/{run_id}/events")
+def get_run_events(run_id: UUID, after: int = 0) -> dict:
+    if after < 0 or after > 100_000:
+        raise HTTPException(status_code=422, detail="after must be between 0 and 100000")
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status, tool_id, started_at, finished_at, error_message FROM runs WHERE id = %s",
+                (run_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    events, next_after = read_jsonl_since(EVIDENCE_ROOT / str(run_id) / "events.jsonl", after)
+    terminal = row[0] in {"succeeded", "failed", "cancelled"}
+    return {
+        "run_id": run_id,
+        "tool_id": row[1],
+        "status": row[0],
+        "terminal": terminal,
+        "started_at": row[2],
+        "finished_at": row[3],
+        "error_message": row[4] if terminal else None,
+        "events": events,
+        "next_after": next_after,
+        "limits": {"max_events_per_response": MAX_EVIDENCE_LINES},
+    }
 
 
 @app.post("/runs/{run_id}/cancel", status_code=202)
