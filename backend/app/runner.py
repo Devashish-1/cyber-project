@@ -658,6 +658,28 @@ def build_command(
             "-f", "/output/results",
             "-q",
         ]
+    if tool_id == "spiderfoot":
+        hostname = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+        if not hostname:
+            raise ValueError("SpiderFoot target does not contain a hostname")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("SpiderFoot requires an authorized DNS domain, not an IP address")
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+            raise ValueError("SpiderFoot target hostname is not a valid DNS domain")
+        return [
+            "sf.py",
+            "-s", hostname,
+            "-m", "sfp_crt",
+            "-F", "INTERNET_NAME,INTERNET_NAME_UNRESOLVED,DOMAIN_NAME",
+            "-o", "json",
+            "-n",
+            "-S", "500",
+            "-max-threads", "2",
+        ]
     if tool_id == "dnsx":
         if not dns_resolver:
             raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -1579,6 +1601,93 @@ def normalize_theharvester(run_id: UUID, output_file: Path) -> int:
                 "third_party_services": True,
             }
             fingerprint = hashlib.sha256(f"theharvester|subdomain|{hostname}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "subdomain", "Certificate-transparency hostname discovered", "info", hostname, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def parse_spiderfoot_hosts(payload: object, root_domain: str) -> list[str]:
+    root = root_domain.lower().rstrip(".")
+    domain_pattern = re.compile(
+        r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    )
+    allowed_types = {"Internet Name", "Unresolved Internet Name", "Domain Name"}
+    scoped = set()
+    if not isinstance(payload, list):
+        return []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if item.get("module") != "sfp_crt" or item.get("type") not in allowed_types:
+            continue
+        hostname = str(item.get("data") or "").strip().lower().lstrip("*.").rstrip(".")
+        if (
+            domain_pattern.fullmatch(hostname)
+            and (hostname == root or hostname.endswith(f".{root}"))
+        ):
+            scoped.add(hostname)
+    return sorted(scoped)
+
+
+def write_spiderfoot_output(raw_bytes: bytes, output_file: Path, root_domain: str) -> None:
+    try:
+        raw_text = raw_bytes.decode("utf-8", errors="strict").strip()
+        start = raw_text.find("[")
+        end = raw_text.rfind("]")
+        payload = json.loads(raw_text[start:end + 1]) if start >= 0 and end >= start else []
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = []
+    names = parse_spiderfoot_hosts(payload, root_domain)
+    with output_file.open("w", encoding="utf-8") as handle:
+        for hostname in names:
+            handle.write(json.dumps({
+                "host": hostname,
+                "root_domain": root_domain.lower().rstrip("."),
+                "source": "crt.sh",
+                "mode": "passive",
+            }, separators=(",", ":")) + "\n")
+
+
+def normalize_spiderfoot(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            hostname = str(item.get("host") or "").lower().rstrip(".")[:2000]
+            root_domain = str(item.get("root_domain") or "").lower().rstrip(".")[:2000]
+            if not hostname or not root_domain or not (
+                hostname == root_domain or hostname.endswith(f".{root_domain}")
+            ):
+                continue
+            details = {
+                "root_domain": root_domain,
+                "mode": "passive",
+                "source": "crt.sh",
+                "module": "sfp_crt",
+                "third_party_services": True,
+                "dns_verification": False,
+                "certificate_fetching": False,
+            }
+            fingerprint = hashlib.sha256(f"spiderfoot|subdomain|{hostname}".encode()).hexdigest()
             records.append((uuid4(), run_id, "subdomain", "Certificate-transparency hostname discovered", "info", hostname, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
@@ -4664,7 +4773,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
                 if run["tool_id"] == "playwright" else
                 {"HOME": "/tmp"}
-                if run["tool_id"] in {"amass", "dnsrecon", "dnsx", "massdns", "theharvester"} else
+                if run["tool_id"] in {"amass", "dnsrecon", "dnsx", "massdns", "spiderfoot", "theharvester"} else
                 {
                     "HOME": "/tmp/semgrep-home",
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
@@ -4728,6 +4837,11 @@ def execute_run(run_id: UUID) -> None:
                     **(
                         {"/home/scanner": "rw,nosuid,nodev,noexec,size=8m,uid=1000,gid=1000,mode=0700"}
                         if run["tool_id"] == "kiterunner"
+                        else {}
+                    ),
+                    **(
+                        {"/var/lib/spiderfoot": "rw,nosuid,nodev,noexec,size=192m,uid=999,gid=999,mode=0700"}
+                        if run["tool_id"] == "spiderfoot"
                         else {}
                     ),
                 }
@@ -4889,6 +5003,22 @@ def execute_run(run_id: UUID) -> None:
                     encoding="utf-8",
                 )
             shutil.rmtree(raw_dir, ignore_errors=True)
+        elif run["tool_id"] == "spiderfoot":
+            host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+            stdout = capture_container_logs(container, stdout=True, stderr=False)
+            stderr = capture_container_logs(container, stdout=False, stderr=True)
+            write_tool_log(
+                run_dir / "tool.log",
+                b"SpiderFoot raw events, source data, and private scan database omitted; "
+                b"only in-scope sfp_crt hostnames normalized.\n" + stderr,
+            )
+            if exit_code == 0:
+                write_spiderfoot_output(stdout, output_file, host)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "SpiderFoot execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "dnsx":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
@@ -5059,7 +5189,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")

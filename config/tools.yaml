@@ -8,7 +8,7 @@ tools:
   amass: {category: recon, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Passive enumeration contacts third-party data sources; require provider/scope approval before automation."}
   subfinder: {category: recon, risk: low, availability: core, execution: adapter}
   theharvester: {category: osint, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Queries third-party search and intelligence providers; require provider terms and scope approval."}
-  spiderfoot: {category: osint, risk: medium, availability: optional, execution: standalone}
+  spiderfoot: {category: osint, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Only the crt.sh module is automated; explicit provider/scope approval is required and identity data is not retained."}
   recon-ng: {category: osint, risk: medium, availability: optional, execution: manual}
   sherlock: {category: osint, risk: low, availability: optional, execution: manual}
   maigret: {category: osint, risk: low, availability: optional, execution: manual}
