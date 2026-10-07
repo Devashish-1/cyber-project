@@ -79,7 +79,9 @@ KITERUNNER_WORDLIST_RUNNER_PATH = Path(os.getenv(
 ))
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
+RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_HEARTBEAT_TTL = 15
+RUNNER_READINESS_TTL = 180
 POLL_SECONDS = 1.0
 MAX_API_SCHEMA_BYTES = 5 * 1024 * 1024
 
@@ -97,6 +99,49 @@ def heartbeat_loop() -> None:
         except redis.RedisError as exc:
             print(f"runner heartbeat error: {exc}", flush=True)
         time.sleep(5)
+
+
+def adapter_readiness_loop() -> None:
+    cache = redis.from_url(
+        REDIS_URL,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        decode_responses=True,
+    )
+    while True:
+        client = None
+        try:
+            adapters = load_adapters()
+            client = docker.from_env()
+            ready = []
+            missing = []
+            errors = []
+            for tool_id, adapter in sorted(adapters.items()):
+                image = adapter.get("image")
+                if not isinstance(image, str) or not image:
+                    errors.append({"tool_id": tool_id, "detail": "image is not configured"})
+                    continue
+                try:
+                    client.images.get(image)
+                    ready.append(tool_id)
+                except docker.errors.ImageNotFound:
+                    missing.append(tool_id)
+                except docker.errors.APIError as exc:
+                    errors.append({"tool_id": tool_id, "detail": str(exc)[:200]})
+            payload = {
+                "checked_at": time.time(),
+                "total": len(adapters),
+                "ready": len(ready),
+                "missing": missing,
+                "errors": errors,
+            }
+            cache.set(RUNNER_READINESS, json.dumps(payload, separators=(",", ":")), ex=RUNNER_READINESS_TTL)
+        except (OSError, yaml.YAMLError, redis.RedisError, docker.errors.DockerException) as exc:
+            print(f"adapter readiness error: {exc}", flush=True)
+        finally:
+            if client is not None:
+                client.close()
+        time.sleep(60)
 
 
 def load_adapters() -> dict:
@@ -4250,6 +4295,7 @@ def main() -> None:
     )
     EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=heartbeat_loop, name="runner-heartbeat", daemon=True).start()
+    threading.Thread(target=adapter_readiness_loop, name="runner-readiness", daemon=True).start()
     while True:
         try:
             item = queue.blpop(RUN_QUEUE, timeout=5)
