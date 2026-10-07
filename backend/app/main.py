@@ -234,7 +234,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.77.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.78.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -294,7 +294,8 @@ class CredentialProfileDelete(BaseModel):
 class BatchCreate(BaseModel):
     target_id: UUID
     credential_profile_id: UUID | None = None
-    plan_id: str = Field(pattern="^(observe|authenticated-browser|controlled-web|extended-web)$")
+    plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web)$")
+    tool_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
 
@@ -1302,7 +1303,12 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit batch approval is required")
     storage_admission(enforce=True)
-    tool_ids = RUN_PLANS[payload.plan_id]
+    if (payload.plan_id is None) == (payload.tool_ids is None):
+        raise HTTPException(status_code=422, detail="Select exactly one preset plan or a custom tool sequence")
+    tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
+    if len(tool_ids) != len(set(tool_ids)):
+        raise HTTPException(status_code=422, detail="Custom workflows cannot contain duplicate adapters")
+    plan_id = payload.plan_id or f"custom-{hashlib.sha256(json.dumps(tool_ids).encode()).hexdigest()[:12]}"
     if payload.credential_profile_id is not None and "playwright" not in tool_ids:
         raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
     queue_admission(requested_slots=len(tool_ids), enforce=True)
@@ -1315,6 +1321,8 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             raise HTTPException(status_code=422, detail=f"Plan adapter is unavailable: {tool_id}")
         if tool.get("execution") in {"disabled", "manual"}:
             raise HTTPException(status_code=422, detail=f"Plan adapter cannot run automatically: {tool_id}")
+        if adapter.get("input", "target") != "target":
+            raise HTTPException(status_code=422, detail=f"Custom target workflows cannot contain source adapter: {tool_id}")
 
     batch_id = uuid4()
     run_ids = [uuid4() for _ in tool_ids]
@@ -1348,7 +1356,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                     (id, project_id, target_id, credential_profile_id, plan_id, requested_by)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (batch_id, project_id, payload.target_id, payload.credential_profile_id, payload.plan_id, payload.requested_by),
+                (batch_id, project_id, payload.target_id, payload.credential_profile_id, plan_id, payload.requested_by),
             )
             cursor.executemany(
                 """
@@ -1369,7 +1377,8 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             record_audit(
                 cursor, project_id, "workflow.approved", payload.requested_by, "batch", batch_id,
                 {
-                    "target_id": str(payload.target_id), "plan_id": payload.plan_id, "tools": tool_ids,
+                    "target_id": str(payload.target_id), "plan_id": plan_id,
+                    "plan_type": "preset" if payload.plan_id else "custom", "tools": tool_ids,
                     "credential_profile_id": str(payload.credential_profile_id) if payload.credential_profile_id else None,
                     "credential_role": credential_role,
                 },
@@ -1379,7 +1388,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     return {
         "id": batch_id,
         "status": "queued",
-        "plan_id": payload.plan_id,
+        "plan_id": plan_id,
         "target_id": payload.target_id,
         "credential_profile_id": payload.credential_profile_id,
         "run_ids": run_ids,
