@@ -196,6 +196,8 @@ def init_database() -> None:
                 ALTER TABLE runs ALTER COLUMN target_id DROP NOT NULL;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS source_artifact_id UUID
                     REFERENCES source_artifacts(id) ON DELETE CASCADE;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS credential_profile_id UUID
+                    REFERENCES credential_profiles(id) ON DELETE RESTRICT;
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -228,7 +230,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.72.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.73.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -258,6 +260,7 @@ class TargetCreate(BaseModel):
 class RunCreate(BaseModel):
     target_id: UUID | None = None
     source_artifact_id: UUID | None = None
+    credential_profile_id: UUID | None = None
     tool_id: str = Field(min_length=1, max_length=100)
     profile: str = Field(min_length=1, max_length=100)
     requested_by: str = Field(min_length=2, max_length=120)
@@ -383,6 +386,7 @@ def run_row(row: tuple) -> dict:
         "finished_at": row[10],
         "retest_of_observation": row[11] if len(row) > 11 else None,
         "source_artifact_id": row[12] if len(row) > 12 else None,
+        "credential_profile_id": row[13] if len(row) > 13 else None,
     }
 
 
@@ -1176,6 +1180,9 @@ def delete_credential_profile(profile_id: UUID, payload: CredentialProfileDelete
             profile = cursor.fetchone()
             if profile is None:
                 raise HTTPException(status_code=404, detail="Credential profile not found")
+            cursor.execute("SELECT COUNT(*) FROM runs WHERE credential_profile_id = %s", (profile_id,))
+            if cursor.fetchone()[0]:
+                raise HTTPException(status_code=409, detail="Credential profile is referenced by run history and cannot be deleted")
             cursor.execute("DELETE FROM credential_profiles WHERE id = %s", (profile_id,))
             record_audit(
                 cursor, profile[0], "credential_profile.deleted", payload.requested_by,
@@ -1210,6 +1217,8 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
         raise HTTPException(status_code=422, detail="Tool runner is not implemented yet")
     if adapter.get("profile") != payload.profile:
         raise HTTPException(status_code=422, detail="Tool is not approved for the selected profile")
+    if payload.credential_profile_id is not None and payload.tool_id != "playwright":
+        raise HTTPException(status_code=422, detail="Credential profiles are only supported by the Playwright adapter")
     input_type = adapter.get("input", "target")
     if input_type == "source":
         if payload.source_artifact_id is None or payload.target_id is not None:
@@ -1218,6 +1227,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
         raise HTTPException(status_code=422, detail="This adapter requires exactly one authorized target")
 
     run_id = uuid4()
+    credential_role = None
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             if input_type == "source":
@@ -1240,14 +1250,27 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=404, detail="Target not found in project")
                 if not target[0]:
                     raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+                if payload.credential_profile_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT role_name FROM credential_profiles
+                        WHERE id = %s AND project_id = %s AND target_id = %s
+                        """,
+                        (payload.credential_profile_id, project_id, payload.target_id),
+                    )
+                    credential = cursor.fetchone()
+                    if credential is None:
+                        raise HTTPException(status_code=404, detail="Credential profile not found for the selected target")
+                    credential_role = credential[0]
             cursor.execute(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, source_artifact_id, tool_id, profile, status, requested_by)
-                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s)
+                    (id, project_id, target_id, source_artifact_id, credential_profile_id,
+                     tool_id, profile, status, requested_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s)
                 """,
                 (
-                    run_id, project_id, payload.target_id, payload.source_artifact_id,
+                    run_id, project_id, payload.target_id, payload.source_artifact_id, payload.credential_profile_id,
                     payload.tool_id, payload.profile, payload.requested_by,
                 ),
             )
@@ -1256,6 +1279,8 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                 {
                     "target_id": str(payload.target_id) if payload.target_id else None,
                     "source_artifact_id": str(payload.source_artifact_id) if payload.source_artifact_id else None,
+                    "credential_profile_id": str(payload.credential_profile_id) if payload.credential_profile_id else None,
+                    "credential_role": credential_role,
                     "tool_id": payload.tool_id, "profile": payload.profile,
                 },
             )
@@ -1375,7 +1400,7 @@ def get_batch(batch_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation, source_artifact_id
+                       retest_of_observation, source_artifact_id, credential_profile_id
                 FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
                 """,
                 (batch_id,),
@@ -1425,7 +1450,7 @@ def list_runs(project_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation, source_artifact_id
+                       retest_of_observation, source_artifact_id, credential_profile_id
                 FROM runs WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -1442,7 +1467,7 @@ def get_run(run_id: UUID) -> dict:
                 """
                 SELECT id, project_id, target_id, tool_id, profile, status,
                        requested_by, error_message, created_at, started_at, finished_at,
-                       retest_of_observation, source_artifact_id
+                       retest_of_observation, source_artifact_id, credential_profile_id
                 FROM runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1915,7 +1940,8 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT r.project_id, r.target_id, r.source_artifact_id, r.tool_id, r.profile,
+                SELECT r.project_id, r.target_id, r.source_artifact_id, r.credential_profile_id,
+                       r.tool_id, r.profile,
                        COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE)
                 FROM observations o
                 JOIN runs r ON r.id = o.run_id
@@ -1928,7 +1954,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             origin = cursor.fetchone()
             if origin is None:
                 raise HTTPException(status_code=404, detail="Observation not found")
-            project_id, target_id, source_artifact_id, tool_id, profile, input_authorized = origin
+            project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile, input_authorized = origin
             registry_tool = load_registry().get("tools", {}).get(tool_id)
             adapter = load_adapters().get("adapters", {}).get(tool_id)
             if not input_authorized:
@@ -1940,12 +1966,12 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             cursor.execute(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, source_artifact_id, tool_id, profile,
+                    (id, project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile,
                      status, requested_by, retest_of_observation)
-                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)
                 """,
                 (
-                    run_id, project_id, target_id, source_artifact_id, tool_id, profile,
+                    run_id, project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile,
                     payload.requested_by, observation_id,
                 ),
             )
@@ -1956,6 +1982,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                     "run_id": str(run_id),
                     "target_id": str(target_id) if target_id else None,
                     "source_artifact_id": str(source_artifact_id) if source_artifact_id else None,
+                    "credential_profile_id": str(credential_profile_id) if credential_profile_id else None,
                     "tool_id": tool_id, "profile": profile,
                 },
             )
@@ -1963,6 +1990,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
     return {
         "id": run_id, "status": "queued", "project_id": project_id,
         "target_id": target_id, "source_artifact_id": source_artifact_id,
+        "credential_profile_id": credential_profile_id,
         "tool_id": tool_id, "profile": profile,
         "retest_of_observation": observation_id,
     }

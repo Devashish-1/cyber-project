@@ -4,6 +4,7 @@ import ipaddress
 import re
 import io
 import os
+import socket
 import tarfile
 import threading
 import time
@@ -19,10 +20,16 @@ import docker
 import psycopg
 import redis
 import yaml
+from cryptography.fernet import Fernet, InvalidToken
 from psycopg.types.json import Jsonb
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
+CREDENTIAL_ENCRYPTION_KEY = os.environ["CREDENTIAL_ENCRYPTION_KEY"].encode("ascii")
+try:
+    CREDENTIAL_CIPHER = Fernet(CREDENTIAL_ENCRYPTION_KEY)
+except (TypeError, ValueError) as exc:
+    raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key") from exc
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 EVIDENCE_HOST_ROOT = Path(os.getenv(
@@ -345,10 +352,14 @@ def get_run(run_id: UUID) -> dict | None:
                 SELECT r.status, r.tool_id, r.profile, t.base_url, t.allowed_hosts,
                        t.excluded_paths, t.dns_resolver,
                        COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
-                       r.source_artifact_id, s.filename, s.sha256
+                       r.source_artifact_id, s.filename, s.sha256,
+                       r.credential_profile_id, cp.role_name, cp.login_url,
+                       cp.username_selector, cp.password_selector, cp.submit_selector,
+                       cp.encrypted_secret
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
+                LEFT JOIN credential_profiles cp ON cp.id = r.credential_profile_id
                 WHERE r.id = %s
                 """,
                 (run_id,),
@@ -368,6 +379,13 @@ def get_run(run_id: UUID) -> dict | None:
         "source_artifact_id": row[8],
         "source_filename": row[9],
         "source_sha256": row[10],
+        "credential_profile_id": row[11],
+        "credential_role": row[12],
+        "credential_login_url": row[13],
+        "credential_username_selector": row[14],
+        "credential_password_selector": row[15],
+        "credential_submit_selector": row[16],
+        "credential_encrypted_secret": row[17],
     }
 
 
@@ -1898,6 +1916,8 @@ def write_playwright_output(raw_output: bytes, output_file: Path) -> None:
                 "title": str(item.get("title") or "")[:500],
                 "status_code": int(item.get("status_code") or 0),
                 "content_type": str(item.get("content_type") or "")[:200],
+                "authentication_attempted": bool(item.get("authentication_attempted")),
+                "role_name": str(item.get("role_name") or "")[:120] or None,
                 "same_origin_requests": min(max(int(item.get("same_origin_requests") or 0), 0), 10000),
                 "blocked_requests": min(max(int(item.get("blocked_requests") or 0), 0), 10000),
                 "failed_requests": min(max(int(item.get("failed_requests") or 0), 0), 10000),
@@ -1925,6 +1945,8 @@ def normalize_playwright(run_id: UUID, output_file: Path) -> int:
             "title": item.get("title"),
             "status_code": status,
             "content_type": item.get("content_type"),
+            "authentication_attempted": bool(item.get("authentication_attempted")),
+            "role_name": item.get("role_name"),
             "same_origin_requests": item.get("same_origin_requests"),
             "blocked_requests": item.get("blocked_requests"),
             "failed_requests": item.get("failed_requests"),
@@ -1935,7 +1957,9 @@ def normalize_playwright(run_id: UUID, output_file: Path) -> int:
             "response_body": "[OMITTED]",
             "cookies": "[OMITTED]",
         }
-        fingerprint = hashlib.sha256(f"playwright|{asset}|{status}".encode()).hexdigest()
+        fingerprint = hashlib.sha256(
+            f"playwright|{asset}|{status}|{item.get('role_name') or 'anonymous'}".encode()
+        ).hexdigest()
         record = (uuid4(), run_id, "browser-page", title, "info", asset, json.dumps(details), fingerprint)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return 0
@@ -3775,12 +3799,28 @@ def prepare_playwright_input(run: dict, run_dir: Path) -> tuple[Path, Path]:
     target_path = target.path or "/"
     if any(blocked == "/" or target_path == blocked or target_path.startswith(blocked + "/") for blocked in excluded):
         raise ValueError("Playwright target URL is inside an excluded path")
+    authenticated = run.get("credential_profile_id") is not None
+    login_url = run.get("credential_login_url")
+    if authenticated:
+        login = urlsplit(login_url or "")
+        login_host = (login.hostname or "").lower().rstrip(".")
+        login_path = login.path or "/"
+        if login.scheme not in {"http", "https"} or login_host != target_host or login.query or login.fragment:
+            raise ValueError("Credential profile login URL is outside the approved Playwright origin")
+        if any(blocked == "/" or login_path == blocked or login_path.startswith(blocked + "/") for blocked in excluded):
+            raise ValueError("Credential profile login URL is inside an excluded path")
     config_file = run_dir / "browser-config.json"
     config_file.write_text(json.dumps({
         "target": run["base_url"],
         "allowed_host": target_host,
         "excluded_paths": excluded,
         "navigation_timeout_ms": 15000,
+        "authenticated": authenticated,
+        "login_url": login_url if authenticated else None,
+        "role_name": run.get("credential_role") if authenticated else None,
+        "username_selector": run.get("credential_username_selector") if authenticated else None,
+        "password_selector": run.get("credential_password_selector") if authenticated else None,
+        "submit_selector": run.get("credential_submit_selector") if authenticated else None,
     }, separators=(",", ":")) + "\n", encoding="utf-8")
     config_file.chmod(0o644)
     script_file = run_dir / "browser-observe.js"
@@ -3811,6 +3851,15 @@ const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pat
       metrics.blocked_requests += 1;
       return route.abort("blockedbyclient");
     });
+    if (config.authenticated) {
+      const credentials = JSON.parse(fs.readFileSync("/auth/credentials.json", "utf8"));
+      await page.goto(config.login_url, {waitUntil: "domcontentloaded", timeout: config.navigation_timeout_ms});
+      await page.locator(config.username_selector).fill(credentials.username);
+      await page.locator(config.password_selector).fill(credentials.password);
+      await page.locator(config.submit_selector).click();
+      await page.waitForLoadState("domcontentloaded", {timeout: config.navigation_timeout_ms}).catch(() => {});
+      await page.waitForTimeout(500);
+    }
     const response = await page.goto(config.target, {waitUntil: "domcontentloaded", timeout: config.navigation_timeout_ms});
     await page.waitForTimeout(500);
     const result = {
@@ -3820,6 +3869,8 @@ const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pat
       title: (await page.title()).slice(0, 500),
       status_code: response ? response.status() : 0,
       content_type: response ? String((await response.allHeaders())["content-type"] || "").slice(0, 200) : "",
+      authentication_attempted: Boolean(config.authenticated),
+      role_name: config.authenticated ? String(config.role_name || "").slice(0, 120) : null,
       ...metrics,
     };
     console.log(JSON.stringify(result));
@@ -3834,6 +3885,25 @@ const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pat
 ''', encoding="utf-8")
     script_file.chmod(0o644)
     return script_file, config_file
+
+
+def playwright_secret_payload(run: dict) -> bytes:
+    encrypted = run.get("credential_encrypted_secret")
+    if encrypted is None:
+        raise ValueError("Credential profile secret is missing")
+    try:
+        decrypted = CREDENTIAL_CIPHER.decrypt(bytes(encrypted))
+        payload = json.loads(decrypted.decode("utf-8"))
+    except (InvalidToken, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("Credential profile could not be decrypted") from exc
+    username = payload.get("username") if isinstance(payload, dict) else None
+    password = payload.get("password") if isinstance(payload, dict) else None
+    if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
+        raise ValueError("Credential profile secret is invalid")
+    encoded = json.dumps({"username": username, "password": password}, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 8192:
+        raise ValueError("Credential profile secret exceeds the runtime limit")
+    return encoded
 
 
 def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
@@ -3942,6 +4012,8 @@ def execute_run(run_id: UUID) -> None:
                 "allowed_hosts": run["allowed_hosts"] if input_type == "target" else [],
                 "excluded_paths": run["excluded_paths"] if input_type == "target" else [],
                 "dns_resolver": run["dns_resolver"] if input_type == "target" else None,
+                "credential_profile_id": str(run["credential_profile_id"]) if run.get("credential_profile_id") else None,
+                "authenticated_role": run.get("credential_role") if run.get("credential_profile_id") else None,
                 "capture_limits": {
                     "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,
                     "max_log_bytes": MAX_TOOL_LOG_BYTES,
@@ -3959,6 +4031,7 @@ def execute_run(run_id: UUID) -> None:
     append_event(event_file, {"event": "started", "time": time.time()})
     client = None
     container = None
+    stdin_socket = None
     trivy_captured = False
     kics_captured = False
     kics_exit_code = 1
@@ -4057,9 +4130,19 @@ def execute_run(run_id: UUID) -> None:
                 "bind": "/zap/wrk/scope-hook.py",
                 "mode": "ro",
             }
-        container = client.containers.run(
+        container_command = command
+        container_entrypoint = {"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node", "codeql": "/bin/sh"}.get(run["tool_id"])
+        if run["tool_id"] == "playwright" and run.get("credential_profile_id"):
+            container_entrypoint = "/bin/sh"
+            container_command = [
+                "-c",
+                "umask 077; cat > /auth/credentials.json; "
+                "test -s /auth/credentials.json; "
+                "exec node /input/browser-observe.js /input/browser-config.json",
+            ]
+        container = client.containers.create(
             adapter["image"],
-            command=command,
+            command=container_command,
             name=f"security-run-{run_id}",
             detach=True,
             # testssl and ZAP need ephemeral writable image layers for their own runtimes.
@@ -4072,6 +4155,7 @@ def execute_run(run_id: UUID) -> None:
             pids_limit=pids,
             network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
+            stdin_open=run["tool_id"] == "playwright" and bool(run.get("credential_profile_id")),
             environment=(
                 {"HOME": "/tmp", "CODEQL_SEARCH_PATH": "/opt/codeql-repo"}
                 if run["tool_id"] == "codeql" else
@@ -4107,7 +4191,7 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node", "codeql": "/bin/sh"}.get(run["tool_id"]),
+            entrypoint=container_entrypoint,
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
@@ -4120,6 +4204,11 @@ def execute_run(run_id: UUID) -> None:
                         "rw,nosuid,nodev,noexec,size=128m"
                         if run["tool_id"] in {"kics", "kubescape"}
                         else "rw,nosuid,nodev,noexec,size=64m"
+                    ),
+                    **(
+                        {"/auth": "rw,nosuid,nodev,noexec,size=1m,uid=1001,gid=1001,mode=0700"}
+                        if run["tool_id"] == "playwright" and run.get("credential_profile_id")
+                        else {}
                     ),
                     **(
                         {
@@ -4147,11 +4236,21 @@ def execute_run(run_id: UUID) -> None:
             },
             volumes=container_volumes or None,
         )
+        if run["tool_id"] == "playwright" and run.get("credential_profile_id"):
+            secret_payload = playwright_secret_payload(run)
+            stdin_socket = client.api.attach_socket(container.id, params={"stdin": 1, "stream": 1})
+            container.start()
+            stdin_socket._sock.sendall(secret_payload)
+            stdin_socket._sock.shutdown(socket.SHUT_WR)
+            secret_payload = b""
+        else:
+            container.start()
         append_event(event_file, {
             "event": "tool_started",
             "tool_id": run["tool_id"],
             "timeout_seconds": timeout_seconds,
             "resources": {"memory": memory, "cpus": cpus, "pids": pids},
+            "authenticated_role": run.get("credential_role") if run.get("credential_profile_id") else None,
             "time": time.time(),
         })
 
@@ -4435,6 +4534,12 @@ def execute_run(run_id: UUID) -> None:
         set_status(run_id, "failed", str(exc)[:1000])
         append_event(event_file, {"event": "failed", "error": str(exc)[:1000], "time": time.time()})
     finally:
+        if stdin_socket is not None:
+            try:
+                stdin_socket._response.close()
+                stdin_socket.close()
+            except (OSError, ValueError):
+                pass
         if container is not None:
             try:
                 container.remove(force=True)
