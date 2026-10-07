@@ -618,6 +618,27 @@ def build_command(
         return ["-c", "exit 64"]
     if tool_id == "playwright":
         return ["/input/browser-observe.js", "/input/browser-config.json"]
+    if tool_id == "amass":
+        hostname = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+        if not hostname:
+            raise ValueError("Amass target does not contain a hostname")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Amass requires an authorized DNS domain, not an IP address")
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+            raise ValueError("Amass target hostname is not a valid DNS domain")
+        return [
+            "enum",
+            "-passive",
+            "-norecursive",
+            "-nocolor",
+            "-timeout", "1",
+            "-d", hostname,
+            "-o", "/output/raw.txt",
+        ]
     if tool_id == "dnsx":
         if not dns_resolver:
             raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -1394,6 +1415,77 @@ def normalize_nuclei(run_id: UUID, output_file: Path) -> int:
                 f"nuclei|{template_id}|{matcher}|{asset}".encode()
             ).hexdigest()
             records.append((uuid4(), run_id, "nuclei-finding", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def parse_amass_names(raw_text: str, root_domain: str) -> list[str]:
+    root = root_domain.lower().rstrip(".")
+    if not root:
+        return []
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    pattern = re.compile(
+        rf"(?i)(?<![a-z0-9_-])(?:{label}\.)*{re.escape(root)}(?![a-z0-9_-])"
+    )
+    return sorted(
+        {
+            match.group(0).lower().rstrip(".")
+            for match in pattern.finditer(raw_text)
+            if len(match.group(0)) <= 253
+        }
+    )
+
+
+def write_amass_output(raw_file: Path, output_file: Path, root_domain: str) -> None:
+    names = parse_amass_names(
+        raw_file.read_text(encoding="utf-8", errors="replace"),
+        root_domain,
+    )
+    with output_file.open("w", encoding="utf-8") as handle:
+        for hostname in names:
+            handle.write(json.dumps({
+                "host": hostname,
+                "root_domain": root_domain.lower().rstrip("."),
+                "mode": "passive",
+            }, separators=(",", ":")) + "\n")
+
+
+def normalize_amass(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            hostname = str(item.get("host") or "").lower().rstrip(".")[:2000]
+            root_domain = str(item.get("root_domain") or "").lower().rstrip(".")[:2000]
+            if not hostname or not root_domain or not (
+                hostname == root_domain or hostname.endswith(f".{root_domain}")
+            ):
+                continue
+            details = {
+                "root_domain": root_domain,
+                "mode": "passive",
+                "third_party_services": True,
+            }
+            fingerprint = hashlib.sha256(f"amass|subdomain|{hostname}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "subdomain", "Passive subdomain discovered", "info", hostname, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
     if not records:
@@ -3944,6 +4036,24 @@ def prepare_schemathesis_schema(run: dict, run_dir: Path) -> Path:
     return schema_file
 
 
+def prepare_amass_output(run: dict, run_dir: Path) -> Path:
+    host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("Amass target must contain a hostname")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Amass requires a DNS domain, not an IP literal")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+        raise ValueError("Amass target hostname is invalid")
+    raw_file = run_dir / "amass-raw.txt"
+    raw_file.write_text("", encoding="utf-8")
+    raw_file.chmod(0o666)
+    return raw_file
+
+
 def prepare_dnsx_input(run: dict, run_dir: Path) -> Path:
     if not run.get("dns_resolver"):
         raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -4313,6 +4423,8 @@ def execute_run(run_id: UUID) -> None:
         schemathesis_schema_file = None
         if run["tool_id"] == "schemathesis":
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
+        if run["tool_id"] == "amass":
+            prepare_amass_output(run, run_dir)
         if run["tool_id"] == "dnsx":
             prepare_dnsx_input(run, run_dir)
         if run["tool_id"] == "massdns":
@@ -4354,6 +4466,10 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
         elif run["tool_id"] == "schemathesis":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "schema.json")] = {"bind": "/schema/openapi.json", "mode": "ro"}
+        elif run["tool_id"] == "amass":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "amass-raw.txt")] = {
+                "bind": "/output/raw.txt", "mode": "rw",
+            }
         elif run["tool_id"] == "dnsx":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsx-hosts.txt")] = {
                 "bind": "/input/hosts.txt",
@@ -4431,7 +4547,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
                 if run["tool_id"] == "playwright" else
                 {"HOME": "/tmp"}
-                if run["tool_id"] in {"dnsrecon", "dnsx", "massdns"} else
+                if run["tool_id"] in {"amass", "dnsrecon", "dnsx", "massdns"} else
                 {
                     "HOME": "/tmp/semgrep-home",
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
@@ -4623,6 +4739,21 @@ def execute_run(run_id: UUID) -> None:
                 write_feroxbuster_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "amass":
+            raw_file = run_dir / "amass-raw.txt"
+            host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+            (run_dir / "tool.log").write_text(
+                "Amass provider output omitted; passive in-scope hostnames normalized.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0:
+                write_amass_output(raw_file, output_file, host)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "Amass execution failed; provider output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+            raw_file.unlink(missing_ok=True)
         elif run["tool_id"] == "dnsx":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
@@ -4793,7 +4924,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")
@@ -4831,6 +4962,11 @@ def execute_run(run_id: UUID) -> None:
         if run["tool_id"] == "dnsrecon":
             try:
                 (run_dir / "dnsrecon-raw.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+        if run["tool_id"] == "amass":
+            try:
+                (run_dir / "amass-raw.txt").unlink(missing_ok=True)
             except OSError:
                 pass
         if run["tool_id"] == "dnsx":
