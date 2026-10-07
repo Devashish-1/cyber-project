@@ -44,6 +44,10 @@ MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
 MAX_SOURCE_FILES = 5_000
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
+MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**3)))
+MAX_STORAGE_USED_PERCENT = float(os.getenv("MAX_STORAGE_USED_PERCENT", "90"))
+if MIN_STORAGE_FREE_BYTES < 0 or not 1 <= MAX_STORAGE_USED_PERCENT <= 100:
+    raise RuntimeError("Storage admission thresholds are invalid")
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
 
 
@@ -183,7 +187,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.63.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.64.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -342,6 +346,25 @@ def sanitize_evidence(value):
     return value
 
 
+def storage_admission(*, enforce: bool = False) -> dict:
+    disk = shutil.disk_usage(EVIDENCE_ROOT)
+    used_percent = (disk.used / disk.total) * 100
+    allowed = disk.free >= MIN_STORAGE_FREE_BYTES and used_percent < MAX_STORAGE_USED_PERCENT
+    result = {
+        "allowed": allowed,
+        "free_bytes": disk.free,
+        "minimum_free_bytes": MIN_STORAGE_FREE_BYTES,
+        "used_percent": round(used_percent, 1),
+        "maximum_used_percent": MAX_STORAGE_USED_PERCENT,
+    }
+    if enforce and not allowed:
+        raise HTTPException(
+            status_code=507,
+            detail="Insufficient protected storage capacity; new work is temporarily blocked",
+        )
+    return result
+
+
 def read_json_file(path: Path) -> dict:
     if not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
         return {}
@@ -465,6 +488,7 @@ def platform_status() -> dict:
     except (json.JSONDecodeError, TypeError):
         recovery = None
     disk = shutil.disk_usage(EVIDENCE_ROOT)
+    admission = storage_admission()
     return {
         "runner": runner,
         "runner_heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
@@ -482,6 +506,7 @@ def platform_status() -> dict:
             "free_bytes": disk.free,
             "used_percent": round((disk.used / disk.total) * 100, 1),
         },
+        "storage_admission": admission,
     }
 
 
@@ -664,6 +689,7 @@ async def upload_source_artifact(
 ) -> dict:
     if not authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit source authorization confirmation is required")
+    storage_admission(enforce=True)
     filename = Path(archive.filename or "").name
     if not filename.lower().endswith(".zip"):
         raise HTTPException(status_code=422, detail="Only ZIP source archives are accepted")
@@ -875,6 +901,7 @@ def list_targets(project_id: UUID) -> dict:
 def create_run(project_id: UUID, payload: RunCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit run approval is required")
+    storage_admission(enforce=True)
 
     registry = load_registry()
     adapters = load_adapters().get("adapters", {})
@@ -952,6 +979,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
 def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit batch approval is required")
+    storage_admission(enforce=True)
     tool_ids = RUN_PLANS[payload.plan_id]
     registry = load_registry().get("tools", {})
     adapters = load_adapters().get("adapters", {})
@@ -1473,6 +1501,7 @@ def get_project_audit_events(project_id: UUID, limit: int = 100) -> dict:
 def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit retest approval is required")
+    storage_admission(enforce=True)
     run_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
