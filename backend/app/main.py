@@ -88,6 +88,8 @@ def init_database() -> None:
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS retest_of_observation UUID;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS evidence_manifest_sha256 TEXT;
+                ALTER TABLE runs ADD COLUMN IF NOT EXISTS evidence_sealed_at TIMESTAMPTZ;
                 CREATE INDEX IF NOT EXISTS runs_batch_step_idx
                     ON runs(batch_id, batch_step, created_at);
                 CREATE INDEX IF NOT EXISTS runs_project_created_idx
@@ -175,7 +177,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.58.1", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.59.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -349,6 +351,57 @@ def read_jsonl_file(path: Path) -> list[dict]:
     except (UnicodeDecodeError, OSError):
         return []
     return records
+
+
+def verify_evidence_integrity(
+    run_id: UUID,
+    run_directory: Path,
+    expected_manifest_sha256: str | None,
+    sealed_at: object,
+) -> dict:
+    if not expected_manifest_sha256:
+        return {"status": "unsealed", "sealed_at": None, "files": 0}
+    manifest_path = run_directory / "integrity.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise HTTPException(status_code=409, detail="Evidence integrity manifest is missing")
+    try:
+        encoded = manifest_path.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != expected_manifest_sha256:
+            raise HTTPException(status_code=409, detail="Evidence integrity manifest does not match its database seal")
+        manifest = json.loads(encoded)
+        if (
+            manifest.get("version") != 1
+            or manifest.get("algorithm") != "sha256"
+            or manifest.get("run_id") != str(run_id)
+            or not isinstance(manifest.get("files"), list)
+        ):
+            raise HTTPException(status_code=409, detail="Evidence integrity manifest is invalid")
+        expected_names = set()
+        for item in manifest["files"]:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not isinstance(name, str) or not name or Path(name).name != name:
+                raise HTTPException(status_code=409, detail="Evidence integrity manifest contains an invalid path")
+            expected_names.add(name)
+            path = run_directory / name
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(status_code=409, detail=f"Sealed evidence file is missing: {name}")
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if path.stat().st_size != item.get("size") or digest.hexdigest() != item.get("sha256"):
+                raise HTTPException(status_code=409, detail=f"Sealed evidence file failed verification: {name}")
+        actual_names = {
+            path.name for path in run_directory.iterdir()
+            if path.name != "integrity.json" and path.is_file() and not path.is_symlink()
+        }
+        if actual_names != expected_names:
+            raise HTTPException(status_code=409, detail="Evidence directory contains unsealed files")
+    except HTTPException:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise HTTPException(status_code=409, detail="Evidence integrity verification failed")
+    return {"status": "verified", "sealed_at": sealed_at, "files": len(expected_names)}
 
 
 @app.get("/health")
@@ -1077,15 +1130,20 @@ def cancel_run(run_id: UUID) -> dict:
 def get_run_evidence(run_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+            cursor.execute(
+                "SELECT status, evidence_manifest_sha256, evidence_sealed_at FROM runs WHERE id = %s",
+                (run_id,),
+            )
             row = cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
     run_directory = EVIDENCE_ROOT / str(run_id)
+    integrity = verify_evidence_integrity(run_id, run_directory, row[1], row[2])
     return {
         "run_id": run_id,
         "status": row[0],
+        "integrity": integrity,
         "metadata": read_json_file(run_directory / "metadata.json"),
         "events": read_jsonl_file(run_directory / "events.jsonl"),
         "output": read_jsonl_file(run_directory / "output.jsonl"),
@@ -1130,7 +1188,10 @@ def get_run_observations(run_id: UUID) -> dict:
 def get_run_sbom(run_id: UUID) -> FileResponse:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT tool_id, status FROM runs WHERE id = %s", (run_id,))
+            cursor.execute(
+                "SELECT tool_id, status, evidence_manifest_sha256, evidence_sealed_at FROM runs WHERE id = %s",
+                (run_id,),
+            )
             run = cursor.fetchone()
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1139,6 +1200,7 @@ def get_run_sbom(run_id: UUID) -> FileResponse:
     sbom_path = EVIDENCE_ROOT / str(run_id) / "sbom.cdx.json"
     if not sbom_path.is_file():
         raise HTTPException(status_code=404, detail="SBOM is not available for this run")
+    verify_evidence_integrity(run_id, sbom_path.parent, run[2], run[3])
     return FileResponse(
         sbom_path,
         media_type="application/vnd.cyclonedx+json",

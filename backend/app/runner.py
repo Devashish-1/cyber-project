@@ -120,6 +120,46 @@ def set_status(run_id: UUID, status: str, error: str | None = None) -> None:
             )
 
 
+def seal_evidence(run_id: UUID, run_dir: Path) -> None:
+    manifest_path = run_dir / "integrity.json"
+    files = []
+    for path in sorted(run_dir.iterdir(), key=lambda item: item.name):
+        if path.name in {manifest_path.name, "integrity.json.tmp"} or path.is_symlink() or not path.is_file():
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files.append({
+            "name": path.name,
+            "size": path.stat().st_size,
+            "sha256": digest.hexdigest(),
+        })
+    manifest = {
+        "version": 1,
+        "algorithm": "sha256",
+        "run_id": str(run_id),
+        "sealed_at": time.time(),
+        "files": files,
+    }
+    encoded = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    temporary = run_dir / "integrity.json.tmp"
+    temporary.write_bytes(encoded)
+    temporary.chmod(0o600)
+    temporary.replace(manifest_path)
+    manifest_digest = hashlib.sha256(encoded).hexdigest()
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE runs
+                SET evidence_manifest_sha256 = %s, evidence_sealed_at = NOW()
+                WHERE id = %s
+                """,
+                (manifest_digest, run_id),
+            )
+
+
 def get_run(run_id: UUID) -> dict | None:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
@@ -4195,6 +4235,10 @@ def execute_run(run_id: UUID) -> None:
                     pass
         if client is not None:
             client.close()
+        try:
+            seal_evidence(run_id, run_dir)
+        except (OSError, ValueError, psycopg.Error) as exc:
+            set_status(run_id, "failed", f"Evidence sealing failed: {str(exc)[:900]}")
 
 
 def main() -> None:
