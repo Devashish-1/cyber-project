@@ -1,5 +1,6 @@
 import json
 import hashlib
+import io
 import ipaddress
 import os
 import re
@@ -247,7 +248,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.85.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.86.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1836,6 +1837,107 @@ def get_run_evidence(run_id: UUID) -> dict:
         "output": read_jsonl_file(run_directory / "output.jsonl"),
         "limits": {"max_bytes_per_file": MAX_EVIDENCE_BYTES, "max_lines_per_file": MAX_EVIDENCE_LINES},
     }
+
+
+@app.get("/runs/{run_id}/evidence-bundle")
+def download_run_evidence_bundle(run_id: UUID) -> Response:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT project_id, tool_id, profile, status, requested_by, created_at,
+                       started_at, finished_at, error_message,
+                       evidence_manifest_sha256, evidence_sealed_at
+                FROM runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            run = cursor.fetchone()
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if run[3] not in {"succeeded", "failed", "cancelled"}:
+                raise HTTPException(status_code=409, detail="Evidence can be exported only after the run is terminal")
+
+            run_directory = EVIDENCE_ROOT / str(run_id)
+            integrity = verify_evidence_integrity(run_id, run_directory, run[9], run[10])
+            if integrity["status"] != "verified":
+                raise HTTPException(status_code=409, detail="Legacy unsealed evidence cannot be exported")
+
+            cursor.execute(
+                """
+                SELECT id, observation_type, title, severity, asset, details, fingerprint,
+                       created_at, review_status, review_notes, reviewed_by, reviewed_at
+                FROM observations WHERE run_id = %s ORDER BY created_at, id
+                """,
+                (run_id,),
+            )
+            observations = [
+                {
+                    "id": row[0], "type": row[1], "title": row[2], "severity": row[3],
+                    "asset": row[4], "details": sanitize_evidence(row[5]),
+                    "fingerprint": row[6], "created_at": row[7],
+                    "review_status": row[8], "review_notes": row[9],
+                    "reviewed_by": row[10], "reviewed_at": row[11],
+                }
+                for row in cursor.fetchall()
+            ]
+
+            payloads = {
+                "run.json": {
+                    "run_id": run_id, "project_id": run[0], "tool_id": run[1],
+                    "profile": run[2], "status": run[3], "requested_by": run[4],
+                    "created_at": run[5], "started_at": run[6], "finished_at": run[7],
+                    "error_message": run[8],
+                },
+                "metadata.json": read_json_file(run_directory / "metadata.json"),
+                "events.json": read_jsonl_file(run_directory / "events.jsonl"),
+                "output.json": read_jsonl_file(run_directory / "output.jsonl"),
+                "observations.json": observations,
+                "source-integrity.json": {
+                    "status": integrity["status"],
+                    "sealed_at": integrity["sealed_at"],
+                    "sealed_files": integrity["files"],
+                    "manifest_sha256": run[9],
+                },
+            }
+            encoded_payloads = {
+                name: json.dumps(value, indent=2, sort_keys=True, default=str).encode("utf-8") + b"\n"
+                for name, value in payloads.items()
+            }
+            if sum(len(content) for content in encoded_payloads.values()) > MAX_RUN_EVIDENCE_BYTES:
+                raise HTTPException(status_code=413, detail="Sanitized evidence bundle exceeds the per-run export limit")
+            bundle_manifest = {
+                "version": 1,
+                "algorithm": "sha256",
+                "run_id": str(run_id),
+                "files": [
+                    {"name": name, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                    for name, content in encoded_payloads.items()
+                ],
+                "sanitization": "API redaction and display limits applied; raw scanner files are not included",
+            }
+            encoded_payloads["bundle-manifest.json"] = (
+                json.dumps(bundle_manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+            )
+
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+                for name, content in encoded_payloads.items():
+                    member = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    member.compress_type = zipfile.ZIP_DEFLATED
+                    member.external_attr = 0o600 << 16
+                    bundle.writestr(member, content)
+
+            record_audit(
+                cursor, run[0], "run.evidence_exported", "control-plane-operator", "run", run_id,
+                {"format": "sanitized-zip", "files": len(encoded_payloads)},
+            )
+
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="security-platform-{run_id}-evidence.zip"'},
+    )
 
 
 @app.get("/projects/{project_id}/evidence-integrity")
