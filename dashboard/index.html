@@ -1,103 +1,585 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Security Testing Platform</title>
   <style>
     :root{color-scheme:dark;font-family:Inter,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:#08101f;color:#e7ecff}main{width:min(1240px,94vw);margin:2rem auto 4rem}header{display:flex;justify-content:space-between;gap:1rem}h1{margin:.4rem 0}h2{margin-top:0}p,.muted{color:#aeb9d8}.status,.tag{display:inline-block;padding:.3rem .65rem;border-radius:999px;background:#123e30;color:#83f2bd}.tag{background:#202d50;color:#b9c8ff;font-size:.8rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-top:1.5rem}article{padding:1rem;border:1px solid #263253;border-radius:12px;background:#111936}label{display:block;margin:.7rem 0 .25rem;color:#c9d3f0}input,select,textarea,button{width:100%;padding:.7rem;border-radius:8px;border:1px solid #34446c;background:#0c1530;color:#f1f4ff}textarea{min-height:70px}button{margin-top:.8rem;background:#315bd7;cursor:pointer;font-weight:650}.secondary{background:#29344e}.danger{background:#7d2638}.check{display:flex;gap:.55rem;align-items:center}.check input{width:auto}.message{margin-top:.7rem;min-height:1.2rem;color:#9bb4ff;white-space:pre-wrap}.adapter-details{margin:.8rem 0;padding:.75rem;border:1px solid #34446c;border-radius:8px;background:#0a1229;font-size:.86rem}.adapter-details.warning{border-color:#936f29;background:#241d10}.adapter-details p{margin:.35rem 0}.adapter-details ul{margin:.4rem 0 0;padding-left:1.2rem;color:#c9d3f0}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{padding:.65rem .45rem;border-bottom:1px solid #263253;text-align:left}td button{width:auto;margin:0 .25rem .25rem 0;padding:.35rem .65rem}.running,.cancelling{color:#ffd47e}.succeeded{color:#7ef0b3}.failed,.cancelled{color:#ff8fa4}.workflow-steps{margin:.65rem 0 0;padding-left:1.35rem;min-width:360px}.workflow-steps li{padding:.45rem 0;border-top:1px solid #263253}.workflow-steps li:first-child{border-top:0}.workflow-steps button{font-size:.78rem;padding:.25rem .5rem}.workflow-error{display:block;color:#ff9fb0;margin-top:.2rem;max-width:620px}code{overflow-wrap:anywhere}pre{white-space:pre-wrap;word-break:break-word;background:#080e1c;border:1px solid #263253;border-radius:8px;padding:1rem;max-height:520px;overflow:auto}
   </style>
+  <style>
+    :root{--panel:#111a31;--line:#263557;--muted:#9eabc9;--blue:#4f7cff;--cyan:#45d7ff}body{background:radial-gradient(circle at 88% 0,#122755 0,transparent 32rem),#07101f}.app-shell{min-height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr)}.sidebar{position:sticky;top:0;height:100vh;padding:1.4rem 1rem;border-right:1px solid #1f2d49;background:rgba(6,13,27,.95);display:flex;flex-direction:column;gap:1.25rem}.brand{display:flex;align-items:center;gap:.8rem;padding:.25rem .4rem}.brand-mark{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(145deg,var(--blue),#7159e9);font-weight:900}.brand strong,.brand small{display:block}.brand small,.sidebar-foot{color:var(--muted)}.nav{display:grid;gap:.35rem}.nav button{margin:0;padding:.75rem .8rem;border:1px solid transparent;background:transparent;color:#b6c2df;text-align:left}.nav button:hover{background:#121f3a;border-color:#263c66}.nav button.active{background:linear-gradient(90deg,#1c376f,#182846);border-color:#365da8;color:#fff;box-shadow:inset 3px 0 var(--cyan)}.sidebar-foot{margin-top:auto;padding:.9rem;border-radius:12px;background:#0e1830;border:1px solid #213153;font-size:.8rem}.workspace{width:min(1600px,96%);margin:0 auto;padding:1.6rem 1.4rem 4rem}.topbar{position:sticky;top:.8rem;z-index:5;padding:1rem 1.1rem;border:1px solid #243657;border-radius:16px;background:rgba(9,18,36,.92);backdrop-filter:blur(16px);box-shadow:0 16px 45px #0005}.topbar h1{font-size:1.55rem}.view-hidden{display:none!important}article,details.registry-card{border-radius:14px;background:linear-gradient(150deg,rgba(18,28,53,.98),rgba(12,21,42,.98));box-shadow:0 14px 35px #0002}th{color:#aab9dc;font-size:.77rem;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff05}@media(max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid #1f2d49}.nav{display:flex;overflow-x:auto}.nav button{min-width:max-content}.sidebar-foot{display:none}.workspace{width:100%;padding:1rem}.topbar{top:.35rem}}@media(max-width:620px){.topbar{display:block}.grid{grid-template-columns:1fr}.workspace{padding:.7rem}.nav{margin:0 -.5rem}}
+  </style>
 </head>
-<body><main>
-  <header><div><span class="status" id="health">Checking platform…</span><h1>Security Testing Platform</h1><p>Private control plane for explicitly authorized testing.</p></div><div><button class="secondary" style="width:auto;height:42px" onclick="refreshAll()">Refresh</button><button class="danger" id="emergency-stop-button" style="width:auto;height:42px" onclick="emergencyStop()">Emergency stop</button><button class="secondary" id="resume-button" style="width:auto;height:42px;display:none" onclick="resumePlatform()">Resume testing</button></div></header>
-  <article style="margin-top:1rem" id="auth-panel"><h2>Control-plane access</h2><p class="muted">Enter the server's operator token. It is retained only for this browser tab.</p><div class="grid" style="margin-top:.5rem"><label>Operator token<input type="password" id="control-token" autocomplete="off" placeholder="64-character token"></label><div><label>Status</label><p id="auth-status" class="failed">Locked</p><button id="auth-button" onclick="unlockControlPlane()">Unlock dashboard</button><button class="secondary" id="lock-button" style="display:none" onclick="lockControlPlane()">Lock</button></div></div></article>
-  <article style="margin-top:1rem"><h2>Operator status</h2><div class="grid" style="margin-top:.5rem"><div><span class="muted">Runner</span><p id="runner-status">Checking…</p></div><div><span class="muted">Adapter runtime</span><p id="adapter-runtime-status">Checking…</p></div><div><span class="muted">Active work</span><p id="work-status">Checking…</p></div><div><span class="muted">Evidence disk</span><p id="disk-status">Checking…</p></div><div><span class="muted">Capture limits</span><p id="capture-status">Checking…</p></div><div><span class="muted">Credential vault</span><p id="credential-vault-status">Checking…</p></div></div><details style="margin-top:.8rem"><summary id="adapter-runtime-summary">Adapter runtime inventory</summary><div style="overflow-x:auto"><table><thead><tr><th>Tool</th><th>State</th><th>Profile</th><th>Input</th><th>Version</th><th>Local image</th><th>Size</th></tr></thead><tbody id="adapter-runtime-inventory"><tr><td colspan="7">Waiting for runner inventory…</td></tr></tbody></table></div></details></article>
-  <article style="margin-top:1rem"><h2>Adapter coverage</h2><p class="muted">Live implementation coverage for tools designed to run through the supervised worker. Disabled, manual, standalone, and credential-gated tools are tracked separately and do not inflate this percentage.</p>
-    <div class="grid" style="margin-top:.5rem"><div><span class="muted">Implemented</span><p id="coverage-implemented">Checking…</p></div><div><span class="muted">Adapter coverage</span><p id="coverage-percent">Checking…</p></div><div><span class="muted">Inputs</span><p id="coverage-inputs">Checking…</p></div><div><span class="muted">Other execution modes</span><p id="coverage-other">Checking…</p></div></div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Category</th><th>Implemented</th><th>Eligible</th><th>Coverage</th></tr></thead><tbody id="coverage-categories"><tr><td colspan="4">Loading coverage…</td></tr></tbody></table></div>
-    <details style="margin-top:.8rem"><summary id="coverage-pending-summary">Pending adapter backlog</summary><div style="overflow-x:auto"><table><thead><tr><th>Tool</th><th>Category</th><th>Risk</th><th>Tier</th></tr></thead><tbody id="coverage-pending"><tr><td colspan="4">Loading backlog…</td></tr></tbody></table></div></details>
-    <details style="margin-top:.8rem"><summary id="coverage-gated-summary">Gated, manual, standalone, and excluded tools</summary><div style="overflow-x:auto"><table><thead><tr><th>Tool</th><th>Mode</th><th>Risk</th><th>Why it is not automated</th></tr></thead><tbody id="coverage-gated"><tr><td colspan="4">Loading policy classifications…</td></tr></tbody></table></div></details>
+<body>
+<div class="app-shell">
+<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.95<br>Private operator console</div></aside>
+<main class="workspace">
+  <header class="topbar">
+<div>
+<span class="status" id="health">Checking platform…</span>
+<h1 id="view-title">Platform overview</h1>
+<p id="view-description">Health, runtime readiness, and adapter coverage.</p>
+</div>
+<div>
+<button class="secondary" style="width:auto;height:42px" onclick="refreshAll()">Refresh</button>
+<button class="danger" id="emergency-stop-button" style="width:auto;height:42px" onclick="emergencyStop()">Emergency stop</button>
+<button class="secondary" id="resume-button" style="width:auto;height:42px;display:none" onclick="resumePlatform()">Resume testing</button>
+</div>
+</header>
+<article data-view="overview" style="margin-top:1rem" id="auth-panel">
+<h2>Control-plane access</h2>
+<p class="muted">Enter the server's operator token. It is retained only for this browser tab.</p>
+<div class="grid" style="margin-top:.5rem">
+<label>Operator token<input type="password" id="control-token" autocomplete="off" placeholder="64-character token">
+</label>
+<div>
+<label>Status</label>
+<p id="auth-status" class="failed">Locked</p>
+<button id="auth-button" onclick="unlockControlPlane()">Unlock dashboard</button>
+<button class="secondary" id="lock-button" style="display:none" onclick="lockControlPlane()">Lock</button>
+</div>
+</div>
+</article>
+  <article style="margin-top:1rem">
+<h2 data-section="overview">Operator status</h2>
+<div class="grid" style="margin-top:.5rem">
+<div>
+<span class="muted">Runner</span>
+<p id="runner-status">Checking…</p>
+</div>
+<div>
+<span class="muted">Adapter runtime</span>
+<p id="adapter-runtime-status">Checking…</p>
+</div>
+<div>
+<span class="muted">Active work</span>
+<p id="work-status">Checking…</p>
+</div>
+<div>
+<span class="muted">Evidence disk</span>
+<p id="disk-status">Checking…</p>
+</div>
+<div>
+<span class="muted">Capture limits</span>
+<p id="capture-status">Checking…</p>
+</div>
+<div>
+<span class="muted">Credential vault</span>
+<p id="credential-vault-status">Checking…</p>
+</div>
+</div>
+<details style="margin-top:.8rem">
+<summary id="adapter-runtime-summary">Adapter runtime inventory</summary>
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>State</th>
+<th>Profile</th>
+<th>Input</th>
+<th>Version</th>
+<th>Local image</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody id="adapter-runtime-inventory">
+<tr>
+<td colspan="7">Waiting for runner inventory…</td>
+</tr>
+</tbody>
+</table>
+</div>
+</details>
+</article>
+  <article style="margin-top:1rem">
+<h2 data-section="overview">Adapter coverage</h2>
+<p class="muted">Live implementation coverage for tools designed to run through the supervised worker. Disabled, manual, standalone, and credential-gated tools are tracked separately and do not inflate this percentage.</p>
+    <div class="grid" style="margin-top:.5rem">
+<div>
+<span class="muted">Implemented</span>
+<p id="coverage-implemented">Checking…</p>
+</div>
+<div>
+<span class="muted">Adapter coverage</span>
+<p id="coverage-percent">Checking…</p>
+</div>
+<div>
+<span class="muted">Inputs</span>
+<p id="coverage-inputs">Checking…</p>
+</div>
+<div>
+<span class="muted">Other execution modes</span>
+<p id="coverage-other">Checking…</p>
+</div>
+</div>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Implemented</th>
+<th>Eligible</th>
+<th>Coverage</th>
+</tr>
+</thead>
+<tbody id="coverage-categories">
+<tr>
+<td colspan="4">Loading coverage…</td>
+</tr>
+</tbody>
+</table>
+</div>
+    <details style="margin-top:.8rem">
+<summary id="coverage-pending-summary">Pending adapter backlog</summary>
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Category</th>
+<th>Risk</th>
+<th>Tier</th>
+</tr>
+</thead>
+<tbody id="coverage-pending">
+<tr>
+<td colspan="4">Loading backlog…</td>
+</tr>
+</tbody>
+</table>
+</div>
+</details>
+    <details style="margin-top:.8rem">
+<summary id="coverage-gated-summary">Gated, manual, standalone, and excluded tools</summary>
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Mode</th>
+<th>Risk</th>
+<th>Why it is not automated</th>
+</tr>
+</thead>
+<tbody id="coverage-gated">
+<tr>
+<td colspan="4">Loading policy classifications…</td>
+</tr>
+</tbody>
+</table>
+</div>
+</details>
   </article>
   <section class="grid">
-    <article><h2>1. Project</h2>
-      <label>Current project</label><select id="projects" onchange="findingReviewDirty=false;projectChanged()"><option value="">Select a project</option></select>
-      <label>New project name</label><input id="project-name" maxlength="120" placeholder="Local validation">
-      <label>Description</label><textarea id="project-description"></textarea>
-      <button onclick="createProject()">Create project</button><div class="message" id="project-message"></div>
+    <article>
+<h2 data-section="scope">Project</h2>
+      <label>Current project</label>
+<select id="projects" onchange="findingReviewDirty=false;projectChanged()">
+<option value="">Select a project</option>
+</select>
+      <label>New project name</label>
+<input id="project-name" maxlength="120" placeholder="Local validation">
+      <label>Description</label>
+<textarea id="project-description">
+</textarea>
+      <button onclick="createProject()">Create project</button>
+<div class="message" id="project-message">
+</div>
     </article>
-    <article><h2>2. Authorized target</h2>
-      <label>Saved target policy</label><select id="target-edit-select" onchange="loadTargetForEdit()"><option value="">Create new target</option></select>
-      <label>Base URL</label><input id="target-url" placeholder="http://172.17.0.2">
-      <label>Allowed hosts (one per line)</label><textarea id="allowed-hosts" placeholder="172.17.0.2"></textarea>
-      <label>Excluded paths (one per line)</label><textarea id="excluded-paths" placeholder="/logout"></textarea>
-      <label>Approved DNS resolver (optional; required for dnsx and massdns)</label><input id="dns-resolver" placeholder="192.168.1.1:53">
-      <label>Maximum duration per run (seconds)</label><input type="number" id="target-max-run-seconds" min="30" max="7200" value="300">
-      <label>Testing window start (UTC, optional)</label><input type="time" id="target-window-start">
-      <label>Testing window end (UTC, optional)</label><input type="time" id="target-window-end">
-      <label class="check"><input type="checkbox" id="target-allow-state-changing"> Allow explicitly approved state-changing extended-active tests</label>
-      <label class="check"><input type="checkbox" id="target-allow-third-party-services"> Allow explicitly approved third-party intelligence/provider access</label>
-      <label>Authorization reference</label><input id="auth-reference" placeholder="locally-owned-docker-lab">
-      <label class="check"><input type="checkbox" id="target-authorized"> I confirm authorization for this scope</label>
+    <article>
+<h2 data-section="scope">Authorized target</h2>
+      <label>Saved target policy</label>
+<select id="target-edit-select" onchange="loadTargetForEdit()">
+<option value="">Create new target</option>
+</select>
+      <label>Base URL</label>
+<input id="target-url" placeholder="http://172.17.0.2">
+      <label>Allowed hosts (one per line)</label>
+<textarea id="allowed-hosts" placeholder="172.17.0.2">
+</textarea>
+      <label>Excluded paths (one per line)</label>
+<textarea id="excluded-paths" placeholder="/logout">
+</textarea>
+      <label>Approved DNS resolver (optional; required for dnsx and massdns)</label>
+<input id="dns-resolver" placeholder="192.168.1.1:53">
+      <label>Maximum duration per run (seconds)</label>
+<input type="number" id="target-max-run-seconds" min="30" max="7200" value="300">
+      <label>Testing window start (UTC, optional)</label>
+<input type="time" id="target-window-start">
+      <label>Testing window end (UTC, optional)</label>
+<input type="time" id="target-window-end">
+      <label class="check">
+<input type="checkbox" id="target-allow-state-changing"> Allow explicitly approved state-changing extended-active tests</label>
+      <label class="check">
+<input type="checkbox" id="target-allow-third-party-services"> Allow explicitly approved third-party intelligence/provider access</label>
+      <label>Authorization reference</label>
+<input id="auth-reference" placeholder="locally-owned-docker-lab">
+      <label class="check">
+<input type="checkbox" id="target-authorized"> I confirm authorization for this scope</label>
       <button onclick="createTarget()">Create target</button>
       <button class="secondary" onclick="updateTarget()">Update selected policy</button>
       <button class="secondary" onclick="resetTargetEditor()">Cancel editing</button>
-      <div class="message" id="target-message"></div>
+      <div class="message" id="target-message">
+</div>
     </article>
-    <article><h2>3. Approved run</h2>
-      <label id="target-selector-label">Target</label><select id="targets" onchange="refreshRunCredentials();refreshBatchCredentials()"><option value="">Select a target</option></select>
-      <label id="source-selector-label">Source archive</label><select id="run-source-artifact"><option value="">Select a source archive</option></select>
-      <label>Encrypted test account (optional; Playwright only)</label><select id="run-credential-profile" disabled><option value="">Anonymous session</option></select>
-      <label>Implemented adapter</label><select id="adapters" onchange="adapterChanged()"><option value="">Select an adapter</option></select>
-      <label>Execution profile</label><input id="profile" readonly>
-      <div class="adapter-details" id="adapter-details" aria-live="polite"><p class="muted">Select an adapter to review its controls.</p></div>
-      <label>Requested by</label><input id="requested-by" value="killswitch">
-      <label class="check"><input type="checkbox" id="run-approved"> I approve this run within the saved scope</label>
-      <button onclick="createRun()">Queue run</button><div class="message" id="run-message"></div>
+    <article>
+<h2 data-section="runs">Queue approved run</h2>
+      <label id="target-selector-label">Target</label>
+<select id="targets" onchange="refreshRunCredentials();refreshBatchCredentials()">
+<option value="">Select a target</option>
+</select>
+      <label id="source-selector-label">Source archive</label>
+<select id="run-source-artifact">
+<option value="">Select a source archive</option>
+</select>
+      <label>Encrypted test account (optional; Playwright only)</label>
+<select id="run-credential-profile" disabled>
+<option value="">Anonymous session</option>
+</select>
+      <label>Implemented adapter</label>
+<select id="adapters" onchange="adapterChanged()">
+<option value="">Select an adapter</option>
+</select>
+      <label>Execution profile</label>
+<input id="profile" readonly>
+      <div class="adapter-details" id="adapter-details" aria-live="polite">
+<p class="muted">Select an adapter to review its controls.</p>
+</div>
+      <label>Requested by</label>
+<input id="requested-by" value="killswitch">
+      <label class="check">
+<input type="checkbox" id="run-approved"> I approve this run within the saved scope</label>
+      <button onclick="createRun()">Queue run</button>
+<div class="message" id="run-message">
+</div>
     </article>
   </section>
-  <article style="margin-top:1rem"><h2>Authorized source archive</h2><p class="muted">Upload a ZIP you own or are authorized to assess. Archives are extracted privately with traversal, symlink, file-count, and size limits.</p>
-    <div class="grid"><label>ZIP archive<input type="file" id="source-archive" accept=".zip,application/zip"></label><label>Authorization reference<input id="source-auth-reference" placeholder="repository-owner-approval"></label></div>
-    <label class="check"><input type="checkbox" id="source-authorized"> I confirm authorization to analyze this source archive</label>
-    <button onclick="uploadSourceArtifact()">Upload authorized source</button><div class="message" id="source-message"></div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Uploaded</th><th>Archive</th><th>Files</th><th>Expanded</th><th>SHA-256</th><th>Authorization</th></tr></thead><tbody id="source-artifacts"><tr><td colspan="6">Select a project.</td></tr></tbody></table></div>
-  </article>
-  <article style="margin-top:1rem"><h2>Encrypted test accounts</h2><p class="muted">Store dedicated authorized form-login accounts by role. Passwords are encrypted at rest, never returned by the API, and runtime use is limited to the approved Playwright login adapter.</p>
-    <div class="grid"><label>Target<select id="credential-target"><option value="">Select a target</option></select></label><label>Profile name<input id="credential-name" maxlength="120" placeholder="Standard user"></label><label>Role name<input id="credential-role" maxlength="120" placeholder="user"></label><label>Login URL<input id="credential-login-url" placeholder="https://example.test/login"></label><label>Username<input id="credential-username" maxlength="500" autocomplete="off"></label><label>Password<input type="password" id="credential-password" maxlength="4096" autocomplete="new-password"></label><label>Username selector<input id="credential-username-selector" maxlength="300" placeholder="#username"></label><label>Password selector<input id="credential-password-selector" maxlength="300" placeholder="#password"></label><label>Submit selector<input id="credential-submit-selector" maxlength="300" placeholder="button[type=submit]"></label><label>Login success selector (recommended)<input id="credential-success-selector" maxlength="300" placeholder="#authenticated-user"></label></div>
-    <button onclick="createCredentialProfile()">Encrypt and save test account</button><div class="message" id="credential-message"></div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Role</th><th>Login</th><th>Kind</th><th>Created</th><th>Action</th></tr></thead><tbody id="credential-profiles"><tr><td colspan="6">Select a project.</td></tr></tbody></table></div>
-  </article>
-  <article style="margin-top:1rem"><h2>Runs</h2><p class="muted">Live status refreshes every three seconds.</p>
-    <div style="overflow-x:auto"><table><thead><tr><th>Created</th><th>Tool</th><th>Profile</th><th>Status</th><th>Requested by</th><th>Action</th></tr></thead><tbody id="runs"><tr><td colspan="6">Select a project.</td></tr></tbody></table></div>
-  </article>
-  <article id="run-progress-panel" style="display:none;margin-top:1rem"><h2>Live run progress</h2><p class="muted" id="run-progress-summary"></p><button class="secondary" style="width:auto" onclick="closeRunProgress()">Close</button><pre id="run-progress-content" aria-live="polite"></pre></article>
-  <article style="margin-top:1rem"><h2>Evidence integrity</h2><p class="muted" id="project-integrity-summary">Select a project, then verify its completed run evidence.</p><button class="secondary" style="width:auto" onclick="verifyProjectIntegrity()">Verify project evidence</button>
-    <div style="overflow-x:auto"><table><thead><tr><th>Run</th><th>Run status</th><th>Integrity</th><th>Sealed</th><th>Detail</th></tr></thead><tbody id="project-integrity-runs"><tr><td colspan="5">No verification requested.</td></tr></tbody></table></div>
-  </article>
-  <article style="margin-top:1rem"><h2>Project findings</h2><p class="muted" id="finding-summary">Select a project. Repeated fingerprints are merged across runs.</p><div class="grid"><label>Search findings<input id="finding-search" placeholder="Title, asset, or tool" oninput="renderFindings()"></label><label>Severity<select id="finding-severity" onchange="renderFindings()"><option value="all">All severities</option><option value="actionable">Actionable (non-info)</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option></select></label><label>Review status<select id="finding-status" onchange="renderFindings()"><option value="all">All statuses</option><option value="new">New</option><option value="confirmed">Confirmed</option><option value="false_positive">False positive</option><option value="accepted_risk">Accepted risk</option><option value="resolved">Resolved</option></select></label></div><button class="secondary" style="width:auto" onclick="downloadReport(false)">Download actionable report</button> <button class="secondary" style="width:auto" onclick="downloadReport(true)">Download full report</button> <button class="secondary" style="width:auto" onclick="downloadSarif()">Download SARIF</button><p class="muted">A saved review applies to every matching fingerprint in this project. Confirmed, false-positive, and accepted-risk decisions carry forward when the same fingerprint reappears; resolved findings reopen as new. Reports include reviewer attribution and timestamps.</p>
-    <div style="overflow-x:auto"><table><thead><tr><th>Severity</th><th>Finding</th><th>Tool</th><th>Occurrences</th><th>Last seen</th><th>Review / retest</th></tr></thead><tbody id="findings"><tr><td colspan="6">Select a project.</td></tr></tbody></table></div>
-  </article>
-  <article style="margin-top:1rem"><h2>Approved workflow</h2><p class="muted">Queue a reviewed sequence of adapters. Each step is dispatched only after the previous step succeeds; failure or cancellation stops the remaining steps.</p>
+  <article style="margin-top:1rem">
+<h2 data-section="scope">Authorized source archive</h2>
+<p class="muted">Upload a ZIP you own or are authorized to assess. Archives are extracted privately with traversal, symlink, file-count, and size limits.</p>
     <div class="grid">
-      <label>Workflow plan<select id="run-plans" onchange="planChanged()"><option value="">Select a workflow</option></select></label>
-      <div id="custom-workflow-label" style="display:none"><label>Saved project template<select id="workflow-template-select" onchange="loadWorkflowTemplate()"><option value="">Select a saved template</option></select></label><label>Template name<input id="workflow-template-name" maxlength="120" placeholder="Authenticated smoke test"></label><button class="secondary" style="width:auto" onclick="saveWorkflowTemplate()">Save current template</button><button class="danger" style="width:auto" onclick="deleteWorkflowTemplate()">Delete selected template</button><label>Custom adapter order<select id="custom-workflow-picker"></select></label><button class="secondary" style="width:auto" onclick="addCustomWorkflowTool()">Add adapter</button><ol id="custom-workflow-tools" class="workflow-steps"></ol><span class="muted">Use ↑/↓ to set the exact sequential execution order.</span></div>
-      <label>Encrypted test account (Playwright step only)<select id="batch-credential-profile" disabled><option value="">Anonymous workflow</option></select></label>
-      <label>Requested by<input id="batch-requested-by" value="killswitch"></label>
+<label>ZIP archive<input type="file" id="source-archive" accept=".zip,application/zip">
+</label>
+<label>Authorization reference<input id="source-auth-reference" placeholder="repository-owner-approval">
+</label>
+</div>
+    <label class="check">
+<input type="checkbox" id="source-authorized"> I confirm authorization to analyze this source archive</label>
+    <button onclick="uploadSourceArtifact()">Upload authorized source</button>
+<div class="message" id="source-message">
+</div>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Uploaded</th>
+<th>Archive</th>
+<th>Files</th>
+<th>Expanded</th>
+<th>SHA-256</th>
+<th>Authorization</th>
+</tr>
+</thead>
+<tbody id="source-artifacts">
+<tr>
+<td colspan="6">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
+  </article>
+  <article style="margin-top:1rem">
+<h2 data-section="scope">Encrypted test accounts</h2>
+<p class="muted">Store dedicated authorized form-login accounts by role. Passwords are encrypted at rest, never returned by the API, and runtime use is limited to the approved Playwright login adapter.</p>
+    <div class="grid">
+<label>Target<select id="credential-target">
+<option value="">Select a target</option>
+</select>
+</label>
+<label>Profile name<input id="credential-name" maxlength="120" placeholder="Standard user">
+</label>
+<label>Role name<input id="credential-role" maxlength="120" placeholder="user">
+</label>
+<label>Login URL<input id="credential-login-url" placeholder="https://example.test/login">
+</label>
+<label>Username<input id="credential-username" maxlength="500" autocomplete="off">
+</label>
+<label>Password<input type="password" id="credential-password" maxlength="4096" autocomplete="new-password">
+</label>
+<label>Username selector<input id="credential-username-selector" maxlength="300" placeholder="#username">
+</label>
+<label>Password selector<input id="credential-password-selector" maxlength="300" placeholder="#password">
+</label>
+<label>Submit selector<input id="credential-submit-selector" maxlength="300" placeholder="button[type=submit]">
+</label>
+<label>Login success selector (recommended)<input id="credential-success-selector" maxlength="300" placeholder="#authenticated-user">
+</label>
+</div>
+    <button onclick="createCredentialProfile()">Encrypt and save test account</button>
+<div class="message" id="credential-message">
+</div>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Role</th>
+<th>Login</th>
+<th>Kind</th>
+<th>Created</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody id="credential-profiles">
+<tr>
+<td colspan="6">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
+  </article>
+  <article style="margin-top:1rem">
+<h2 data-section="runs">Run history</h2>
+<p class="muted">Live status refreshes every three seconds.</p>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Created</th>
+<th>Tool</th>
+<th>Profile</th>
+<th>Status</th>
+<th>Requested by</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody id="runs">
+<tr>
+<td colspan="6">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
+  </article>
+<article data-view="runs" id="run-progress-panel" style="display:none;margin-top:1rem">
+<h2>Live run progress</h2>
+<p class="muted" id="run-progress-summary">
+</p>
+<button class="secondary" style="width:auto" onclick="closeRunProgress()">Close</button>
+<pre id="run-progress-content" aria-live="polite">
+</pre>
+</article>
+  <article style="margin-top:1rem">
+<h2 data-section="reports">Evidence integrity</h2>
+<p class="muted" id="project-integrity-summary">Select a project, then verify its completed run evidence.</p>
+<button class="secondary" style="width:auto" onclick="verifyProjectIntegrity()">Verify project evidence</button>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Run</th>
+<th>Run status</th>
+<th>Integrity</th>
+<th>Sealed</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody id="project-integrity-runs">
+<tr>
+<td colspan="5">No verification requested.</td>
+</tr>
+</tbody>
+</table>
+</div>
+  </article>
+  <article style="margin-top:1rem">
+<h2 data-section="findings">Project findings</h2>
+<p class="muted" id="finding-summary">Select a project. Repeated fingerprints are merged across runs.</p>
+<div class="grid">
+<label>Search findings<input id="finding-search" placeholder="Title, asset, or tool" oninput="renderFindings()">
+</label>
+<label>Severity<select id="finding-severity" onchange="renderFindings()">
+<option value="all">All severities</option>
+<option value="actionable">Actionable (non-info)</option>
+<option value="critical">Critical</option>
+<option value="high">High</option>
+<option value="medium">Medium</option>
+<option value="low">Low</option>
+<option value="info">Info</option>
+</select>
+</label>
+<label>Review status<select id="finding-status" onchange="renderFindings()">
+<option value="all">All statuses</option>
+<option value="new">New</option>
+<option value="confirmed">Confirmed</option>
+<option value="false_positive">False positive</option>
+<option value="accepted_risk">Accepted risk</option>
+<option value="resolved">Resolved</option>
+</select>
+</label>
+</div>
+<button class="secondary" style="width:auto" onclick="downloadReport(false)">Download actionable report</button> <button class="secondary" style="width:auto" onclick="downloadReport(true)">Download full report</button> <button class="secondary" style="width:auto" onclick="downloadSarif()">Download SARIF</button>
+<p class="muted">A saved review applies to every matching fingerprint in this project. Confirmed, false-positive, and accepted-risk decisions carry forward when the same fingerprint reappears; resolved findings reopen as new. Reports include reviewer attribution and timestamps.</p>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Finding</th>
+<th>Tool</th>
+<th>Occurrences</th>
+<th>Last seen</th>
+<th>Review / retest</th>
+</tr>
+</thead>
+<tbody id="findings">
+<tr>
+<td colspan="6">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
+  </article>
+  <article style="margin-top:1rem">
+<h2 data-section="workflows">Approved workflow</h2>
+<p class="muted">Queue a reviewed sequence of adapters. Each step is dispatched only after the previous step succeeds; failure or cancellation stops the remaining steps.</p>
+    <div class="grid">
+      <label>Workflow plan<select id="run-plans" onchange="planChanged()">
+<option value="">Select a workflow</option>
+</select>
+</label>
+      <div id="custom-workflow-label" style="display:none">
+<label>Saved project template<select id="workflow-template-select" onchange="loadWorkflowTemplate()">
+<option value="">Select a saved template</option>
+</select>
+</label>
+<label>Template name<input id="workflow-template-name" maxlength="120" placeholder="Authenticated smoke test">
+</label>
+<button class="secondary" style="width:auto" onclick="saveWorkflowTemplate()">Save current template</button>
+<button class="danger" style="width:auto" onclick="deleteWorkflowTemplate()">Delete selected template</button>
+<label>Custom adapter order<select id="custom-workflow-picker">
+</select>
+</label>
+<button class="secondary" style="width:auto" onclick="addCustomWorkflowTool()">Add adapter</button>
+<ol id="custom-workflow-tools" class="workflow-steps">
+</ol>
+<span class="muted">Use ↑/↓ to set the exact sequential execution order.</span>
+</div>
+      <label>Encrypted test account (Playwright step only)<select id="batch-credential-profile" disabled>
+<option value="">Anonymous workflow</option>
+</select>
+</label>
+      <label>Requested by<input id="batch-requested-by" value="killswitch">
+</label>
     </div>
-    <div class="adapter-details" id="plan-details"><p class="muted">Select a workflow to review its ordered tools.</p></div>
-    <label class="check"><input type="checkbox" id="batch-approved"> I approve every listed run within the saved target scope</label>
-    <button onclick="createBatch()">Queue workflow</button><div class="message" id="batch-message"></div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Created</th><th>Plan</th><th>Status</th><th>Progress</th><th>Action</th></tr></thead><tbody id="batches"><tr><td colspan="5">Select a project.</td></tr></tbody></table></div>
+    <div class="adapter-details" id="plan-details">
+<p class="muted">Select a workflow to review its ordered tools.</p>
+</div>
+    <label class="check">
+<input type="checkbox" id="batch-approved"> I approve every listed run within the saved target scope</label>
+    <button onclick="createBatch()">Queue workflow</button>
+<div class="message" id="batch-message">
+</div>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Created</th>
+<th>Plan</th>
+<th>Status</th>
+<th>Progress</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody id="batches">
+<tr>
+<td colspan="5">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
   </article>
-  <article style="margin-top:1rem"><h2>Audit trail</h2><p class="muted">Append-only record of approvals, cancellation requests, authorization, and review decisions.</p>
-    <div style="overflow-x:auto"><table><thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Object</th><th>Details</th></tr></thead><tbody id="audit-events"><tr><td colspan="5">Select a project.</td></tr></tbody></table></div>
+  <article style="margin-top:1rem">
+<h2 data-section="operations">Audit trail</h2>
+<p class="muted">Append-only record of approvals, cancellation requests, authorization, and review decisions.</p>
+    <div style="overflow-x:auto">
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Event</th>
+<th>Actor</th>
+<th>Object</th>
+<th>Details</th>
+</tr>
+</thead>
+<tbody id="audit-events">
+<tr>
+<td colspan="5">Select a project.</td>
+</tr>
+</tbody>
+</table>
+</div>
   </article>
-  <article id="observation-panel" style="display:none;margin-top:1rem"><h2>Run summary</h2><p class="muted" id="observation-summary"></p><div class="grid"><label>Severity<select id="observation-severity" onchange="renderObservations()"><option value="actionable">Actionable (non-info)</option><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option></select></label><label>Review status<select id="observation-status" onchange="renderObservations()"><option value="all">All statuses</option><option value="new">New</option><option value="confirmed">Confirmed</option><option value="false_positive">False positive</option><option value="accepted_risk">Accepted risk</option><option value="resolved">Resolved</option></select></label></div><div id="observation-content"></div></article>
-  <article id="evidence-panel" style="display:none;margin-top:1rem"><h2>Sanitized evidence</h2><p class="muted" id="evidence-summary"></p><pre id="evidence-content"></pre></article>
-  <article id="retest-panel" style="display:none;margin-top:1rem"><h2>Retest comparison</h2><p id="retest-summary"></p><div id="retest-content"></div></article>
-  <details style="margin-top:1rem"><summary>Tool registry</summary><p id="tool-summary"></p><section class="grid" id="tool-grid"></section></details>
-</main><script>
+<article data-view="findings" id="observation-panel" style="display:none;margin-top:1rem">
+<h2>Run summary</h2>
+<p class="muted" id="observation-summary">
+</p>
+<div class="grid">
+<label>Severity<select id="observation-severity" onchange="renderObservations()">
+<option value="actionable">Actionable (non-info)</option>
+<option value="all">All severities</option>
+<option value="critical">Critical</option>
+<option value="high">High</option>
+<option value="medium">Medium</option>
+<option value="low">Low</option>
+<option value="info">Info</option>
+</select>
+</label>
+<label>Review status<select id="observation-status" onchange="renderObservations()">
+<option value="all">All statuses</option>
+<option value="new">New</option>
+<option value="confirmed">Confirmed</option>
+<option value="false_positive">False positive</option>
+<option value="accepted_risk">Accepted risk</option>
+<option value="resolved">Resolved</option>
+</select>
+</label>
+</div>
+<div id="observation-content">
+</div>
+</article>
+<article data-view="reports" id="evidence-panel" style="display:none;margin-top:1rem">
+<h2>Sanitized evidence</h2>
+<p class="muted" id="evidence-summary">
+</p>
+<pre id="evidence-content">
+</pre>
+</article>
+<article data-view="findings" id="retest-panel" style="display:none;margin-top:1rem">
+<h2>Retest comparison</h2>
+<p id="retest-summary">
+</p>
+<div id="retest-content">
+</div>
+</article>
+<details data-view="operations" class="registry-card" style="margin-top:1rem">
+<summary>Tool registry</summary>
+<p id="tool-summary">
+</p>
+<section class="grid" id="tool-grid">
+</section>
+</details>
+</main></div><script>
 const api='/api';let adapterMap={},targetMap={},credentialProfiles=[],planMap={},workflowTemplates=[],workflowTemplateProjectId='',customWorkflowToolIds=[],currentObservationData=null,currentFindings=[],findingReviewDirty=false,integrityProjectId='',controlPlaneToken=sessionStorage.getItem('security-platform-token')||'',watchedRunId='',watchedRunAfter=0,watchedRunEvents=[],watchedRunTerminal=false;
 const el=id=>document.getElementById(id), lines=v=>v.split('\n').map(x=>x.trim()).filter(Boolean);
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const viewMeta={overview:['Platform overview','Health, runtime readiness, and adapter coverage.'],scope:['Projects & Scope','Manage authorized assets, source archives, and test identities.'],runs:['Runs','Queue approved tools and watch live execution.'],workflows:['Workflows','Build and monitor reviewed multi-tool sequences.'],findings:['Findings & Review','Triage observations, record decisions, and retest fixes.'],reports:['Reports & Evidence','Verify sealed evidence and export assessment results.'],operations:['Operations','Inspect audit history and the full tool registry.']};
+document.querySelectorAll('[data-section]').forEach(node=>{const card=node.closest('article');if(card)card.dataset.view=node.dataset.section});
+function showView(name,updateHash=true){if(!viewMeta[name])name='overview';document.querySelectorAll('[data-view]').forEach(node=>node.classList.toggle('view-hidden',node.dataset.view!==name));document.querySelectorAll('[data-nav]').forEach(button=>{const active=button.dataset.nav===name;button.classList.toggle('active',active);button.setAttribute('aria-current',active?'page':'false')});el('view-title').textContent=viewMeta[name][0];el('view-description').textContent=viewMeta[name][1];sessionStorage.setItem('security-platform-view',name);if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);window.scrollTo({top:0,behavior:'smooth'})}
+window.addEventListener('hashchange',()=>showView(location.hash.slice(1),false));
 function msg(id,text,error=false){el(id).textContent=text;el(id).style.color=error?'#ff8fa4':'#9bb4ff'}
 const authHeaders=()=>controlPlaneToken?{'X-Control-Plane-Token':controlPlaneToken}:{};
 async function req(path,options={}){const r=await fetch(api+path,{...options,headers:{'Content-Type':'application/json',...authHeaders(),...(options.headers||{})}});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.detail||`Request failed (${r.status})`);return b}
@@ -169,5 +651,8 @@ async function downloadSbom(runId){try{const response=await fetch(`${api}/runs/$
 async function downloadEvidenceBundle(runId){try{const response=await fetch(`${api}/runs/${runId}/evidence-bundle`,{headers:authHeaders()});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`Evidence bundle failed (${response.status})`)}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`security-platform-${runId}-evidence.zip`;link.click();URL.revokeObjectURL(url);msg('run-message',`Sanitized evidence bundle downloaded for ${runId}.`)}catch(e){msg('run-message',e.message,true)}}
 async function loadTools(){const {tools}=await req('/tools'),entries=Object.entries(tools);el('tool-summary').textContent=`${entries.length} tools catalogued.`;el('tool-grid').innerHTML=entries.map(([name,t])=>`<article><h3>${esc(name)}</h3><span class="tag">${esc(t.category)}</span><p>Risk: ${esc(t.risk)}<br>Mode: ${esc(t.execution)}<br>Tier: ${esc(t.availability)}</p>${t.automation_note?`<p class="muted">${esc(t.automation_note)}</p>`:''}</article>`).join('')}
 async function refreshAll(){await loadHealth();if(!controlPlaneToken){renderAuthState(false);return}renderAuthState(true);await Promise.allSettled([loadPlatformStatus(),loadCoverage(),loadProjects(el('projects').value),loadAdapters(),loadPlans(),loadTools()])}
+const navigateBefore={watchRun:['runs',watchRun],viewEvidence:['reports',viewEvidence],viewObservations:['findings',viewObservations],viewRetestResult:['findings',viewRetestResult]};
+Object.entries(navigateBefore).forEach(([name,[view,handler]])=>{window[name]=(...args)=>{showView(view);return handler(...args)}});
+showView(location.hash.slice(1)||sessionStorage.getItem('security-platform-view')||'overview',false);
 refreshAll();setInterval(()=>{loadHealth();if(controlPlaneToken){loadPlatformStatus();loadCoverage();if(el('projects').value&&!findingReviewDirty)projectChanged();if(watchedRunId&&!watchedRunTerminal)loadRunProgress()}},3000);
 </script></body></html>
