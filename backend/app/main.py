@@ -247,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.81.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.82.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1646,6 +1646,89 @@ def get_run(run_id: UUID) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run_row(row)
+
+
+@app.get("/runs/{run_id}/retest-result")
+def get_retest_result(run_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT project_id, tool_id, status, retest_of_observation, finished_at
+                FROM runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            run = cursor.fetchone()
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if run[3] is None:
+                raise HTTPException(status_code=422, detail="Run is not a finding retest")
+            cursor.execute(
+                """
+                SELECT id, title, severity, asset, fingerprint, review_status
+                FROM observations WHERE id = %s
+                """,
+                (run[3],),
+            )
+            original = cursor.fetchone()
+            if original is None:
+                raise HTTPException(status_code=409, detail="Original finding is unavailable")
+            cursor.execute(
+                """
+                SELECT id, title, severity, asset, created_at
+                FROM observations
+                WHERE run_id = %s AND fingerprint = %s
+                ORDER BY created_at
+                """,
+                (run_id, original[4]),
+            )
+            matches = cursor.fetchall()
+
+    if run[2] in {"queued", "running", "cancelling"}:
+        comparison = "pending"
+        conclusion = "Retest is still in progress."
+    elif run[2] in {"failed", "cancelled"}:
+        comparison = "inconclusive"
+        conclusion = "Retest did not complete successfully, so no comparison can be made."
+    elif matches:
+        comparison = "persisting"
+        conclusion = "The same normalized finding fingerprint was observed again."
+    else:
+        comparison = "not_observed"
+        conclusion = "The original fingerprint was not observed in this successful retest."
+
+    return {
+        "run_id": run_id,
+        "project_id": run[0],
+        "tool_id": run[1],
+        "run_status": run[2],
+        "finished_at": run[4],
+        "comparison": comparison,
+        "conclusion": conclusion,
+        "original": {
+            "id": original[0],
+            "title": original[1],
+            "severity": original[2],
+            "asset": original[3],
+            "fingerprint": original[4],
+            "review_status": original[5],
+        },
+        "matches": [
+            {
+                "id": row[0],
+                "title": row[1],
+                "severity": row[2],
+                "asset": row[3],
+                "created_at": row[4],
+            }
+            for row in matches
+        ],
+        "disclaimer": (
+            "A not_observed result is evidence from this bounded retest only; it does not prove the issue is fixed. "
+            "Review scope, tool coverage, and evidence before marking the finding resolved."
+        ),
+    }
 
 
 @app.get("/runs/{run_id}/events")
