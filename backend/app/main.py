@@ -151,6 +151,8 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS workflow_templates_project_created_idx
                     ON workflow_templates(project_id, created_at DESC);
+                ALTER TABLE run_batches ADD COLUMN IF NOT EXISTS template_id UUID
+                    REFERENCES workflow_templates(id) ON DELETE SET NULL;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS retest_of_observation UUID;
@@ -245,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.79.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.80.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -307,6 +309,7 @@ class BatchCreate(BaseModel):
     credential_profile_id: UUID | None = None
     plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web)$")
     tool_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    template_id: UUID | None = None
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
 
@@ -1409,11 +1412,30 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit batch approval is required")
     storage_admission(enforce=True)
-    if (payload.plan_id is None) == (payload.tool_ids is None):
-        raise HTTPException(status_code=422, detail="Select exactly one preset plan or a custom tool sequence")
-    tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
+    choices = sum(value is not None for value in (payload.plan_id, payload.tool_ids, payload.template_id))
+    if choices != 1:
+        raise HTTPException(status_code=422, detail="Select exactly one preset plan, saved template, or custom tool sequence")
+    template_name = None
+    if payload.template_id is not None:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT name, tool_ids FROM workflow_templates WHERE id = %s AND project_id = %s",
+                    (payload.template_id, project_id),
+                )
+                template = cursor.fetchone()
+                if template is None:
+                    raise HTTPException(status_code=404, detail="Workflow template not found in project")
+                template_name, template_tools = template
+        tool_ids = list(template_tools)
+    else:
+        tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
     adapters = validate_workflow_tool_ids(tool_ids)
-    plan_id = payload.plan_id or f"custom-{hashlib.sha256(json.dumps(tool_ids).encode()).hexdigest()[:12]}"
+    plan_id = (
+        payload.plan_id
+        or (f"template-{payload.template_id}" if payload.template_id else None)
+        or f"custom-{hashlib.sha256(json.dumps(tool_ids).encode()).hexdigest()[:12]}"
+    )
     if payload.credential_profile_id is not None and "playwright" not in tool_ids:
         raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
     queue_admission(requested_slots=len(tool_ids), enforce=True)
@@ -1446,10 +1468,13 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             cursor.execute(
                 """
                 INSERT INTO run_batches
-                    (id, project_id, target_id, credential_profile_id, plan_id, requested_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (id, project_id, target_id, credential_profile_id, template_id, plan_id, requested_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (batch_id, project_id, payload.target_id, payload.credential_profile_id, plan_id, payload.requested_by),
+                (
+                    batch_id, project_id, payload.target_id, payload.credential_profile_id,
+                    payload.template_id, plan_id, payload.requested_by,
+                ),
             )
             cursor.executemany(
                 """
@@ -1471,7 +1496,9 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 cursor, project_id, "workflow.approved", payload.requested_by, "batch", batch_id,
                 {
                     "target_id": str(payload.target_id), "plan_id": plan_id,
-                    "plan_type": "preset" if payload.plan_id else "custom", "tools": tool_ids,
+                    "plan_type": "preset" if payload.plan_id else "template" if payload.template_id else "custom",
+                    "template_id": str(payload.template_id) if payload.template_id else None,
+                    "template_name": template_name, "tools": tool_ids,
                     "credential_profile_id": str(payload.credential_profile_id) if payload.credential_profile_id else None,
                     "credential_role": credential_role,
                 },
@@ -1482,6 +1509,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         "id": batch_id,
         "status": "queued",
         "plan_id": plan_id,
+        "template_id": payload.template_id,
         "target_id": payload.target_id,
         "credential_profile_id": payload.credential_profile_id,
         "run_ids": run_ids,
@@ -1495,7 +1523,7 @@ def list_batches(project_id: UUID) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, target_id, plan_id, requested_by, created_at, credential_profile_id
+                SELECT id, target_id, plan_id, requested_by, created_at, credential_profile_id, template_id
                 FROM run_batches WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -1517,6 +1545,7 @@ def list_batches(project_id: UUID) -> dict:
                     {
                         "id": row[0], "target_id": row[1], "plan_id": row[2],
                         "requested_by": row[3], "created_at": row[4], "credential_profile_id": row[5],
+                        "template_id": row[6],
                         "status": derive_batch_status(statuses),
                         "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
                         "runs": runs,
@@ -1530,7 +1559,7 @@ def get_batch(batch_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id, project_id, target_id, plan_id, requested_by, created_at, credential_profile_id FROM run_batches WHERE id = %s",
+                "SELECT id, project_id, target_id, plan_id, requested_by, created_at, credential_profile_id, template_id FROM run_batches WHERE id = %s",
                 (batch_id,),
             )
             batch = cursor.fetchone()
@@ -1549,7 +1578,7 @@ def get_batch(batch_id: UUID) -> dict:
     return {
         "id": batch[0], "project_id": batch[1], "target_id": batch[2],
         "plan_id": batch[3], "requested_by": batch[4], "created_at": batch[5],
-        "credential_profile_id": batch[6],
+        "credential_profile_id": batch[6], "template_id": batch[7],
         "status": derive_batch_status([run["status"] for run in runs]), "runs": runs,
     }
 
