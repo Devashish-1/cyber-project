@@ -177,7 +177,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.59.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.60.0", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -1148,6 +1148,54 @@ def get_run_evidence(run_id: UUID) -> dict:
         "events": read_jsonl_file(run_directory / "events.jsonl"),
         "output": read_jsonl_file(run_directory / "output.jsonl"),
         "limits": {"max_bytes_per_file": MAX_EVIDENCE_BYTES, "max_lines_per_file": MAX_EVIDENCE_LINES},
+    }
+
+
+@app.get("/projects/{project_id}/evidence-integrity")
+def get_project_evidence_integrity(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, status, evidence_manifest_sha256, evidence_sealed_at
+                FROM runs
+                WHERE project_id = %s
+                  AND status IN ('succeeded', 'failed', 'cancelled')
+                ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            runs = cursor.fetchall()
+    results = []
+    counts = {"verified": 0, "unsealed": 0, "failed": 0}
+    for run_id, status, manifest_digest, sealed_at in runs:
+        try:
+            integrity = verify_evidence_integrity(
+                run_id,
+                EVIDENCE_ROOT / str(run_id),
+                manifest_digest,
+                sealed_at,
+            )
+            integrity_status = integrity["status"]
+            detail = None
+        except HTTPException as exc:
+            integrity_status = "failed"
+            detail = str(exc.detail)
+        counts[integrity_status] += 1
+        results.append({
+            "run_id": run_id,
+            "run_status": status,
+            "integrity_status": integrity_status,
+            "sealed_at": sealed_at,
+            "detail": detail,
+        })
+    return {
+        "project_id": project_id,
+        "counts": {**counts, "total": len(results)},
+        "runs": results,
     }
 
 
