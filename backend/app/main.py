@@ -234,7 +234,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.75.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.76.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1375,8 +1375,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 },
             )
 
-    queue = queue_client()
-    queue.rpush(RUN_QUEUE, *[str(run_id) for run_id in run_ids])
+    queue_client().rpush(RUN_QUEUE, str(run_ids[0]))
     return {
         "id": batch_id,
         "status": "queued",

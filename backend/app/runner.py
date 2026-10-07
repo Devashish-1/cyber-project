@@ -193,6 +193,7 @@ def recover_runner_state(queue) -> None:
             client.close()
 
     recovered = []
+    skipped_workflow_runs = []
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -233,7 +234,41 @@ def recover_runner_state(queue) -> None:
                     ),
                 )
                 recovered.append((run_id, next_status))
-            cursor.execute("SELECT id FROM runs WHERE status = 'queued' ORDER BY created_at")
+            cursor.execute(
+                """
+                UPDATE runs AS pending
+                SET status = 'cancelled',
+                    error_message = 'Skipped because an earlier workflow step did not succeed',
+                    finished_at = NOW()
+                WHERE pending.status = 'queued'
+                  AND pending.batch_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM runs AS earlier
+                      WHERE earlier.batch_id = pending.batch_id
+                        AND earlier.batch_step < pending.batch_step
+                        AND earlier.status IN ('failed', 'cancelled')
+                  )
+                RETURNING pending.id
+                """
+            )
+            skipped_workflow_runs = [row[0] for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT pending.id
+                FROM runs AS pending
+                WHERE pending.status = 'queued'
+                  AND (
+                      pending.batch_id IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM runs AS earlier
+                          WHERE earlier.batch_id = pending.batch_id
+                            AND earlier.batch_step < pending.batch_step
+                            AND earlier.status <> 'succeeded'
+                      )
+                  )
+                ORDER BY pending.created_at
+                """
+            )
             queued_ids = [str(row[0]) for row in cursor.fetchall()]
 
     existing_queue = set(queue.lrange(RUN_QUEUE, 0, -1))
@@ -256,12 +291,81 @@ def recover_runner_state(queue) -> None:
     result = {
         "checked_at": time.time(),
         "interrupted_runs": len(recovered),
+        "skipped_workflow_runs": len(skipped_workflow_runs),
         "requeued_runs": len(requeued),
         "removed_containers": len(removed_containers),
         "cleanup_errors": cleanup_errors,
     }
     queue.set(RUNNER_RECOVERY, json.dumps(result, separators=(",", ":")))
     print(f"runner recovery: {json.dumps(result, separators=(',', ':'))}", flush=True)
+
+
+def advance_workflow(run_id: UUID, queue) -> None:
+    next_run_id = None
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT batch_id, batch_step, status, project_id FROM runs WHERE id = %s FOR UPDATE",
+                (run_id,),
+            )
+            current = cursor.fetchone()
+            if current is None or current[0] is None:
+                return
+            batch_id, batch_step, status, project_id = current
+            if status == "succeeded":
+                cursor.execute(
+                    """
+                    SELECT id FROM runs
+                    WHERE batch_id = %s AND batch_step > %s AND status = 'queued'
+                    ORDER BY batch_step LIMIT 1 FOR UPDATE
+                    """,
+                    (batch_id, batch_step),
+                )
+                next_run = cursor.fetchone()
+                if next_run is not None:
+                    next_run_id = next_run[0]
+                    cursor.execute(
+                        """
+                        INSERT INTO audit_events
+                            (id, project_id, event_type, actor, object_type, object_id, details)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            uuid4(), project_id, "workflow.step_dispatched", "runner",
+                            "batch", str(batch_id),
+                            Jsonb({"completed_run_id": str(run_id), "next_run_id": str(next_run_id)}),
+                        ),
+                    )
+            elif status in {"failed", "cancelled"}:
+                cursor.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'cancelled',
+                        error_message = 'Skipped because an earlier workflow step did not succeed',
+                        finished_at = NOW()
+                    WHERE batch_id = %s AND batch_step > %s AND status = 'queued'
+                    RETURNING id
+                    """,
+                    (batch_id, batch_step),
+                )
+                skipped = [str(row[0]) for row in cursor.fetchall()]
+                if skipped:
+                    cursor.execute(
+                        """
+                        INSERT INTO audit_events
+                            (id, project_id, event_type, actor, object_type, object_id, details)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            uuid4(), project_id, "workflow.remaining_cancelled", "runner",
+                            "batch", str(batch_id),
+                            Jsonb({"terminal_run_id": str(run_id), "terminal_status": status, "cancelled_run_ids": skipped}),
+                        ),
+                    )
+    if next_run_id is not None:
+        pending = set(queue.lrange(RUN_QUEUE, 0, -1))
+        if str(next_run_id) not in pending:
+            queue.rpush(RUN_QUEUE, str(next_run_id))
 
 
 def load_adapters() -> dict:
@@ -4605,8 +4709,11 @@ def main() -> None:
             continue
         if item is None:
             continue
+        run_id = None
         try:
-            execute_run(UUID(item[1]))
+            run_id = UUID(item[1])
+            execute_run(run_id)
+            advance_workflow(run_id, queue)
         except (ValueError, psycopg.Error, redis.RedisError) as exc:
             print(f"runner queue error: {exc}", flush=True)
             time.sleep(2)

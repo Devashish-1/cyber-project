@@ -66,7 +66,7 @@
   <article style="margin-top:1rem"><h2>Project findings</h2><p class="muted" id="finding-summary">Select a project. Repeated fingerprints are merged across runs.</p><button class="secondary" style="width:auto" onclick="downloadReport(false)">Download actionable report</button> <button class="secondary" style="width:auto" onclick="downloadReport(true)">Download full report</button>
     <div style="overflow-x:auto"><table><thead><tr><th>Severity</th><th>Finding</th><th>Tool</th><th>Occurrences</th><th>Last seen</th><th>Review / retest</th></tr></thead><tbody id="findings"><tr><td colspan="6">Select a project.</td></tr></tbody></table></div>
   </article>
-  <article style="margin-top:1rem"><h2>Approved workflow</h2><p class="muted">Queue a reviewed sequence of adapters. Runs execute one at a time and remain inside the saved target scope.</p>
+  <article style="margin-top:1rem"><h2>Approved workflow</h2><p class="muted">Queue a reviewed sequence of adapters. Each step is dispatched only after the previous step succeeds; failure or cancellation stops the remaining steps.</p>
     <div class="grid">
       <label>Workflow plan<select id="run-plans" onchange="planChanged()"><option value="">Select a workflow</option></select></label>
       <label>Encrypted test account (Playwright step only)<select id="batch-credential-profile" disabled><option value="">Anonymous workflow</option></select></label>
