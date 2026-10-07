@@ -18,7 +18,7 @@ import psycopg
 import redis
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from cryptography.fernet import Fernet
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
@@ -247,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.80.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.81.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1879,6 +1879,90 @@ def get_project_findings(project_id: UUID) -> dict:
             for row in rows
         ],
     }
+
+
+@app.get("/projects/{project_id}/report.sarif")
+def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Response:
+    finding_data = get_project_findings(project_id)
+    findings = finding_data["findings"]
+    reported = findings if include_info else [item for item in findings if item["severity"] != "info"]
+
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    level_by_severity = {
+        "critical": "error",
+        "high": "error",
+        "medium": "warning",
+        "low": "note",
+        "info": "note",
+    }
+    for finding in reported:
+        raw_rule_id = f"security-platform/{finding['tool_id']}/{finding['type']}"
+        rule_id = re.sub(r"[^A-Za-z0-9._/-]+", "-", raw_rule_id).strip("-")
+        rules.setdefault(
+            rule_id,
+            {
+                "id": rule_id,
+                "name": re.sub(r"[^A-Za-z0-9_]+", "_", str(finding["type"])).strip("_") or "finding",
+                "shortDescription": {"text": str(finding["title"])},
+                "properties": {
+                    "toolId": str(finding["tool_id"]),
+                    "observationType": str(finding["type"]),
+                },
+            },
+        )
+        results.append(
+            {
+                "ruleId": rule_id,
+                "level": level_by_severity.get(str(finding["severity"]), "warning"),
+                "message": {"text": str(finding["title"])},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": str(finding["asset"] or "unknown")}
+                        }
+                    }
+                ],
+                "partialFingerprints": {
+                    "securityPlatformFingerprint": str(finding["fingerprint"])
+                },
+                "properties": {
+                    "severity": str(finding["severity"]),
+                    "reviewStatus": str(finding["review_status"]),
+                    "occurrenceCount": int(finding["occurrence_count"]),
+                    "toolId": str(finding["tool_id"]),
+                    "runId": str(finding["run_id"]),
+                    "firstSeen": str(finding["first_seen"]),
+                    "lastSeen": str(finding["last_seen"]),
+                    "details": finding["details"],
+                },
+            }
+        )
+
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Security Testing Platform",
+                        "semanticVersion": "0.81.0",
+                        "informationUri": "https://owasp.org/www-project-web-security-testing-guide/",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    return Response(
+        content=json.dumps(sarif, ensure_ascii=False, separators=(",", ":"), default=str),
+        media_type="application/sarif+json",
+        headers={
+            "Content-Disposition": f'attachment; filename="security-platform-{project_id}.sarif"'
+        },
+    )
 
 
 @app.get("/projects/{project_id}/report.md", response_class=PlainTextResponse)
