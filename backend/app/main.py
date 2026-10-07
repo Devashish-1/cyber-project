@@ -104,6 +104,7 @@ def init_database() -> None:
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS testing_window_start_minute_utc INTEGER;
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS testing_window_end_minute_utc INTEGER;
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS allow_state_changing BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS allow_third_party_services BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE targets
                     DROP CONSTRAINT IF EXISTS targets_valid_testing_window;
                 ALTER TABLE targets
@@ -269,7 +270,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.91.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.92.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -296,6 +297,7 @@ class TargetCreate(BaseModel):
     testing_window_start_minute_utc: int | None = Field(default=None, ge=0, le=1439)
     testing_window_end_minute_utc: int | None = Field(default=None, ge=0, le=1439)
     allow_state_changing: bool = False
+    allow_third_party_services: bool = False
     authorization_reference: str = Field(min_length=3, max_length=500)
     authorization_confirmed: bool
 
@@ -358,6 +360,20 @@ def require_state_changing_permission(
         raise HTTPException(
             status_code=409,
             detail=f"Target does not authorize state-changing extended-active {subject}",
+        )
+
+
+def require_third_party_service_permission(
+    uses_third_party_services: bool,
+    allow_third_party_services: bool,
+    *,
+    workflow: bool = False,
+) -> None:
+    if uses_third_party_services and not allow_third_party_services:
+        subject = "workflow steps" if workflow else "test"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Target does not authorize third-party intelligence/provider access for this {subject}",
         )
 
 
@@ -1282,9 +1298,10 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                 INSERT INTO targets
                     (id, project_id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                      max_run_seconds, testing_window_start_minute_utc,
-                     testing_window_end_minute_utc, allow_state_changing, authorization_reference,
+                     testing_window_end_minute_utc, allow_state_changing,
+                     allow_third_party_services, authorization_reference,
                      authorization_confirmed)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s, TRUE)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, TRUE)
                 """,
                 (
                     target_id,
@@ -1297,6 +1314,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     payload.testing_window_start_minute_utc,
                     payload.testing_window_end_minute_utc,
                     payload.allow_state_changing,
+                    payload.allow_third_party_services,
                     payload.authorization_reference,
                 ),
             )
@@ -1309,6 +1327,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     "testing_window_start_minute_utc": payload.testing_window_start_minute_utc,
                     "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
                     "allow_state_changing": payload.allow_state_changing,
+                    "allow_third_party_services": payload.allow_third_party_services,
                     "authorization_reference": payload.authorization_reference,
                 },
             )
@@ -1328,7 +1347,8 @@ def list_targets(project_id: UUID) -> dict:
                 """
                 SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
-                       testing_window_end_minute_utc, allow_state_changing, authorization_reference,
+                       testing_window_end_minute_utc, allow_state_changing,
+                       allow_third_party_services, authorization_reference,
                        authorization_confirmed, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at DESC
                 """,
@@ -1344,8 +1364,9 @@ def list_targets(project_id: UUID) -> dict:
                 "testing_window_start_minute_utc": row[6],
                 "testing_window_end_minute_utc": row[7],
                 "allow_state_changing": row[8],
-                "authorization_reference": row[9],
-                "authorization_confirmed": row[10], "created_at": row[11],
+                "allow_third_party_services": row[9],
+                "authorization_reference": row[10],
+                "authorization_confirmed": row[11], "created_at": row[12],
             }
             for row in rows
         ]
@@ -1365,7 +1386,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       authorization_reference
+                       allow_third_party_services, authorization_reference
                 FROM targets
                 WHERE id = %s AND project_id = %s
                 FOR UPDATE
@@ -1419,6 +1440,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                     testing_window_start_minute_utc = %s,
                     testing_window_end_minute_utc = %s,
                     allow_state_changing = %s,
+                    allow_third_party_services = %s,
                     authorization_reference = %s,
                     authorization_confirmed = TRUE
                 WHERE id = %s AND project_id = %s
@@ -1431,6 +1453,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                     payload.testing_window_start_minute_utc,
                     payload.testing_window_end_minute_utc,
                     payload.allow_state_changing,
+                    payload.allow_third_party_services,
                     payload.authorization_reference,
                     target_id,
                     project_id,
@@ -1448,7 +1471,8 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                         "testing_window_start_minute_utc": previous[5],
                         "testing_window_end_minute_utc": previous[6],
                         "allow_state_changing": previous[7],
-                        "authorization_reference": previous[8],
+                        "allow_third_party_services": previous[8],
+                        "authorization_reference": previous[9],
                     },
                     "current": {
                         "allowed_hosts": payload.allowed_hosts,
@@ -1458,6 +1482,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                         "testing_window_start_minute_utc": payload.testing_window_start_minute_utc,
                         "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
                         "allow_state_changing": payload.allow_state_changing,
+                        "allow_third_party_services": payload.allow_third_party_services,
                         "authorization_reference": payload.authorization_reference,
                     },
                 },
@@ -1643,7 +1668,8 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                 cursor.execute(
                     """
                     SELECT authorization_confirmed, testing_window_start_minute_utc,
-                           testing_window_end_minute_utc, allow_state_changing
+                           testing_window_end_minute_utc, allow_state_changing,
+                           allow_third_party_services
                     FROM targets WHERE id = %s AND project_id = %s
                     """,
                     (payload.target_id, project_id),
@@ -1655,6 +1681,10 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
                 require_open_testing_window(target[1], target[2])
                 require_state_changing_permission(payload.profile, target[3])
+                require_third_party_service_permission(
+                    bool(adapter.get("uses_third_party_services", False)),
+                    target[4],
+                )
                 if payload.credential_profile_id is not None:
                     cursor.execute(
                         """
@@ -1733,7 +1763,8 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             cursor.execute(
                 """
                 SELECT authorization_confirmed, testing_window_start_minute_utc,
-                       testing_window_end_minute_utc, allow_state_changing
+                       testing_window_end_minute_utc, allow_state_changing,
+                       allow_third_party_services
                 FROM targets WHERE id = %s AND project_id = %s
                 """,
                 (payload.target_id, project_id),
@@ -1748,6 +1779,11 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 require_state_changing_permission(
                     adapters[tool_id].get("profile", ""),
                     target[3],
+                    workflow=True,
+                )
+                require_third_party_service_permission(
+                    bool(adapters[tool_id].get("uses_third_party_services", False)),
+                    target[4],
                     workflow=True,
                 )
             credential_role = None
@@ -2462,7 +2498,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       authorization_reference
+                       allow_third_party_services, authorization_reference
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -2556,7 +2592,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         for (
             base_url, allowed_hosts, excluded_paths, dns_resolver, max_run_seconds,
             testing_window_start_minute_utc, testing_window_end_minute_utc,
-            allow_state_changing, authorization_reference,
+            allow_state_changing, allow_third_party_services,
+            authorization_reference,
         ) in targets:
             lines.extend([
                 f"- Target: `{md(base_url)}`",
@@ -2571,6 +2608,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 ),
                 "  - State-changing extended-active tests: "
                 + ("Explicitly allowed" if allow_state_changing else "Not allowed"),
+                "  - Third-party intelligence/provider access: "
+                + ("Explicitly allowed" if allow_third_party_services else "Not allowed"),
                 f"  - Authorization reference: {md(authorization_reference)}",
             ])
     else:

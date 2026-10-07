@@ -536,7 +536,8 @@ def get_run(run_id: UUID) -> dict | None:
                        cp.success_selector, cp.encrypted_secret, t.max_run_seconds,
                        t.testing_window_start_minute_utc,
                        t.testing_window_end_minute_utc,
-                       t.allow_state_changing
+                       t.allow_state_changing,
+                       t.allow_third_party_services
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -572,6 +573,7 @@ def get_run(run_id: UUID) -> dict | None:
         "testing_window_start_minute_utc": row[20],
         "testing_window_end_minute_utc": row[21],
         "target_allow_state_changing": row[22],
+        "target_allow_third_party_services": row[23],
     }
 
 
@@ -4186,6 +4188,9 @@ def execute_run(run_id: UUID) -> None:
         if run["profile"] == "extended-active" and not run.get("target_allow_state_changing"):
             set_status(run_id, "failed", "Target does not authorize state-changing extended-active tests")
             return
+        if adapter.get("uses_third_party_services", False) and not run.get("target_allow_third_party_services"):
+            set_status(run_id, "failed", "Target does not authorize third-party intelligence/provider access")
+            return
         if not testing_window_allows(
             run.get("testing_window_start_minute_utc"),
             run.get("testing_window_end_minute_utc"),
@@ -4249,6 +4254,9 @@ def execute_run(run_id: UUID) -> None:
                 "dns_resolver": run["dns_resolver"] if input_type == "target" else None,
                 "target_allow_state_changing": (
                     bool(run.get("target_allow_state_changing")) if input_type == "target" else None
+                ),
+                "target_allow_third_party_services": (
+                    bool(run.get("target_allow_third_party_services")) if input_type == "target" else None
                 ),
                 "credential_profile_id": str(run["credential_profile_id"]) if run.get("credential_profile_id") else None,
                 "authenticated_role": run.get("credential_role") if run.get("credential_profile_id") else None,
