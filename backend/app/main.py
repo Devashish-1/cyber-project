@@ -234,7 +234,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.76.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.77.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1393,32 +1393,34 @@ def list_batches(project_id: UUID) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT b.id, b.target_id, b.plan_id, b.requested_by, b.created_at,
-                       b.credential_profile_id,
-                       COALESCE(array_agg(r.tool_id ORDER BY r.batch_step, r.created_at) FILTER (WHERE r.id IS NOT NULL), '{}'),
-                       COALESCE(array_agg(r.status ORDER BY r.batch_step, r.created_at) FILTER (WHERE r.id IS NOT NULL), '{}')
-                FROM run_batches b LEFT JOIN runs r ON r.batch_id = b.id
-                WHERE b.project_id = %s
-                GROUP BY b.id ORDER BY b.created_at DESC
+                SELECT id, target_id, plan_id, requested_by, created_at, credential_profile_id
+                FROM run_batches WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
             )
-            rows = cursor.fetchall()
-    return {
-        "batches": [
-            {
-                "id": row[0], "target_id": row[1], "plan_id": row[2],
-                "requested_by": row[3], "created_at": row[4], "credential_profile_id": row[5],
-                "status": derive_batch_status(list(row[7])),
-                "status_counts": {status: list(row[7]).count(status) for status in sorted(set(row[7]))},
-                "runs": [
-                    {"tool_id": tool_id, "status": status}
-                    for tool_id, status in zip(row[6], row[7])
-                ],
-            }
-            for row in rows
-        ]
-    }
+            batches = []
+            for row in cursor.fetchall():
+                cursor.execute(
+                    """
+                    SELECT id, project_id, target_id, tool_id, profile, status,
+                           requested_by, error_message, created_at, started_at, finished_at,
+                           retest_of_observation, source_artifact_id, credential_profile_id
+                    FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
+                    """,
+                    (row[0],),
+                )
+                runs = [run_row(run) for run in cursor.fetchall()]
+                statuses = [run["status"] for run in runs]
+                batches.append(
+                    {
+                        "id": row[0], "target_id": row[1], "plan_id": row[2],
+                        "requested_by": row[3], "created_at": row[4], "credential_profile_id": row[5],
+                        "status": derive_batch_status(statuses),
+                        "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
+                        "runs": runs,
+                    }
+                )
+    return {"batches": batches}
 
 
 @app.get("/batches/{batch_id}")
