@@ -46,6 +46,7 @@ services:
       SOURCE_ROOT: /sources
       MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-10737418240}
       MAX_STORAGE_USED_PERCENT: ${MAX_STORAGE_USED_PERCENT:-90}
+      MAX_PENDING_RUNS: ${MAX_PENDING_RUNS:-100}
     volumes:
       - ./config:/app/config:ro
       - ./evidence:/evidence:ro

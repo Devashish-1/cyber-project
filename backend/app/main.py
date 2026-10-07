@@ -46,7 +46,8 @@ MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
 MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**3)))
 MAX_STORAGE_USED_PERCENT = float(os.getenv("MAX_STORAGE_USED_PERCENT", "90"))
-if MIN_STORAGE_FREE_BYTES < 0 or not 1 <= MAX_STORAGE_USED_PERCENT <= 100:
+MAX_PENDING_RUNS = int(os.getenv("MAX_PENDING_RUNS", "100"))
+if MIN_STORAGE_FREE_BYTES < 0 or not 1 <= MAX_STORAGE_USED_PERCENT <= 100 or MAX_PENDING_RUNS < 1:
     raise RuntimeError("Storage admission thresholds are invalid")
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
 
@@ -187,7 +188,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.64.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.65.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -365,6 +366,29 @@ def storage_admission(*, enforce: bool = False) -> dict:
     return result
 
 
+def queue_admission(*, requested_slots: int = 0, enforce: bool = False) -> dict:
+    with psycopg.connect(DATABASE_URL, connect_timeout=3) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM runs WHERE status = 'queued'")
+            database_queued = cursor.fetchone()[0]
+    redis_queued = queue_client().llen(RUN_QUEUE)
+    pending = max(database_queued, redis_queued)
+    allowed = pending + requested_slots <= MAX_PENDING_RUNS
+    result = {
+        "allowed": allowed,
+        "pending": pending,
+        "maximum_pending": MAX_PENDING_RUNS,
+        "requested_slots": requested_slots,
+        "available_slots": max(0, MAX_PENDING_RUNS - pending),
+    }
+    if enforce and not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Pending-run capacity is exhausted; wait for queued work to finish",
+        )
+    return result
+
+
 def read_json_file(path: Path) -> dict:
     if not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
         return {}
@@ -489,12 +513,20 @@ def platform_status() -> dict:
         recovery = None
     disk = shutil.disk_usage(EVIDENCE_ROOT)
     admission = storage_admission()
+    redis_depth = cache.llen(RUN_QUEUE)
+    pending = max(counts.get("queued", 0), redis_depth)
+    queue_capacity = {
+        "allowed": pending < MAX_PENDING_RUNS,
+        "pending": pending,
+        "maximum_pending": MAX_PENDING_RUNS,
+        "available_slots": max(0, MAX_PENDING_RUNS - pending),
+    }
     return {
         "runner": runner,
         "runner_heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
         "adapter_readiness": readiness,
         "runner_recovery": recovery,
-        "queue_depth": cache.llen(RUN_QUEUE),
+        "queue_depth": redis_depth,
         "runs": {
             "queued": counts.get("queued", 0),
             "running": counts.get("running", 0),
@@ -507,6 +539,7 @@ def platform_status() -> dict:
             "used_percent": round((disk.used / disk.total) * 100, 1),
         },
         "storage_admission": admission,
+        "queue_admission": queue_capacity,
     }
 
 
@@ -902,6 +935,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit run approval is required")
     storage_admission(enforce=True)
+    queue_admission(requested_slots=1, enforce=True)
 
     registry = load_registry()
     adapters = load_adapters().get("adapters", {})
@@ -981,6 +1015,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         raise HTTPException(status_code=422, detail="Explicit batch approval is required")
     storage_admission(enforce=True)
     tool_ids = RUN_PLANS[payload.plan_id]
+    queue_admission(requested_slots=len(tool_ids), enforce=True)
     registry = load_registry().get("tools", {})
     adapters = load_adapters().get("adapters", {})
     for tool_id in tool_ids:
@@ -1502,6 +1537,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
     if not payload.approval_confirmed:
         raise HTTPException(status_code=422, detail="Explicit retest approval is required")
     storage_admission(enforce=True)
+    queue_admission(requested_slots=1, enforce=True)
     run_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
