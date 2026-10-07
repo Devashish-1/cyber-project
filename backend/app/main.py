@@ -41,7 +41,7 @@ RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 PLATFORM_PAUSE = "security-platform:control:paused"
-RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "authenticated-browser": ["httpx", "playwright"],
@@ -270,7 +270,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.93.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.94.0", lifespan=lifespan)
 
 
 @app.middleware("http")

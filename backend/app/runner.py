@@ -639,6 +639,25 @@ def build_command(
             "-d", hostname,
             "-o", "/output/raw.txt",
         ]
+    if tool_id == "theharvester":
+        hostname = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+        if not hostname:
+            raise ValueError("theHarvester target does not contain a hostname")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("theHarvester requires an authorized DNS domain, not an IP address")
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+            raise ValueError("theHarvester target hostname is not a valid DNS domain")
+        return [
+            "-d", hostname,
+            "-l", "50",
+            "-b", "crtsh,certspotter",
+            "-f", "/output/results",
+            "-q",
+        ]
     if tool_id == "dnsx":
         if not dns_resolver:
             raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -1486,6 +1505,81 @@ def normalize_amass(run_id: UUID, output_file: Path) -> int:
             }
             fingerprint = hashlib.sha256(f"amass|subdomain|{hostname}".encode()).hexdigest()
             records.append((uuid4(), run_id, "subdomain", "Passive subdomain discovered", "info", hostname, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                records,
+            )
+    return len(records)
+
+
+def parse_theharvester_hosts(payload: dict, root_domain: str) -> list[str]:
+    root = root_domain.lower().rstrip(".")
+    domain_pattern = re.compile(
+        r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    )
+    scoped = set()
+    for value in payload.get("hosts") or []:
+        if not isinstance(value, str):
+            continue
+        hostname = value.strip().lower().rstrip(".")
+        if ":" in hostname:
+            hostname = hostname.split(":", 1)[0].rstrip(".")
+        if (
+            domain_pattern.fullmatch(hostname)
+            and (hostname == root or hostname.endswith(f".{root}"))
+        ):
+            scoped.add(hostname)
+    return sorted(scoped)
+
+
+def write_theharvester_output(raw_json: Path, output_file: Path, root_domain: str) -> None:
+    payload = json.loads(raw_json.read_text(encoding="utf-8"))
+    names = parse_theharvester_hosts(payload, root_domain)
+    with output_file.open("w", encoding="utf-8") as handle:
+        for hostname in names:
+            handle.write(json.dumps({
+                "host": hostname,
+                "root_domain": root_domain.lower().rstrip("."),
+                "sources": ["crtsh", "certspotter"],
+                "mode": "passive",
+            }, separators=(",", ":")) + "\n")
+
+
+def normalize_theharvester(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        for raw_line in output_file.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            item = json.loads(raw_line)
+            hostname = str(item.get("host") or "").lower().rstrip(".")[:2000]
+            root_domain = str(item.get("root_domain") or "").lower().rstrip(".")[:2000]
+            if not hostname or not root_domain or not (
+                hostname == root_domain or hostname.endswith(f".{root_domain}")
+            ):
+                continue
+            details = {
+                "root_domain": root_domain,
+                "mode": "passive",
+                "sources": ["crtsh", "certspotter"],
+                "third_party_services": True,
+            }
+            fingerprint = hashlib.sha256(f"theharvester|subdomain|{hostname}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "subdomain", "Certificate-transparency hostname discovered", "info", hostname, json.dumps(details), fingerprint))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return 0
     if not records:
@@ -4054,6 +4148,23 @@ def prepare_amass_output(run: dict, run_dir: Path) -> Path:
     return raw_file
 
 
+def prepare_theharvester_output(run: dict, run_dir: Path) -> Path:
+    host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("theHarvester target must contain a hostname")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("theHarvester requires a DNS domain, not an IP literal")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+        raise ValueError("theHarvester target hostname is invalid")
+    raw_dir = run_dir / "theharvester-raw"
+    raw_dir.mkdir(mode=0o700)
+    return raw_dir
+
+
 def prepare_dnsx_input(run: dict, run_dir: Path) -> Path:
     if not run.get("dns_resolver"):
         raise ValueError("dnsx requires an explicitly approved DNS resolver")
@@ -4425,6 +4536,8 @@ def execute_run(run_id: UUID) -> None:
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
         if run["tool_id"] == "amass":
             prepare_amass_output(run, run_dir)
+        if run["tool_id"] == "theharvester":
+            prepare_theharvester_output(run, run_dir)
         if run["tool_id"] == "dnsx":
             prepare_dnsx_input(run, run_dir)
         if run["tool_id"] == "massdns":
@@ -4469,6 +4582,10 @@ def execute_run(run_id: UUID) -> None:
         elif run["tool_id"] == "amass":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "amass-raw.txt")] = {
                 "bind": "/output/raw.txt", "mode": "rw",
+            }
+        elif run["tool_id"] == "theharvester":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "theharvester-raw")] = {
+                "bind": "/output", "mode": "rw",
             }
         elif run["tool_id"] == "dnsx":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsx-hosts.txt")] = {
@@ -4515,7 +4632,7 @@ def execute_run(run_id: UUID) -> None:
                 "mode": "ro",
             }
         container_command = command
-        container_entrypoint = {"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node", "codeql": "/bin/sh"}.get(run["tool_id"])
+        container_entrypoint = {"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node", "codeql": "/bin/sh", "theharvester": "theHarvester"}.get(run["tool_id"])
         if run["tool_id"] == "playwright" and run.get("credential_profile_id"):
             container_entrypoint = "/bin/sh"
             container_command = [
@@ -4547,7 +4664,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
                 if run["tool_id"] == "playwright" else
                 {"HOME": "/tmp"}
-                if run["tool_id"] in {"amass", "dnsrecon", "dnsx", "massdns"} else
+                if run["tool_id"] in {"amass", "dnsrecon", "dnsx", "massdns", "theharvester"} else
                 {
                     "HOME": "/tmp/semgrep-home",
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
@@ -4575,7 +4692,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
-            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl", "theharvester"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
             entrypoint=container_entrypoint,
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
@@ -4754,6 +4871,24 @@ def execute_run(run_id: UUID) -> None:
                     encoding="utf-8",
                 )
             raw_file.unlink(missing_ok=True)
+        elif run["tool_id"] == "theharvester":
+            raw_dir = run_dir / "theharvester-raw"
+            raw_json = raw_dir / "results.json"
+            host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+            (run_dir / "tool.log").write_text(
+                "theHarvester raw JSON/XML and identity data omitted; in-scope hostnames normalized.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0 and raw_json.is_file():
+                write_theharvester_output(raw_json, output_file, host)
+            elif exit_code == 0:
+                output_file.write_text("", encoding="utf-8")
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "theHarvester execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+            shutil.rmtree(raw_dir, ignore_errors=True)
         elif run["tool_id"] == "dnsx":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
@@ -4924,7 +5059,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")
@@ -4969,6 +5104,8 @@ def execute_run(run_id: UUID) -> None:
                 (run_dir / "amass-raw.txt").unlink(missing_ok=True)
             except OSError:
                 pass
+        if run["tool_id"] == "theharvester":
+            shutil.rmtree(run_dir / "theharvester-raw", ignore_errors=True)
         if run["tool_id"] == "dnsx":
             try:
                 (run_dir / "dnsx-hosts.txt").unlink(missing_ok=True)

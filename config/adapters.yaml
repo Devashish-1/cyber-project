@@ -291,6 +291,21 @@ adapters:
     controls: [single-authorized-domain, hostname-only-no-ip-literals, passive-mode-only, active-enumeration-disabled, brute-force-disabled, recursive-enumeration-disabled, dns-resolution-disabled, one-minute-tool-timeout, scope-filtered-output, raw-provider-output-deleted-after-normalization, non-root-read-only-container, pinned-local-image]
     state: verified-local-image
 
+  theharvester:
+    version: 4.11.1
+    image: security-platform/theharvester@sha256:cae9f16c4bd41d1ef2d1b4c99ed3481b7e98796c72b62f6e30c6994d438af603
+    input: target
+    profile: observe
+    approval: explicit-target-run-and-third-party-provider-approval-required
+    timeout_seconds: 90
+    user: "1000:1000"
+    resources: {cpus: 0.5, memory: 512m, pids: 96}
+    output: sanitized-jsonl
+    uses_third_party_services: true
+    capabilities: [passive-certificate-transparency-subdomain-discovery]
+    controls: [single-authorized-domain, hostname-only-no-ip-literals, fixed-sources-crtsh-and-certspotter, result-limit-50, dns-resolution-disabled, dns-lookup-disabled, dns-brute-disabled, takeover-check-disabled, shodan-disabled, screenshots-disabled, api-scan-disabled, proxy-file-disabled, scope-filtered-hostnames-only, emails-people-urls-and-ips-omitted, raw-json-and-xml-deleted-after-normalization, non-root-read-only-container, pinned-local-image]
+    state: verified-local-image
+
   subfinder:
     version: v2.16.0
     image: projectdiscovery/subfinder@sha256:c0f4683f91e8e30fbb5bf45051ef45e245ef48424b0d5bc99f8a72cb45163ea9
