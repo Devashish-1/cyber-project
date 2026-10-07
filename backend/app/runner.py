@@ -960,6 +960,22 @@ def build_command(
             "-timeout", "10",
             "-retries", "1",
         ]
+    if tool_id == "whatweb":
+        return [
+            "whatweb",
+            "--aggression=1",
+            "--follow-redirect=never",
+            "--max-redirects=0",
+            "--max-threads=1",
+            "--open-timeout=5",
+            "--read-timeout=10",
+            "--wait=1",
+            "--no-cookies",
+            "--colour=never",
+            "--quiet",
+            "--log-json=/dev/stdout",
+            base_url,
+        ]
     if tool_id == "naabu":
         hostname = urlsplit(base_url).hostname
         if not hostname:
@@ -1319,6 +1335,85 @@ def normalize_httpx(run_id: UUID, output_file: Path) -> int:
                 records,
             )
     return len(records)
+
+
+def write_whatweb_output(raw_bytes: bytes, output_file: Path, target_url: str) -> None:
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = []
+    item = payload[0] if isinstance(payload, list) and payload and isinstance(payload[0], dict) else {}
+    plugins = item.get("plugins") if isinstance(item.get("plugins"), dict) else {}
+    excluded = {"Country", "IP", "Title"}
+    technologies = sorted(
+        name for name in plugins
+        if isinstance(name, str)
+        and name not in excluded
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+ -]{0,79}", name)
+    )[:100]
+    versions = {}
+    for name in technologies:
+        plugin = plugins.get(name)
+        if not isinstance(plugin, dict):
+            continue
+        safe_values = []
+        for value in plugin.get("version") or []:
+            candidate = str(value).strip()
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+:-]{0,63}", candidate):
+                safe_values.append(candidate)
+        if safe_values:
+            versions[name] = sorted(set(safe_values))[:10]
+    server_values = []
+    server_plugin = plugins.get("HTTPServer")
+    if isinstance(server_plugin, dict):
+        for value in server_plugin.get("string") or []:
+            candidate = str(value).strip()
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+:/() -]{0,199}", candidate):
+                server_values.append(candidate)
+    status = item.get("http_status")
+    status_code = int(status) if isinstance(status, int) and 100 <= status <= 599 else None
+    record = {
+        "url": target_url[:2000],
+        "status_code": status_code,
+        "technologies": technologies,
+        "versions": versions,
+        "servers": sorted(set(server_values))[:10],
+    }
+    output_file.write_text(json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_whatweb(run_id: UUID, output_file: Path) -> int:
+    try:
+        item = json.loads(output_file.read_text(encoding="utf-8").strip())
+        asset = str(item.get("url") or "")[:2000]
+        if not asset:
+            return 0
+        details = {
+            "status_code": item.get("status_code"),
+            "technologies": item.get("technologies") or [],
+            "versions": item.get("versions") or {},
+            "servers": item.get("servers") or [],
+            "request_budget": 1,
+            "redirects_followed": False,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return 0
+    fingerprint = hashlib.sha256(f"whatweb|fingerprint|{asset}".encode()).hexdigest()
+    record = (uuid4(), run_id, "web-technology", "Web technology fingerprint", "info", asset, json.dumps(details), fingerprint)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                record,
+            )
+    return 1
 
 
 def normalize_naabu(run_id: UUID, output_file: Path) -> int:
@@ -4918,7 +5013,20 @@ def execute_run(run_id: UUID) -> None:
             int(result.get("StatusCode", 1))
         )
         append_event(event_file, {"event": "tool_finished", "exit_code": exit_code, "time": time.time()})
-        if run["tool_id"] == "testssl":
+        if run["tool_id"] == "whatweb":
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
+            if exit_code == 0:
+                write_whatweb_output(
+                    capture_container_logs(container, stdout=True, stderr=False),
+                    output_file,
+                    run["base_url"],
+                )
+            else:
+                output_file.write_text(
+                    json.dumps({"url": run["base_url"], "error": "WhatWeb execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+        elif run["tool_id"] == "testssl":
             write_tool_log(run_dir / "tool.log", logs)
             if exit_code == 0:
                 capture_testssl_output(container, output_file)
@@ -5189,7 +5297,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")

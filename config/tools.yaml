@@ -16,6 +16,7 @@ tools:
   dnsrecon: {category: dns, risk: medium, availability: optional, execution: adapter}
   massdns: {category: dns, risk: high, availability: optional, execution: adapter}
   httpx: {category: http-discovery, risk: low, availability: core, execution: adapter}
+  whatweb: {category: web-fingerprinting, risk: low, availability: optional, execution: adapter, automation_note: "One low-aggression request to the authorized base URL; redirects and cookies are disabled and only sanitized technology metadata is retained."}
   nmap: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
   naabu: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
   masscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}

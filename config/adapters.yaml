@@ -456,6 +456,20 @@ adapters:
     capabilities: [status-code, title, technology, tls, redirect, ip, cname]
     state: verified-image
 
+  whatweb:
+    version: 0.6.4
+    image: security-platform/network-toolbox@sha256:cde8eb17d065eb7c66223cd6f8cf2deaa584c11589fee70bc81f89c6d3741f15
+    input: target
+    profile: observe
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 45
+    user: "1000:1000"
+    resources: {cpus: 0.25, memory: 256m, pids: 64}
+    output: sanitized-jsonl
+    capabilities: [single-request-web-technology-fingerprinting]
+    controls: [single-authorized-base-url, aggression-level-1, redirects-disabled, cookies-disabled, one-thread, one-second-wait, five-second-connect-timeout, ten-second-read-timeout, title-ip-country-and-request-headers-omitted, non-root-read-only-container, pinned-local-image]
+    state: verified-local-image
+
   naabu:
     version: v2.6.1
     image: projectdiscovery/naabu@sha256:0b7efcd6eb4bf7be2c5cfb2bbfe091a132df0e442e549267bca818a4cef15ea4
