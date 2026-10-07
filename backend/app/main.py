@@ -31,6 +31,7 @@ RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
+PLATFORM_PAUSE = "security-platform:control:paused"
 RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
@@ -188,7 +189,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.65.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.66.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -245,6 +246,11 @@ class RetestCreate(BaseModel):
 class EmergencyStopCreate(BaseModel):
     requested_by: str = Field(min_length=2, max_length=120)
     confirmation: str = Field(pattern="^STOP ALL RUNS$")
+
+
+class PlatformResumeCreate(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^RESUME NEW RUNS$")
 
 
 def normalize_dns_resolver(value: str | None) -> str | None:
@@ -367,21 +373,34 @@ def storage_admission(*, enforce: bool = False) -> dict:
 
 
 def queue_admission(*, requested_slots: int = 0, enforce: bool = False) -> dict:
+    cache = queue_client()
+    pause_raw = cache.get(PLATFORM_PAUSE)
+    try:
+        pause = json.loads(pause_raw) if pause_raw else None
+    except (json.JSONDecodeError, TypeError):
+        pause = {"paused": True, "reason": "Invalid pause state requires operator review"}
     with psycopg.connect(DATABASE_URL, connect_timeout=3) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM runs WHERE status = 'queued'")
             database_queued = cursor.fetchone()[0]
-    redis_queued = queue_client().llen(RUN_QUEUE)
+    redis_queued = cache.llen(RUN_QUEUE)
     pending = max(database_queued, redis_queued)
-    allowed = pending + requested_slots <= MAX_PENDING_RUNS
+    allowed = pause is None and pending + requested_slots <= MAX_PENDING_RUNS
     result = {
         "allowed": allowed,
         "pending": pending,
         "maximum_pending": MAX_PENDING_RUNS,
         "requested_slots": requested_slots,
         "available_slots": max(0, MAX_PENDING_RUNS - pending),
+        "paused": pause is not None,
+        "pause": pause,
     }
     if enforce and not allowed:
+        if pause is not None:
+            raise HTTPException(
+                status_code=423,
+                detail="Platform is paused by the emergency stop; explicit resume is required",
+            )
         raise HTTPException(
             status_code=429,
             detail="Pending-run capacity is exhausted; wait for queued work to finish",
@@ -514,13 +533,7 @@ def platform_status() -> dict:
     disk = shutil.disk_usage(EVIDENCE_ROOT)
     admission = storage_admission()
     redis_depth = cache.llen(RUN_QUEUE)
-    pending = max(counts.get("queued", 0), redis_depth)
-    queue_capacity = {
-        "allowed": pending < MAX_PENDING_RUNS,
-        "pending": pending,
-        "maximum_pending": MAX_PENDING_RUNS,
-        "available_slots": max(0, MAX_PENDING_RUNS - pending),
-    }
+    queue_capacity = queue_admission()
     return {
         "runner": runner,
         "runner_heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
@@ -550,6 +563,14 @@ def root() -> dict[str, str]:
 
 @app.post("/emergency-stop", status_code=202)
 def emergency_stop(payload: EmergencyStopCreate) -> dict:
+    cache = queue_client()
+    pause = {
+        "paused": True,
+        "requested_by": payload.requested_by,
+        "paused_at": time.time(),
+        "reason": "Emergency stop",
+    }
+    cache.set(PLATFORM_PAUSE, json.dumps(pause, separators=(",", ":")))
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -572,16 +593,40 @@ def emergency_stop(payload: EmergencyStopCreate) -> dict:
                     cursor, project_id, "platform.emergency_stop", payload.requested_by,
                     "platform", "all-runs", {"changed_runs": project_runs},
                 )
-    cache = queue_client()
+            cursor.execute("SELECT id FROM projects")
+            for (project_id,) in cursor.fetchall():
+                if project_id not in by_project:
+                    record_audit(
+                        cursor, project_id, "platform.emergency_stop", payload.requested_by,
+                        "platform", "all-runs", {"changed_runs": []},
+                    )
+    cache.delete(RUN_QUEUE)
     for run_id, _, _ in changed:
         cache.publish("security-platform:cancellations", str(run_id))
     return {
-        "status": "stop-requested",
+        "status": "paused",
+        "pause": pause,
         "changed": [
             {"run_id": row[0], "project_id": row[1], "status": row[2]}
             for row in changed
         ],
     }
+
+
+@app.post("/platform-resume")
+def platform_resume(payload: PlatformResumeCreate) -> dict:
+    cache = queue_client()
+    previous_raw = cache.get(PLATFORM_PAUSE)
+    cache.delete(PLATFORM_PAUSE)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM projects")
+            for (project_id,) in cursor.fetchall():
+                record_audit(
+                    cursor, project_id, "platform.resumed", payload.requested_by,
+                    "platform", "all-runs", {"previous_pause_present": previous_raw is not None},
+                )
+    return {"status": "ready", "previous_pause_present": previous_raw is not None}
 
 
 @app.get("/tools")
