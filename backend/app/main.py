@@ -43,6 +43,7 @@ PLATFORM_PAUSE = "security-platform:control:paused"
 RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
+    "authenticated-browser": ["httpx", "playwright"],
     "controlled-web": ["dnsx", "naabu", "nmap", "httpx", "playwright", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster", "feroxbuster", "kiterunner", "wapiti", "sqlmap-controlled"],
 }
@@ -137,6 +138,8 @@ def init_database() -> None:
                     requested_by TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE run_batches ADD COLUMN IF NOT EXISTS credential_profile_id UUID
+                    REFERENCES credential_profiles(id) ON DELETE RESTRICT;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS retest_of_observation UUID;
@@ -231,7 +234,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.74.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.75.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -290,7 +293,8 @@ class CredentialProfileDelete(BaseModel):
 
 class BatchCreate(BaseModel):
     target_id: UUID
-    plan_id: str = Field(pattern="^(observe|controlled-web|extended-web)$")
+    credential_profile_id: UUID | None = None
+    plan_id: str = Field(pattern="^(observe|authenticated-browser|controlled-web|extended-web)$")
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
 
@@ -1299,6 +1303,8 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         raise HTTPException(status_code=422, detail="Explicit batch approval is required")
     storage_admission(enforce=True)
     tool_ids = RUN_PLANS[payload.plan_id]
+    if payload.credential_profile_id is not None and "playwright" not in tool_ids:
+        raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
     queue_admission(requested_slots=len(tool_ids), enforce=True)
     registry = load_registry().get("tools", {})
     adapters = load_adapters().get("adapters", {})
@@ -1323,22 +1329,38 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 raise HTTPException(status_code=404, detail="Target not found in project")
             if not target[0]:
                 raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            credential_role = None
+            if payload.credential_profile_id is not None:
+                cursor.execute(
+                    """
+                    SELECT role_name FROM credential_profiles
+                    WHERE id = %s AND project_id = %s AND target_id = %s
+                    """,
+                    (payload.credential_profile_id, project_id, payload.target_id),
+                )
+                credential = cursor.fetchone()
+                if credential is None:
+                    raise HTTPException(status_code=404, detail="Credential profile not found for the selected target")
+                credential_role = credential[0]
             cursor.execute(
                 """
-                INSERT INTO run_batches (id, project_id, target_id, plan_id, requested_by)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO run_batches
+                    (id, project_id, target_id, credential_profile_id, plan_id, requested_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (batch_id, project_id, payload.target_id, payload.plan_id, payload.requested_by),
+                (batch_id, project_id, payload.target_id, payload.credential_profile_id, payload.plan_id, payload.requested_by),
             )
             cursor.executemany(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, tool_id, profile, status, requested_by, batch_id, batch_step)
-                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s)
+                    (id, project_id, target_id, credential_profile_id, tool_id, profile,
+                     status, requested_by, batch_id, batch_step)
+                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s)
                 """,
                 [
                     (
-                        run_id, project_id, payload.target_id, tool_id,
+                        run_id, project_id, payload.target_id,
+                        payload.credential_profile_id if tool_id == "playwright" else None, tool_id,
                         adapters[tool_id]["profile"], payload.requested_by, batch_id, batch_step,
                     )
                     for batch_step, (run_id, tool_id) in enumerate(zip(run_ids, tool_ids), start=1)
@@ -1346,7 +1368,11 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             )
             record_audit(
                 cursor, project_id, "workflow.approved", payload.requested_by, "batch", batch_id,
-                {"target_id": str(payload.target_id), "plan_id": payload.plan_id, "tools": tool_ids},
+                {
+                    "target_id": str(payload.target_id), "plan_id": payload.plan_id, "tools": tool_ids,
+                    "credential_profile_id": str(payload.credential_profile_id) if payload.credential_profile_id else None,
+                    "credential_role": credential_role,
+                },
             )
 
     queue = queue_client()
@@ -1356,6 +1382,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         "status": "queued",
         "plan_id": payload.plan_id,
         "target_id": payload.target_id,
+        "credential_profile_id": payload.credential_profile_id,
         "run_ids": run_ids,
         "tools": tool_ids,
     }
@@ -1368,6 +1395,8 @@ def list_batches(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT b.id, b.target_id, b.plan_id, b.requested_by, b.created_at,
+                       b.credential_profile_id,
+                       COALESCE(array_agg(r.tool_id ORDER BY r.batch_step, r.created_at) FILTER (WHERE r.id IS NOT NULL), '{}'),
                        COALESCE(array_agg(r.status ORDER BY r.batch_step, r.created_at) FILTER (WHERE r.id IS NOT NULL), '{}')
                 FROM run_batches b LEFT JOIN runs r ON r.batch_id = b.id
                 WHERE b.project_id = %s
@@ -1380,9 +1409,13 @@ def list_batches(project_id: UUID) -> dict:
         "batches": [
             {
                 "id": row[0], "target_id": row[1], "plan_id": row[2],
-                "requested_by": row[3], "created_at": row[4],
-                "status": derive_batch_status(list(row[5])),
-                "status_counts": {status: list(row[5]).count(status) for status in sorted(set(row[5]))},
+                "requested_by": row[3], "created_at": row[4], "credential_profile_id": row[5],
+                "status": derive_batch_status(list(row[7])),
+                "status_counts": {status: list(row[7]).count(status) for status in sorted(set(row[7]))},
+                "runs": [
+                    {"tool_id": tool_id, "status": status}
+                    for tool_id, status in zip(row[6], row[7])
+                ],
             }
             for row in rows
         ]
@@ -1394,7 +1427,7 @@ def get_batch(batch_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id, project_id, target_id, plan_id, requested_by, created_at FROM run_batches WHERE id = %s",
+                "SELECT id, project_id, target_id, plan_id, requested_by, created_at, credential_profile_id FROM run_batches WHERE id = %s",
                 (batch_id,),
             )
             batch = cursor.fetchone()
@@ -1413,6 +1446,7 @@ def get_batch(batch_id: UUID) -> dict:
     return {
         "id": batch[0], "project_id": batch[1], "target_id": batch[2],
         "plan_id": batch[3], "requested_by": batch[4], "created_at": batch[5],
+        "credential_profile_id": batch[6],
         "status": derive_batch_status([run["status"] for run in runs]), "runs": runs,
     }
 
