@@ -47,6 +47,9 @@ services:
       MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-10737418240}
       MAX_STORAGE_USED_PERCENT: ${MAX_STORAGE_USED_PERCENT:-90}
       MAX_PENDING_RUNS: ${MAX_PENDING_RUNS:-100}
+      MAX_TOOL_OUTPUT_BYTES: ${MAX_TOOL_OUTPUT_BYTES:-16777216}
+      MAX_TOOL_LOG_BYTES: ${MAX_TOOL_LOG_BYTES:-2097152}
+      MAX_TOOL_LOG_LINES: ${MAX_TOOL_LOG_LINES:-20000}
     volumes:
       - ./config:/app/config:ro
       - ./evidence:/evidence:ro
@@ -82,6 +85,9 @@ services:
       SOURCE_HOST_ROOT: /home/killswitch/security-platform/data/sources
       CODEQL_CACHE_HOST_PATH: /home/killswitch/security-platform/data/codeql-cache
       KUBESCAPE_POLICY_HOST_PATH: /home/killswitch/security-platform/config/kubescape/nsa.json
+      MAX_TOOL_OUTPUT_BYTES: ${MAX_TOOL_OUTPUT_BYTES:-16777216}
+      MAX_TOOL_LOG_BYTES: ${MAX_TOOL_LOG_BYTES:-2097152}
+      MAX_TOOL_LOG_LINES: ${MAX_TOOL_LOG_LINES:-20000}
     volumes:
       - ./config:/app/config:ro
       - ./evidence:/evidence

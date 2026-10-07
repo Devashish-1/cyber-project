@@ -86,6 +86,16 @@ RUNNER_HEARTBEAT_TTL = 15
 RUNNER_READINESS_TTL = 180
 POLL_SECONDS = 1.0
 MAX_API_SCHEMA_BYTES = 5 * 1024 * 1024
+MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
+MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
+MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
+LOG_TRUNCATION_MARKER = b"[security-platform: earlier tool output truncated]\n"
+if not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024:
+    raise RuntimeError("MAX_TOOL_OUTPUT_BYTES must be between 1 KiB and 64 MiB")
+if not len(LOG_TRUNCATION_MARKER) <= MAX_TOOL_LOG_BYTES <= MAX_TOOL_OUTPUT_BYTES:
+    raise RuntimeError("MAX_TOOL_LOG_BYTES must fit the truncation marker and not exceed MAX_TOOL_OUTPUT_BYTES")
+if not 1 <= MAX_TOOL_LOG_LINES <= 100_000:
+    raise RuntimeError("MAX_TOOL_LOG_LINES must be between 1 and 100000")
 
 
 def heartbeat_loop() -> None:
@@ -896,6 +906,22 @@ def append_event(event_file: Path, event: dict) -> None:
     event_file.parent.mkdir(parents=True, exist_ok=True)
     with event_file.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def bounded_bytes(data: bytes, maximum: int) -> bytes:
+    if len(data) <= maximum:
+        return data
+    keep = maximum - len(LOG_TRUNCATION_MARKER)
+    return LOG_TRUNCATION_MARKER + data[-keep:]
+
+
+def capture_container_logs(container, *, stdout: bool = True, stderr: bool = True) -> bytes:
+    raw = container.logs(stdout=stdout, stderr=stderr, tail=MAX_TOOL_LOG_LINES)
+    return bounded_bytes(raw, MAX_TOOL_OUTPUT_BYTES)
+
+
+def write_tool_log(path: Path, data: bytes) -> None:
+    path.write_bytes(bounded_bytes(data, MAX_TOOL_LOG_BYTES))
 
 
 def normalize_httpx(run_id: UUID, output_file: Path) -> int:
@@ -3870,6 +3896,11 @@ def execute_run(run_id: UUID) -> None:
                 "allowed_hosts": run["allowed_hosts"] if input_type == "target" else [],
                 "excluded_paths": run["excluded_paths"] if input_type == "target" else [],
                 "dns_resolver": run["dns_resolver"] if input_type == "target" else None,
+                "capture_limits": {
+                    "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,
+                    "max_log_bytes": MAX_TOOL_LOG_BYTES,
+                    "max_log_lines": MAX_TOOL_LOG_LINES,
+                },
             },
             indent=2,
         ),
@@ -4108,39 +4139,39 @@ def execute_run(run_id: UUID) -> None:
             time.sleep(POLL_SECONDS)
 
         result = container.wait(timeout=10)
-        logs = container.logs(stdout=True, stderr=True)
+        logs = capture_container_logs(container, stdout=True, stderr=True)
         exit_code = (
             0 if trivy_captured else
             kics_exit_code if kics_captured else
             int(result.get("StatusCode", 1))
         )
         if run["tool_id"] == "testssl":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code == 0:
                 capture_testssl_output(container, output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "schemathesis":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code in {0, 1}:
                 capture_json_output(container, "/tmp/report.json", output_file)
                 write_schemathesis_output(output_file.read_bytes(), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"}:
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code in {0, 1, 2}:
                 capture_json_output(container, "/zap/wrk/report.json", output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "wapiti":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code == 0:
                 capture_json_output(container, "/tmp/report.json", output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "arjun":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code == 0:
                 try:
                     capture_json_output(container, "/tmp/arjun.json", output_file)
@@ -4149,27 +4180,27 @@ def execute_run(run_id: UUID) -> None:
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "gitleaks":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code in {0, 1}:
-                write_gitleaks_output(container.logs(stdout=True, stderr=False), output_file)
+                write_gitleaks_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "gobuster":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_gobuster_output(container.logs(stdout=True, stderr=False), output_file)
+                write_gobuster_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "feroxbuster":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_feroxbuster_output(container.logs(stdout=True, stderr=False), output_file)
+                write_feroxbuster_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "dnsx":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_dnsx_output(container.logs(stdout=True, stderr=False), output_file)
+                write_dnsx_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "dnsx execution failed; raw output omitted"}) + "\n",
@@ -4181,7 +4212,7 @@ def execute_run(run_id: UUID) -> None:
                 encoding="utf-8",
             )
             if exit_code == 0:
-                write_massdns_output(container.logs(stdout=True, stderr=False), output_file)
+                write_massdns_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "MassDNS execution failed; raw output omitted"}) + "\n",
@@ -4196,7 +4227,7 @@ def execute_run(run_id: UUID) -> None:
                 )
                 write_dnsrecon_output(raw_file, output_file)
             else:
-                diagnostic = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")[-4096:]
+                diagnostic = capture_container_logs(container, stdout=True, stderr=True).decode("utf-8", errors="replace")[-4096:]
                 host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
                 for sensitive in (str(run.get("dns_resolver") or ""), host, "/input/words.txt", "/output/raw.json"):
                     if sensitive:
@@ -4211,9 +4242,9 @@ def execute_run(run_id: UUID) -> None:
                 )
             raw_file.unlink(missing_ok=True)
         elif run["tool_id"] == "playwright":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_playwright_output(container.logs(stdout=True, stderr=False), output_file)
+                write_playwright_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"kind": "browser-observation", "error": "Playwright execution failed; raw output omitted"}) + "\n",
@@ -4225,31 +4256,31 @@ def execute_run(run_id: UUID) -> None:
                 encoding="utf-8",
             )
             if exit_code == 0:
-                write_codeql_output(container.logs(stdout=True, stderr=False), output_file)
+                write_codeql_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "CodeQL execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
         elif run["tool_id"] == "kiterunner":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_kiterunner_output(container.logs(stdout=True, stderr=False), output_file)
+                write_kiterunner_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "Kiterunner execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
         elif run["tool_id"] == "semgrep":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_semgrep_output(container.logs(stdout=True, stderr=False), output_file)
+                write_semgrep_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "dalfox":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code in {0, 1}:
-                write_dalfox_output(container.logs(stdout=True, stderr=False), output_file)
+                write_dalfox_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "sqlmap-controlled":
@@ -4265,21 +4296,21 @@ def execute_run(run_id: UUID) -> None:
                     encoding="utf-8",
                 )
         elif run["tool_id"] == "syft":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_syft_output(container.logs(stdout=True, stderr=False), output_file)
+                write_syft_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "grype":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_grype_output(container.logs(stdout=True, stderr=False), output_file)
+                write_grype_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "checkov":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_checkov_output(container.logs(stdout=True, stderr=False), output_file)
+                write_checkov_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "kubescape":
@@ -4288,48 +4319,48 @@ def execute_run(run_id: UUID) -> None:
                 encoding="utf-8",
             )
             if exit_code == 0:
-                write_kubescape_output(container.logs(stdout=True, stderr=False), output_file)
+                write_kubescape_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "Kubescape execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
         elif run["tool_id"] == "bandit":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_bandit_output(container.logs(stdout=True, stderr=False), output_file)
+                write_bandit_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "trufflehog":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_trufflehog_output(container.logs(stdout=True, stderr=False), output_file)
+                write_trufflehog_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_text("[]\n", encoding="utf-8")
         elif run["tool_id"] == "osv-scanner":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code in {0, 1}:
-                write_osv_output(container.logs(stdout=True, stderr=False), output_file)
+                write_osv_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "njsscan":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                output_file.write_bytes(container.logs(stdout=True, stderr=False))
+                output_file.write_bytes(capture_container_logs(container, stdout=True, stderr=False))
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "brakeman":
-            (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code in {0, 3}:
-                output_file.write_bytes(container.logs(stdout=True, stderr=False))
+                output_file.write_bytes(capture_container_logs(container, stdout=True, stderr=False))
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "kics":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code != 0:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "trivy":
-            (run_dir / "tool.log").write_bytes(logs)
+            write_tool_log(run_dir / "tool.log", logs)
             if exit_code != 0:
                 output_file.write_bytes(logs)
         else:

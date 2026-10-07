@@ -48,7 +48,17 @@ MAX_EVIDENCE_LINES = 200
 MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**3)))
 MAX_STORAGE_USED_PERCENT = float(os.getenv("MAX_STORAGE_USED_PERCENT", "90"))
 MAX_PENDING_RUNS = int(os.getenv("MAX_PENDING_RUNS", "100"))
-if MIN_STORAGE_FREE_BYTES < 0 or not 1 <= MAX_STORAGE_USED_PERCENT <= 100 or MAX_PENDING_RUNS < 1:
+MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
+MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
+MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
+if (
+    MIN_STORAGE_FREE_BYTES < 0
+    or not 1 <= MAX_STORAGE_USED_PERCENT <= 100
+    or MAX_PENDING_RUNS < 1
+    or not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024
+    or not 1 <= MAX_TOOL_LOG_BYTES <= MAX_TOOL_OUTPUT_BYTES
+    or not 1 <= MAX_TOOL_LOG_LINES <= 100_000
+):
     raise RuntimeError("Storage admission thresholds are invalid")
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
 
@@ -189,7 +199,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.66.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.67.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -553,6 +563,11 @@ def platform_status() -> dict:
         },
         "storage_admission": admission,
         "queue_admission": queue_capacity,
+        "capture_limits": {
+            "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,
+            "max_log_bytes": MAX_TOOL_LOG_BYTES,
+            "max_log_lines": MAX_TOOL_LOG_LINES,
+        },
     }
 
 
