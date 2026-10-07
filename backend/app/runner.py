@@ -10,6 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
@@ -499,7 +500,9 @@ def get_run(run_id: UUID) -> dict | None:
                        r.source_artifact_id, s.filename, s.sha256,
                        r.credential_profile_id, cp.role_name, cp.login_url,
                        cp.username_selector, cp.password_selector, cp.submit_selector,
-                       cp.success_selector, cp.encrypted_secret, t.max_run_seconds
+                       cp.success_selector, cp.encrypted_secret, t.max_run_seconds,
+                       t.testing_window_start_minute_utc,
+                       t.testing_window_end_minute_utc
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -532,6 +535,8 @@ def get_run(run_id: UUID) -> dict | None:
         "credential_success_selector": row[17],
         "credential_encrypted_secret": row[18],
         "target_max_run_seconds": row[19],
+        "testing_window_start_minute_utc": row[20],
+        "testing_window_end_minute_utc": row[21],
     }
 
 
@@ -541,6 +546,28 @@ def effective_timeout_seconds(adapter: dict, run: dict) -> int:
     if target_timeout is None:
         return adapter_timeout
     return min(adapter_timeout, max(30, min(int(target_timeout), 7200)))
+
+
+def testing_window_allows(
+    start_minute_utc: int | None,
+    end_minute_utc: int | None,
+    now: datetime | None = None,
+) -> bool:
+    if start_minute_utc is None and end_minute_utc is None:
+        return True
+    if (
+        start_minute_utc is None
+        or end_minute_utc is None
+        or not 0 <= start_minute_utc <= 1439
+        or not 0 <= end_minute_utc <= 1439
+        or start_minute_utc == end_minute_utc
+    ):
+        return False
+    current = now or datetime.now(timezone.utc)
+    current_minute = current.hour * 60 + current.minute
+    if start_minute_utc < end_minute_utc:
+        return start_minute_utc <= current_minute < end_minute_utc
+    return current_minute >= start_minute_utc or current_minute < end_minute_utc
 
 
 def build_command(
@@ -4121,6 +4148,12 @@ def execute_run(run_id: UUID) -> None:
             set_status(run_id, "failed", "Approved source artifact is missing from storage")
             return
     else:
+        if not testing_window_allows(
+            run.get("testing_window_start_minute_utc"),
+            run.get("testing_window_end_minute_utc"),
+        ):
+            set_status(run_id, "failed", "Target testing window is currently closed (UTC)")
+            return
         target_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
         allowed_hosts = {
             str(host).lower().rstrip(".") for host in (run["allowed_hosts"] or [])
@@ -4186,6 +4219,17 @@ def execute_run(run_id: UUID) -> None:
                         run.get("target_max_run_seconds") if input_type == "target" else None
                     ),
                     "effective_timeout_seconds": timeout_seconds,
+                },
+                "testing_window": {
+                    "start_minute_utc": (
+                        run.get("testing_window_start_minute_utc")
+                        if input_type == "target" else None
+                    ),
+                    "end_minute_utc": (
+                        run.get("testing_window_end_minute_utc")
+                        if input_type == "target" else None
+                    ),
+                    "enforced_at_start": input_type == "target",
                 },
                 "capture_limits": {
                     "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,

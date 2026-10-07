@@ -22,7 +22,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from cryptography.fernet import Fernet
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 REGISTRY_PATH = Path(os.getenv("TOOL_REGISTRY_PATH", "/app/config/tools.yaml"))
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
@@ -101,6 +101,25 @@ def init_database() -> None:
                 );
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS dns_resolver TEXT;
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS max_run_seconds INTEGER NOT NULL DEFAULT 300;
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS testing_window_start_minute_utc INTEGER;
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS testing_window_end_minute_utc INTEGER;
+                ALTER TABLE targets
+                    DROP CONSTRAINT IF EXISTS targets_valid_testing_window;
+                ALTER TABLE targets
+                    ADD CONSTRAINT targets_valid_testing_window CHECK (
+                        (
+                            testing_window_start_minute_utc IS NULL
+                            AND testing_window_end_minute_utc IS NULL
+                        )
+                        OR (
+                            testing_window_start_minute_utc IS NOT NULL
+                            AND testing_window_end_minute_utc IS NOT NULL
+                            AND testing_window_start_minute_utc BETWEEN 0 AND 1439
+                            AND testing_window_end_minute_utc BETWEEN 0 AND 1439
+                            AND testing_window_start_minute_utc
+                                <> testing_window_end_minute_utc
+                        )
+                    );
                 CREATE TABLE IF NOT EXISTS credential_profiles (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -249,7 +268,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.87.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.88.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -273,8 +292,64 @@ class TargetCreate(BaseModel):
     excluded_paths: list[str] = Field(default_factory=list, max_length=100)
     dns_resolver: str | None = Field(default=None, max_length=80)
     max_run_seconds: int = Field(default=300, ge=30, le=7200)
+    testing_window_start_minute_utc: int | None = Field(default=None, ge=0, le=1439)
+    testing_window_end_minute_utc: int | None = Field(default=None, ge=0, le=1439)
     authorization_reference: str = Field(min_length=3, max_length=500)
     authorization_confirmed: bool
+
+    @model_validator(mode="after")
+    def validate_testing_window(self):
+        start = self.testing_window_start_minute_utc
+        end = self.testing_window_end_minute_utc
+        if (start is None) != (end is None):
+            raise ValueError("Testing window requires both UTC start and end times")
+        if start is not None and start == end:
+            raise ValueError("Testing window start and end must differ")
+        return self
+
+
+def testing_window_allows(
+    start_minute_utc: int | None,
+    end_minute_utc: int | None,
+    now: datetime | None = None,
+) -> bool:
+    if start_minute_utc is None and end_minute_utc is None:
+        return True
+    if (
+        start_minute_utc is None
+        or end_minute_utc is None
+        or not 0 <= start_minute_utc <= 1439
+        or not 0 <= end_minute_utc <= 1439
+        or start_minute_utc == end_minute_utc
+    ):
+        return False
+    current = now or datetime.now(timezone.utc)
+    current_minute = current.hour * 60 + current.minute
+    if start_minute_utc < end_minute_utc:
+        return start_minute_utc <= current_minute < end_minute_utc
+    return current_minute >= start_minute_utc or current_minute < end_minute_utc
+
+
+def require_open_testing_window(
+    start_minute_utc: int | None,
+    end_minute_utc: int | None,
+) -> None:
+    if not testing_window_allows(start_minute_utc, end_minute_utc):
+        raise HTTPException(
+            status_code=409,
+            detail="Target testing window is currently closed (UTC)",
+        )
+
+
+def format_testing_window(start_minute_utc: int | None, end_minute_utc: int | None) -> str:
+    if start_minute_utc is None and end_minute_utc is None:
+        return "Any time"
+    if start_minute_utc is None or end_minute_utc is None:
+        return "Invalid configuration"
+    start = f"{start_minute_utc // 60:02d}:{start_minute_utc % 60:02d}"
+    end = f"{end_minute_utc // 60:02d}:{end_minute_utc % 60:02d}"
+    suffix = " (overnight)" if start_minute_utc > end_minute_utc else ""
+    return f"{start}-{end} UTC{suffix}"
 
 
 class RunCreate(BaseModel):
@@ -1168,8 +1243,10 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                 """
                 INSERT INTO targets
                     (id, project_id, base_url, allowed_hosts, excluded_paths, dns_resolver,
-                     max_run_seconds, authorization_reference, authorization_confirmed)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, TRUE)
+                     max_run_seconds, testing_window_start_minute_utc,
+                     testing_window_end_minute_utc, authorization_reference,
+                     authorization_confirmed)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, TRUE)
                 """,
                 (
                     target_id,
@@ -1179,6 +1256,8 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     Jsonb(payload.excluded_paths),
                     dns_resolver,
                     payload.max_run_seconds,
+                    payload.testing_window_start_minute_utc,
+                    payload.testing_window_end_minute_utc,
                     payload.authorization_reference,
                 ),
             )
@@ -1188,6 +1267,8 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     "base_url": str(payload.base_url),
                     "dns_resolver": dns_resolver,
                     "max_run_seconds": payload.max_run_seconds,
+                    "testing_window_start_minute_utc": payload.testing_window_start_minute_utc,
+                    "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
                     "authorization_reference": payload.authorization_reference,
                 },
             )
@@ -1206,7 +1287,9 @@ def list_targets(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
-                       max_run_seconds, authorization_reference, authorization_confirmed, created_at
+                       max_run_seconds, testing_window_start_minute_utc,
+                       testing_window_end_minute_utc, authorization_reference,
+                       authorization_confirmed, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -1217,8 +1300,11 @@ def list_targets(project_id: UUID) -> dict:
             {
                 "id": row[0], "base_url": row[1], "allowed_hosts": row[2],
                 "excluded_paths": row[3], "dns_resolver": row[4],
-                "max_run_seconds": row[5], "authorization_reference": row[6],
-                "authorization_confirmed": row[7], "created_at": row[8],
+                "max_run_seconds": row[5],
+                "testing_window_start_minute_utc": row[6],
+                "testing_window_end_minute_utc": row[7],
+                "authorization_reference": row[8],
+                "authorization_confirmed": row[9], "created_at": row[10],
             }
             for row in rows
         ]
@@ -1395,7 +1481,11 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=422, detail="Source authorization is not confirmed")
             else:
                 cursor.execute(
-                    "SELECT authorization_confirmed FROM targets WHERE id = %s AND project_id = %s",
+                    """
+                    SELECT authorization_confirmed, testing_window_start_minute_utc,
+                           testing_window_end_minute_utc
+                    FROM targets WHERE id = %s AND project_id = %s
+                    """,
                     (payload.target_id, project_id),
                 )
                 target = cursor.fetchone()
@@ -1403,6 +1493,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=404, detail="Target not found in project")
                 if not target[0]:
                     raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+                require_open_testing_window(target[1], target[2])
                 if payload.credential_profile_id is not None:
                     cursor.execute(
                         """
@@ -1479,7 +1570,11 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT authorization_confirmed FROM targets WHERE id = %s AND project_id = %s",
+                """
+                SELECT authorization_confirmed, testing_window_start_minute_utc,
+                       testing_window_end_minute_utc
+                FROM targets WHERE id = %s AND project_id = %s
+                """,
                 (payload.target_id, project_id),
             )
             target = cursor.fetchone()
@@ -1487,6 +1582,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 raise HTTPException(status_code=404, detail="Target not found in project")
             if not target[0]:
                 raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+            require_open_testing_window(target[1], target[2])
             credential_role = None
             if payload.credential_profile_id is not None:
                 cursor.execute(
@@ -2197,7 +2293,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             cursor.execute(
                 """
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
-                       max_run_seconds, authorization_reference
+                       max_run_seconds, testing_window_start_minute_utc,
+                       testing_window_end_minute_utc, authorization_reference
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -2288,13 +2385,22 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
     ]
     if targets:
-        for base_url, allowed_hosts, excluded_paths, dns_resolver, max_run_seconds, authorization_reference in targets:
+        for (
+            base_url, allowed_hosts, excluded_paths, dns_resolver, max_run_seconds,
+            testing_window_start_minute_utc, testing_window_end_minute_utc,
+            authorization_reference,
+        ) in targets:
             lines.extend([
                 f"- Target: `{md(base_url)}`",
                 f"  - Allowed hosts: {md(', '.join(allowed_hosts))}",
                 f"  - Excluded paths: {md(', '.join(excluded_paths) or 'None recorded')}",
                 f"  - Approved DNS resolver: {md(dns_resolver or 'None recorded')}",
                 f"  - Maximum run duration: {max_run_seconds} seconds",
+                "  - Testing window: "
+                + format_testing_window(
+                    testing_window_start_minute_utc,
+                    testing_window_end_minute_utc,
+                ),
                 f"  - Authorization reference: {md(authorization_reference)}",
             ])
     else:
