@@ -5,9 +5,9 @@ profiles:
   source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, syft, grype, trivy, gitleaks, trufflehog, osv-scanner, checkov, kics, hadolint, shellcheck]}
 
 tools:
-  amass: {category: recon, risk: medium, availability: optional, execution: adapter}
+  amass: {category: recon, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Passive enumeration contacts third-party data sources; require provider/scope approval before automation."}
   subfinder: {category: recon, risk: low, availability: core, execution: adapter}
-  theharvester: {category: osint, risk: medium, availability: optional, execution: adapter}
+  theharvester: {category: osint, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Queries third-party search and intelligence providers; require provider terms and scope approval."}
   spiderfoot: {category: osint, risk: medium, availability: optional, execution: standalone}
   recon-ng: {category: osint, risk: medium, availability: optional, execution: manual}
   sherlock: {category: osint, risk: low, availability: optional, execution: manual}
@@ -54,7 +54,7 @@ tools:
   kics: {category: iac, risk: low, availability: core, execution: adapter}
   prowler: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
   scoutsuite: {category: cloud, risk: medium, availability: optional, execution: credential-gated}
-  kube-bench: {category: kubernetes, risk: low, availability: optional, execution: adapter}
+  kube-bench: {category: kubernetes, risk: medium, availability: optional, execution: manual-host-audit, automation_note: "Full CIS assessment requires explicit read-only node configuration and host PID access; never mounted by the supervised runner."}
   kubescape: {category: kubernetes, risk: low, availability: optional, execution: adapter}
   mobsf: {category: mobile, risk: low, availability: optional, execution: standalone}
   greenbone: {category: infrastructure, risk: high, availability: optional-heavy, execution: standalone}

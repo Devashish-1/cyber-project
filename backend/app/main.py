@@ -175,7 +175,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.58.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.58.1", lifespan=lifespan)
 
 
 class ProjectCreate(BaseModel):
@@ -497,21 +497,33 @@ def coverage() -> dict:
         by_input[input_type] = by_input.get(input_type, 0) + 1
     eligible_count = len(eligible)
     implemented_count = len(implemented_names)
+    by_execution: dict[str, int] = {}
+    for metadata in registry.values():
+        mode = str(metadata.get("execution") or "unspecified")
+        by_execution[mode] = by_execution.get(mode, 0) + 1
+    non_adapter = [
+        {"id": name, **metadata}
+        for name, metadata in sorted(registry.items())
+        if metadata.get("execution") not in eligible_modes
+    ]
     return {
         "totals": {
             "catalogued": len(registry),
             "adapter_eligible": eligible_count,
             "implemented": implemented_count,
             "pending": len(pending_names),
+            "non_adapter": len(non_adapter),
             "coverage_percent": round((implemented_count / eligible_count) * 100, 1) if eligible_count else 0,
         },
         "by_profile": dict(sorted(by_profile.items())),
         "by_input": dict(sorted(by_input.items())),
+        "by_execution": dict(sorted(by_execution.items())),
         "by_category": dict(sorted(by_category.items())),
         "pending": [
             {"id": name, **eligible[name]}
             for name in pending_names
         ],
+        "non_adapter": non_adapter,
     }
 
 
