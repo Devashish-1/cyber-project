@@ -389,6 +389,47 @@ def set_status(run_id: UUID, status: str, error: str | None = None) -> None:
             )
 
 
+def apply_inherited_finding_reviews(cursor, run_id: UUID) -> int:
+    cursor.execute(
+        """
+        WITH inherited AS (
+            SELECT current.id, prior.review_status, prior.review_notes,
+                   prior.reviewed_by, prior.reviewed_at
+            FROM observations AS current
+            JOIN runs AS current_run ON current_run.id = current.run_id
+            JOIN LATERAL (
+                SELECT older.review_status, older.review_notes,
+                       older.reviewed_by, older.reviewed_at
+                FROM observations AS older
+                JOIN runs AS older_run ON older_run.id = older.run_id
+                WHERE older_run.project_id = current_run.project_id
+                  AND older.fingerprint = current.fingerprint
+                  AND older.id <> current.id
+                  AND older.review_status IN ('confirmed', 'false_positive', 'accepted_risk')
+                ORDER BY older.reviewed_at DESC NULLS LAST, older.created_at DESC
+                LIMIT 1
+            ) AS prior ON TRUE
+            WHERE current.run_id = %s AND current.review_status = 'new'
+        )
+        UPDATE observations AS current
+        SET review_status = inherited.review_status,
+            review_notes = inherited.review_notes,
+            reviewed_by = inherited.reviewed_by,
+            reviewed_at = inherited.reviewed_at
+        FROM inherited
+        WHERE current.id = inherited.id
+        """,
+        (run_id,),
+    )
+    return cursor.rowcount
+
+
+def inherit_finding_reviews(run_id: UUID) -> int:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            return apply_inherited_finding_reviews(cursor, run_id)
+
+
 def seal_evidence(run_id: UUID, run_dir: Path) -> None:
     manifest_path = run_dir / "integrity.json"
     evidence_paths = [
@@ -4640,8 +4681,14 @@ def execute_run(run_id: UUID) -> None:
         if exit_code in successful_exit_codes:
             normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
+            inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")
-            append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
+            append_event(event_file, {
+                "event": "normalized",
+                "observations": observation_count,
+                "inherited_reviews": inherited_review_count,
+                "time": time.time(),
+            })
             append_event(event_file, {"event": "succeeded", "exit_code": exit_code, "time": time.time()})
         else:
             set_status(run_id, "failed", f"Tool exited with status {exit_code}")

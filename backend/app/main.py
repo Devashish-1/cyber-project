@@ -247,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.84.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.85.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2372,37 +2372,64 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
     }
 
 
+def apply_project_fingerprint_review(
+    cursor, observation_id: UUID, status: str, notes: str, reviewed_by: str
+) -> tuple | None:
+    cursor.execute(
+        """
+        SELECT r.project_id, o.review_status, o.fingerprint
+        FROM observations o JOIN runs r ON r.id = o.run_id
+        WHERE o.id = %s
+        """,
+        (observation_id,),
+    )
+    observation = cursor.fetchone()
+    if observation is None:
+        return None
+    cursor.execute(
+        """
+        UPDATE observations AS candidate
+        SET review_status = %s, review_notes = %s, reviewed_by = %s, reviewed_at = NOW()
+        FROM runs AS candidate_run
+        WHERE candidate.run_id = candidate_run.id
+          AND candidate_run.project_id = %s
+          AND candidate.fingerprint = %s
+        """,
+        (status, notes, reviewed_by, observation[0], observation[2]),
+    )
+    affected_observations = cursor.rowcount
+    cursor.execute(
+        """
+        SELECT run_id, review_status, review_notes, reviewed_by, reviewed_at
+        FROM observations WHERE id = %s
+        """,
+        (observation_id,),
+    )
+    row = cursor.fetchone()
+    return observation, row, affected_observations
+
+
 @app.patch("/observations/{observation_id}")
 def review_observation(observation_id: UUID, payload: ObservationReview) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.project_id, o.review_status
-                FROM observations o JOIN runs r ON r.id = o.run_id
-                WHERE o.id = %s
-                """,
-                (observation_id,),
+            result = apply_project_fingerprint_review(
+                cursor, observation_id, payload.status, payload.notes, payload.reviewed_by
             )
-            observation = cursor.fetchone()
-            if observation is None:
+            if result is None:
                 raise HTTPException(status_code=404, detail="Observation not found")
-            cursor.execute(
-                """
-                UPDATE observations
-                SET review_status = %s, review_notes = %s, reviewed_by = %s, reviewed_at = NOW()
-                WHERE id = %s
-                RETURNING run_id, review_status, review_notes, reviewed_by, reviewed_at
-                """,
-                (payload.status, payload.notes, payload.reviewed_by, observation_id),
-            )
-            row = cursor.fetchone()
+            observation, row, affected_observations = result
             record_audit(
                 cursor, observation[0], "finding.reviewed", payload.reviewed_by,
                 "observation", observation_id,
-                {"previous_status": observation[1], "review_status": payload.status},
+                {
+                    "previous_status": observation[1],
+                    "review_status": payload.status,
+                    "affected_observations": affected_observations,
+                },
             )
     return {
         "id": observation_id, "run_id": row[0], "review_status": row[1],
         "review_notes": row[2], "reviewed_by": row[3], "reviewed_at": row[4],
+        "affected_observations": affected_observations,
     }
