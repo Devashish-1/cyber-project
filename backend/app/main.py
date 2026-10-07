@@ -9,6 +9,7 @@ import stat
 import time
 import zipfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
 
@@ -203,7 +204,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.69.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.70.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1499,6 +1500,39 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 (project_id,),
             )
             tools = [row[0] for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT filename, sha256, file_count, compressed_size, extracted_size,
+                       authorization_reference, created_at
+                FROM source_artifacts WHERE project_id = %s ORDER BY created_at
+                """,
+                (project_id,),
+            )
+            sources = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT tool_id, profile, status, COUNT(*),
+                       COUNT(*) FILTER (WHERE evidence_manifest_sha256 IS NOT NULL),
+                       MAX(finished_at)
+                FROM runs WHERE project_id = %s
+                GROUP BY tool_id, profile, status
+                ORDER BY tool_id, profile, status
+                """,
+                (project_id,),
+            )
+            run_coverage = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FILTER (WHERE status IN ('succeeded','failed','cancelled')),
+                       COUNT(*) FILTER (
+                           WHERE status IN ('succeeded','failed','cancelled')
+                           AND evidence_manifest_sha256 IS NOT NULL
+                       )
+                FROM runs WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            completed_runs, sealed_runs = cursor.fetchone()
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -1509,12 +1543,22 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     }
 
     def md(value: object) -> str:
-        return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+        return (
+            str(value or "")
+            .replace("\\", "\\\\")
+            .replace("`", "\\`")
+            .replace("|", "\\|")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
 
     lines = [
         f"# Security assessment report — {md(project[0])}",
         "",
         f"Project ID: `{project_id}`  ",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}  ",
         f"Created: {project[2].isoformat()}  ",
         f"Description: {md(project[1]) or 'Not provided'}",
         "",
@@ -1532,6 +1576,18 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             ])
     else:
         lines.append("No targets recorded.")
+    lines.extend(["", "### Authorized source archives", ""])
+    if sources:
+        for filename, sha256, file_count, compressed_size, extracted_size, authorization_reference, created_at in sources:
+            lines.extend([
+                f"- Source: `{md(filename)}` ({file_count} files, {extracted_size} extracted bytes)",
+                f"  - SHA-256: `{md(sha256)}`",
+                f"  - Archive size: {compressed_size} bytes",
+                f"  - Authorization reference: {md(authorization_reference)}",
+                f"  - Added: {created_at.isoformat()}",
+            ])
+    else:
+        lines.append("No source archives recorded.")
     lines.extend([
         "",
         "## Automated coverage",
@@ -1540,6 +1596,20 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Run outcomes: {md(', '.join(f'{status}={count}' for status, count in status_counts) or 'None')}",
         f"- Unique observations: {len(findings)}",
         f"- Severity totals: critical={severity_counts['critical']}, high={severity_counts['high']}, medium={severity_counts['medium']}, low={severity_counts['low']}, info={severity_counts['info']}",
+        f"- Evidence sealed: {sealed_runs} of {completed_runs} completed runs",
+        "",
+        "### Run coverage matrix",
+        "",
+        "| Tool | Profile | Outcome | Runs | Sealed evidence | Latest completion |",
+        "|---|---|---|---:|---:|---|",
+    ])
+    lines.extend(
+        f"| {md(tool_id)} | {md(profile)} | {md(status)} | {count} | {sealed_count} | {latest.isoformat() if latest else '—'} |"
+        for tool_id, profile, status, count, sealed_count, latest in run_coverage
+    )
+    if not run_coverage:
+        lines.append("| — | — | No runs recorded | 0 | 0 | — |")
+    lines.extend([
         "",
         "## Findings",
         "",
@@ -1552,6 +1622,25 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     )
     if not reported:
         lines.append("| — | No reportable findings | — | — | 0 | — |")
+    else:
+        lines.extend(["", "### Finding details", ""])
+        for index, item in enumerate(reported, start=1):
+            details = json.dumps(sanitize_evidence(item["details"]), sort_keys=True, separators=(",", ":"), default=str)
+            lines.extend([
+                f"#### {index}. [{md(item['severity']).upper()}] {md(item['title'])}",
+                "",
+                f"- Asset: `{md(item['asset'])}`",
+                f"- Tool: `{md(item['tool_id'])}`",
+                f"- Evidence run: `{md(item['run_id'])}`",
+                f"- Type: `{md(item['type'])}`",
+                f"- Review status: {md(item['review_status'])}",
+                f"- Occurrences: {item['occurrence_count']}",
+                f"- First seen: {item['first_seen'].isoformat()}",
+                f"- Last seen: {item['last_seen'].isoformat()}",
+                f"- Review notes: {md(item['review_notes']) or 'None'}",
+                f"- Sanitized details: `{md(details)}`",
+                "",
+            ])
     lines.extend([
         "",
         "## Limitations",
