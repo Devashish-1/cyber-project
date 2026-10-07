@@ -230,7 +230,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.73.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.73.1", lifespan=lifespan)
 
 
 @app.middleware("http")

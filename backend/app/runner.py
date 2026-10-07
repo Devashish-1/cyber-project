@@ -4,7 +4,6 @@ import ipaddress
 import re
 import io
 import os
-import socket
 import tarfile
 import threading
 import time
@@ -4136,7 +4135,8 @@ def execute_run(run_id: UUID) -> None:
             container_entrypoint = "/bin/sh"
             container_command = [
                 "-c",
-                "umask 077; cat > /auth/credentials.json; "
+                "umask 077; IFS= read -r credentials; "
+                "printf '%s' \"$credentials\" > /auth/credentials.json; unset credentials; "
                 "test -s /auth/credentials.json; "
                 "exec node /input/browser-observe.js /input/browser-config.json",
             ]
@@ -4240,8 +4240,10 @@ def execute_run(run_id: UUID) -> None:
             secret_payload = playwright_secret_payload(run)
             stdin_socket = client.api.attach_socket(container.id, params={"stdin": 1, "stream": 1})
             container.start()
-            stdin_socket._sock.sendall(secret_payload)
-            stdin_socket._sock.shutdown(socket.SHUT_WR)
+            stdin_socket._sock.sendall(secret_payload + b"\n")
+            stdin_socket._response.close()
+            stdin_socket.close()
+            stdin_socket = None
             secret_payload = b""
         else:
             container.start()
