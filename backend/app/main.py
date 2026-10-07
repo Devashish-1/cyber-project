@@ -3,6 +3,7 @@ import hashlib
 import ipaddress
 import os
 import re
+import secrets
 import shutil
 import stat
 import time
@@ -14,8 +15,8 @@ from uuid import UUID, uuid4
 import psycopg
 import redis
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -23,6 +24,9 @@ REGISTRY_PATH = Path(os.getenv("TOOL_REGISTRY_PATH", "/app/config/tools.yaml"))
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
+CONTROL_PLANE_TOKEN = os.environ["CONTROL_PLANE_TOKEN"]
+if len(CONTROL_PLANE_TOKEN) < 32:
+    raise RuntimeError("CONTROL_PLANE_TOKEN must contain at least 32 characters")
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_IMPLEMENTED_TOOLS = {"arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "sqlmap-controlled", "subfinder", "syft", "testssl", "trivy", "trufflehog", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
@@ -177,7 +181,17 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.60.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.61.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_control_plane_token(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+    supplied = request.headers.get("x-control-plane-token", "")
+    if not secrets.compare_digest(supplied, CONTROL_PLANE_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Control-plane authentication required"})
+    return await call_next(request)
 
 
 class ProjectCreate(BaseModel):

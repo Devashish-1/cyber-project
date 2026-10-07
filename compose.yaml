@@ -39,6 +39,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:?Set CONTROL_PLANE_TOKEN in .env}
       TOOL_REGISTRY_PATH: /app/config/tools.yaml
       ADAPTERS_PATH: /app/config/adapters.yaml
       EVIDENCE_ROOT: /evidence/runs
