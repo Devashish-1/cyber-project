@@ -140,6 +140,17 @@ def init_database() -> None:
                 );
                 ALTER TABLE run_batches ADD COLUMN IF NOT EXISTS credential_profile_id UUID
                     REFERENCES credential_profiles(id) ON DELETE RESTRICT;
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    tool_ids JSONB NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (project_id, name)
+                );
+                CREATE INDEX IF NOT EXISTS workflow_templates_project_created_idx
+                    ON workflow_templates(project_id, created_at DESC);
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_step INTEGER;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS retest_of_observation UUID;
@@ -234,7 +245,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.78.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.79.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -300,6 +311,17 @@ class BatchCreate(BaseModel):
     approval_confirmed: bool
 
 
+class WorkflowTemplateCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    tool_ids: list[str] = Field(min_length=1, max_length=20)
+    created_by: str = Field(min_length=2, max_length=120)
+
+
+class WorkflowTemplateDelete(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^DELETE WORKFLOW TEMPLATE$")
+
+
 class ObservationReview(BaseModel):
     status: str = Field(pattern="^(new|confirmed|false_positive|accepted_risk|resolved)$")
     reviewed_by: str = Field(min_length=2, max_length=120)
@@ -343,6 +365,23 @@ def normalize_dns_resolver(value: str | None) -> str | None:
         raise HTTPException(status_code=422, detail="DNS resolver port must be between 1 and 65535")
     formatted = f"[{address}]" if address.version == 6 else str(address)
     return f"{formatted}:{port}"
+
+
+def validate_workflow_tool_ids(tool_ids: list[str]) -> dict:
+    if len(tool_ids) != len(set(tool_ids)):
+        raise HTTPException(status_code=422, detail="Custom workflows cannot contain duplicate adapters")
+    registry = load_registry().get("tools", {})
+    adapters = load_adapters().get("adapters", {})
+    for tool_id in tool_ids:
+        tool = registry.get(tool_id)
+        adapter = adapters.get(tool_id)
+        if tool is None or adapter is None or tool_id not in RUNNER_IMPLEMENTED_TOOLS:
+            raise HTTPException(status_code=422, detail=f"Workflow adapter is unavailable: {tool_id}")
+        if tool.get("execution") in {"disabled", "manual"}:
+            raise HTTPException(status_code=422, detail=f"Workflow adapter cannot run automatically: {tool_id}")
+        if adapter.get("input", "target") != "target":
+            raise HTTPException(status_code=422, detail=f"Target workflows cannot contain source adapter: {tool_id}")
+    return adapters
 
 
 def load_registry() -> dict:
@@ -836,6 +875,73 @@ def run_plans() -> dict:
     }
 
 
+@app.get("/projects/{project_id}/workflow-templates")
+def list_workflow_templates(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, name, tool_ids, created_by, created_at
+                FROM workflow_templates WHERE project_id = %s ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {
+        "templates": [
+            {"id": row[0], "name": row[1], "tool_ids": row[2], "created_by": row[3], "created_at": row[4]}
+            for row in rows
+        ]
+    }
+
+
+@app.post("/projects/{project_id}/workflow-templates", status_code=201)
+def create_workflow_template(project_id: UUID, payload: WorkflowTemplateCreate) -> dict:
+    validate_workflow_tool_ids(payload.tool_ids)
+    template_id = uuid4()
+    try:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                cursor.execute(
+                    """
+                    INSERT INTO workflow_templates (id, project_id, name, tool_ids, created_by)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (template_id, project_id, payload.name.strip(), Jsonb(payload.tool_ids), payload.created_by),
+                )
+                record_audit(
+                    cursor, project_id, "workflow_template.created", payload.created_by,
+                    "workflow_template", template_id, {"name": payload.name.strip(), "tools": payload.tool_ids},
+                )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="A workflow template with this name already exists") from exc
+    return {"id": template_id, "project_id": project_id, **payload.model_dump()}
+
+
+@app.delete("/workflow-templates/{template_id}")
+def delete_workflow_template(template_id: UUID, payload: WorkflowTemplateDelete) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM workflow_templates WHERE id = %s RETURNING project_id, name, tool_ids",
+                (template_id,),
+            )
+            deleted = cursor.fetchone()
+            if deleted is None:
+                raise HTTPException(status_code=404, detail="Workflow template not found")
+            record_audit(
+                cursor, deleted[0], "workflow_template.deleted", payload.requested_by,
+                "workflow_template", template_id, {"name": deleted[1], "tools": deleted[2]},
+            )
+    return {"id": template_id, "deleted": True}
+
+
 @app.post("/projects", status_code=201)
 def create_project(payload: ProjectCreate) -> dict:
     project_id = uuid4()
@@ -1306,24 +1412,11 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     if (payload.plan_id is None) == (payload.tool_ids is None):
         raise HTTPException(status_code=422, detail="Select exactly one preset plan or a custom tool sequence")
     tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
-    if len(tool_ids) != len(set(tool_ids)):
-        raise HTTPException(status_code=422, detail="Custom workflows cannot contain duplicate adapters")
+    adapters = validate_workflow_tool_ids(tool_ids)
     plan_id = payload.plan_id or f"custom-{hashlib.sha256(json.dumps(tool_ids).encode()).hexdigest()[:12]}"
     if payload.credential_profile_id is not None and "playwright" not in tool_ids:
         raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
     queue_admission(requested_slots=len(tool_ids), enforce=True)
-    registry = load_registry().get("tools", {})
-    adapters = load_adapters().get("adapters", {})
-    for tool_id in tool_ids:
-        tool = registry.get(tool_id)
-        adapter = adapters.get(tool_id)
-        if tool is None or adapter is None or tool_id not in RUNNER_IMPLEMENTED_TOOLS:
-            raise HTTPException(status_code=422, detail=f"Plan adapter is unavailable: {tool_id}")
-        if tool.get("execution") in {"disabled", "manual"}:
-            raise HTTPException(status_code=422, detail=f"Plan adapter cannot run automatically: {tool_id}")
-        if adapter.get("input", "target") != "target":
-            raise HTTPException(status_code=422, detail=f"Custom target workflows cannot contain source adapter: {tool_id}")
-
     batch_id = uuid4()
     run_ids = [uuid4() for _ in tool_ids]
     with psycopg.connect(DATABASE_URL) as connection:
