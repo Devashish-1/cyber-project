@@ -100,6 +100,7 @@ def init_database() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS dns_resolver TEXT;
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS max_run_seconds INTEGER NOT NULL DEFAULT 300;
                 CREATE TABLE IF NOT EXISTS credential_profiles (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -248,7 +249,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.86.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.87.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -271,6 +272,7 @@ class TargetCreate(BaseModel):
     allowed_hosts: list[str] = Field(min_length=1, max_length=50)
     excluded_paths: list[str] = Field(default_factory=list, max_length=100)
     dns_resolver: str | None = Field(default=None, max_length=80)
+    max_run_seconds: int = Field(default=300, ge=30, le=7200)
     authorization_reference: str = Field(min_length=3, max_length=500)
     authorization_confirmed: bool
 
@@ -1166,8 +1168,8 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                 """
                 INSERT INTO targets
                     (id, project_id, base_url, allowed_hosts, excluded_paths, dns_resolver,
-                     authorization_reference, authorization_confirmed)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, TRUE)
+                     max_run_seconds, authorization_reference, authorization_confirmed)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, TRUE)
                 """,
                 (
                     target_id,
@@ -1176,6 +1178,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     Jsonb(payload.allowed_hosts),
                     Jsonb(payload.excluded_paths),
                     dns_resolver,
+                    payload.max_run_seconds,
                     payload.authorization_reference,
                 ),
             )
@@ -1184,6 +1187,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                 {
                     "base_url": str(payload.base_url),
                     "dns_resolver": dns_resolver,
+                    "max_run_seconds": payload.max_run_seconds,
                     "authorization_reference": payload.authorization_reference,
                 },
             )
@@ -1202,7 +1206,7 @@ def list_targets(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
-                       authorization_reference, authorization_confirmed, created_at
+                       max_run_seconds, authorization_reference, authorization_confirmed, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -1213,8 +1217,8 @@ def list_targets(project_id: UUID) -> dict:
             {
                 "id": row[0], "base_url": row[1], "allowed_hosts": row[2],
                 "excluded_paths": row[3], "dns_resolver": row[4],
-                "authorization_reference": row[5],
-                "authorization_confirmed": row[6], "created_at": row[7],
+                "max_run_seconds": row[5], "authorization_reference": row[6],
+                "authorization_confirmed": row[7], "created_at": row[8],
             }
             for row in rows
         ]
@@ -2192,7 +2196,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 raise HTTPException(status_code=404, detail="Project not found")
             cursor.execute(
                 """
-                SELECT base_url, allowed_hosts, excluded_paths, dns_resolver, authorization_reference
+                SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
+                       max_run_seconds, authorization_reference
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -2283,12 +2288,13 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
     ]
     if targets:
-        for base_url, allowed_hosts, excluded_paths, dns_resolver, authorization_reference in targets:
+        for base_url, allowed_hosts, excluded_paths, dns_resolver, max_run_seconds, authorization_reference in targets:
             lines.extend([
                 f"- Target: `{md(base_url)}`",
                 f"  - Allowed hosts: {md(', '.join(allowed_hosts))}",
                 f"  - Excluded paths: {md(', '.join(excluded_paths) or 'None recorded')}",
                 f"  - Approved DNS resolver: {md(dns_resolver or 'None recorded')}",
+                f"  - Maximum run duration: {max_run_seconds} seconds",
                 f"  - Authorization reference: {md(authorization_reference)}",
             ])
     else:

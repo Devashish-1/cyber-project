@@ -499,7 +499,7 @@ def get_run(run_id: UUID) -> dict | None:
                        r.source_artifact_id, s.filename, s.sha256,
                        r.credential_profile_id, cp.role_name, cp.login_url,
                        cp.username_selector, cp.password_selector, cp.submit_selector,
-                       cp.success_selector, cp.encrypted_secret
+                       cp.success_selector, cp.encrypted_secret, t.max_run_seconds
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -531,7 +531,16 @@ def get_run(run_id: UUID) -> dict | None:
         "credential_submit_selector": row[16],
         "credential_success_selector": row[17],
         "credential_encrypted_secret": row[18],
+        "target_max_run_seconds": row[19],
     }
+
+
+def effective_timeout_seconds(adapter: dict, run: dict) -> int:
+    adapter_timeout = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
+    target_timeout = run.get("target_max_run_seconds")
+    if target_timeout is None:
+        return adapter_timeout
+    return min(adapter_timeout, max(30, min(int(target_timeout), 7200)))
 
 
 def build_command(
@@ -4120,6 +4129,7 @@ def execute_run(run_id: UUID) -> None:
             set_status(run_id, "failed", "Target host is not present in the saved allowed-host scope")
             return
 
+    timeout_seconds = effective_timeout_seconds(adapter, run)
     run_dir = EVIDENCE_ROOT / str(run_id)
     output_file = run_dir / "output.jsonl"
     event_file = run_dir / "events.jsonl"
@@ -4168,6 +4178,15 @@ def execute_run(run_id: UUID) -> None:
                 "dns_resolver": run["dns_resolver"] if input_type == "target" else None,
                 "credential_profile_id": str(run["credential_profile_id"]) if run.get("credential_profile_id") else None,
                 "authenticated_role": run.get("credential_role") if run.get("credential_profile_id") else None,
+                "duration_policy": {
+                    "adapter_timeout_seconds": max(
+                        30, min(int(adapter.get("timeout_seconds", 600)), 7200)
+                    ),
+                    "target_max_run_seconds": (
+                        run.get("target_max_run_seconds") if input_type == "target" else None
+                    ),
+                    "effective_timeout_seconds": timeout_seconds,
+                },
                 "capture_limits": {
                     "max_output_bytes": MAX_TOOL_OUTPUT_BYTES,
                     "max_log_bytes": MAX_TOOL_LOG_BYTES,
@@ -4182,7 +4201,10 @@ def execute_run(run_id: UUID) -> None:
     )
 
     set_status(run_id, "running")
-    append_event(event_file, {"event": "started", "time": time.time()})
+    append_event(
+        event_file,
+        {"event": "started", "timeout_seconds": timeout_seconds, "time": time.time()},
+    )
     client = None
     container = None
     stdin_socket = None
@@ -4195,7 +4217,6 @@ def execute_run(run_id: UUID) -> None:
         memory = resources.get("memory", "512m")
         cpus = float(resources.get("cpus", 0.5))
         pids = int(resources.get("pids", 128))
-        timeout_seconds = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
         schemathesis_schema_file = None
         if run["tool_id"] == "schemathesis":
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
