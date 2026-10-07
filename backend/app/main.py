@@ -11,6 +11,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import psycopg
@@ -18,6 +19,7 @@ import redis
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from cryptography.fernet import Fernet
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -28,6 +30,11 @@ REDIS_URL = os.environ["REDIS_URL"]
 CONTROL_PLANE_TOKEN = os.environ["CONTROL_PLANE_TOKEN"]
 if len(CONTROL_PLANE_TOKEN) < 32:
     raise RuntimeError("CONTROL_PLANE_TOKEN must contain at least 32 characters")
+CREDENTIAL_ENCRYPTION_KEY = os.environ["CREDENTIAL_ENCRYPTION_KEY"].encode("ascii")
+try:
+    CREDENTIAL_CIPHER = Fernet(CREDENTIAL_ENCRYPTION_KEY)
+except (TypeError, ValueError) as exc:
+    raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key") from exc
 RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
@@ -91,6 +98,23 @@ def init_database() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS dns_resolver TEXT;
+                CREATE TABLE IF NOT EXISTS credential_profiles (
+                    id UUID PRIMARY KEY,
+                    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    role_name TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind = 'form-login'),
+                    login_url TEXT NOT NULL,
+                    username_selector TEXT NOT NULL,
+                    password_selector TEXT NOT NULL,
+                    submit_selector TEXT NOT NULL,
+                    encrypted_secret BYTEA NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (project_id, name)
+                );
+                CREATE INDEX IF NOT EXISTS credential_profiles_project_created_idx
+                    ON credential_profiles(project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS runs (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -204,7 +228,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.71.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.72.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -238,6 +262,25 @@ class RunCreate(BaseModel):
     profile: str = Field(min_length=1, max_length=100)
     requested_by: str = Field(min_length=2, max_length=120)
     approval_confirmed: bool
+
+
+class CredentialProfileCreate(BaseModel):
+    target_id: UUID
+    name: str = Field(min_length=2, max_length=120)
+    role_name: str = Field(min_length=2, max_length=120)
+    kind: str = Field(default="form-login", pattern="^form-login$")
+    login_url: HttpUrl
+    username: str = Field(min_length=1, max_length=500)
+    password: str = Field(min_length=1, max_length=4096)
+    username_selector: str = Field(min_length=1, max_length=300)
+    password_selector: str = Field(min_length=1, max_length=300)
+    submit_selector: str = Field(min_length=1, max_length=300)
+    requested_by: str = Field(min_length=2, max_length=120)
+
+
+class CredentialProfileDelete(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^DELETE CREDENTIAL PROFILE$")
 
 
 class BatchCreate(BaseModel):
@@ -599,6 +642,11 @@ def platform_status() -> dict:
             "max_log_lines": MAX_TOOL_LOG_LINES,
             "max_run_evidence_bytes": MAX_RUN_EVIDENCE_BYTES,
             "max_run_evidence_files": MAX_RUN_EVIDENCE_FILES,
+        },
+        "credential_vault": {
+            "configured": True,
+            "cipher": "fernet",
+            "plaintext_returned": False,
         },
     }
 
@@ -1020,6 +1068,121 @@ def list_targets(project_id: UUID) -> dict:
             for row in rows
         ]
     }
+
+
+def credential_profile_response(row: tuple) -> dict:
+    return {
+        "id": row[0], "project_id": row[1], "target_id": row[2],
+        "name": row[3], "role_name": row[4], "kind": row[5],
+        "login_url": row[6], "username_selector": row[7],
+        "password_selector": row[8], "submit_selector": row[9],
+        "created_at": row[10],
+    }
+
+
+@app.post("/projects/{project_id}/credential-profiles", status_code=201)
+def create_credential_profile(project_id: UUID, payload: CredentialProfileCreate) -> dict:
+    login_url = str(payload.login_url)
+    parsed = urlsplit(login_url)
+    login_host = (parsed.hostname or "").lower().rstrip(".")
+    login_path = parsed.path or "/"
+    if parsed.query or parsed.fragment:
+        raise HTTPException(status_code=422, detail="Login URL must not contain a query or fragment")
+    for selector in (payload.username_selector, payload.password_selector, payload.submit_selector):
+        if any(ord(character) < 32 for character in selector):
+            raise HTTPException(status_code=422, detail="Login selectors must not contain control characters")
+    secret = json.dumps(
+        {"username": payload.username, "password": payload.password},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encrypted_secret = CREDENTIAL_CIPHER.encrypt(secret)
+    profile_id = uuid4()
+    try:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT base_url, allowed_hosts, excluded_paths, authorization_confirmed
+                    FROM targets WHERE id = %s AND project_id = %s
+                    """,
+                    (payload.target_id, project_id),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    raise HTTPException(status_code=404, detail="Target not found in project")
+                target_host = (urlsplit(target[0]).hostname or "").lower().rstrip(".")
+                allowed_hosts = {str(host).lower().rstrip(".") for host in target[1]}
+                excluded_paths = ["/" + str(path).lstrip("/").rstrip("/") for path in target[2]]
+                if not target[3]:
+                    raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+                if not login_host or login_host != target_host or login_host not in allowed_hosts:
+                    raise HTTPException(status_code=422, detail="Login URL must use the authorized target host")
+                if any(path == "/" or login_path == path or login_path.startswith(path + "/") for path in excluded_paths):
+                    raise HTTPException(status_code=422, detail="Login URL is inside an excluded path")
+                cursor.execute(
+                    """
+                    INSERT INTO credential_profiles
+                        (id, project_id, target_id, name, role_name, kind, login_url,
+                         username_selector, password_selector, submit_selector, encrypted_secret)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id, project_id, target_id, name, role_name, kind, login_url,
+                              username_selector, password_selector, submit_selector, created_at
+                    """,
+                    (
+                        profile_id, project_id, payload.target_id, payload.name.strip(),
+                        payload.role_name.strip(), payload.kind, login_url,
+                        payload.username_selector, payload.password_selector,
+                        payload.submit_selector, encrypted_secret,
+                    ),
+                )
+                row = cursor.fetchone()
+                record_audit(
+                    cursor, project_id, "credential_profile.created", payload.requested_by,
+                    "credential_profile", profile_id,
+                    {"target_id": str(payload.target_id), "name": payload.name.strip(), "role_name": payload.role_name.strip(), "kind": payload.kind},
+                )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="Credential profile name already exists in project") from exc
+    return credential_profile_response(row)
+
+
+@app.get("/projects/{project_id}/credential-profiles")
+def list_credential_profiles(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, project_id, target_id, name, role_name, kind, login_url,
+                       username_selector, password_selector, submit_selector, created_at
+                FROM credential_profiles WHERE project_id = %s ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {"profiles": [credential_profile_response(row) for row in rows]}
+
+
+@app.delete("/credential-profiles/{profile_id}")
+def delete_credential_profile(profile_id: UUID, payload: CredentialProfileDelete) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT project_id, name, role_name FROM credential_profiles WHERE id = %s FOR UPDATE",
+                (profile_id,),
+            )
+            profile = cursor.fetchone()
+            if profile is None:
+                raise HTTPException(status_code=404, detail="Credential profile not found")
+            cursor.execute("DELETE FROM credential_profiles WHERE id = %s", (profile_id,))
+            record_audit(
+                cursor, profile[0], "credential_profile.deleted", payload.requested_by,
+                "credential_profile", profile_id,
+                {"name": profile[1], "role_name": profile[2]},
+            )
+    return {"id": profile_id, "deleted": True}
 
 
 @app.post("/projects/{project_id}/runs", status_code=202)

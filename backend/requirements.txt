@@ -5,3 +5,4 @@ psycopg[binary]==3.3.6
 PyYAML==6.0.3
 docker==7.1.0
 python-multipart==0.0.22
+cryptography==50.0.2
