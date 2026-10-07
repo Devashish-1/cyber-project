@@ -42,6 +42,14 @@ GRYPE_CACHE_HOST_PATH = os.getenv(
     "GRYPE_CACHE_HOST_PATH",
     "/home/killswitch/security-platform/data/grype-cache",
 )
+CODEQL_CACHE_HOST_PATH = os.getenv(
+    "CODEQL_CACHE_HOST_PATH",
+    "/home/killswitch/security-platform/data/codeql-cache",
+)
+KUBESCAPE_POLICY_HOST_PATH = os.getenv(
+    "KUBESCAPE_POLICY_HOST_PATH",
+    "/home/killswitch/security-platform/config/kubescape/nsa.json",
+)
 SEMGREP_RULES_HOST_PATH = os.getenv(
     "SEMGREP_RULES_HOST_PATH",
     "/home/killswitch/security-platform/config/semgrep-reviewed.yaml",
@@ -53,6 +61,10 @@ NUCLEI_TEMPLATES_HOST_PATH = os.getenv(
 FFUF_WORDLIST_HOST_PATH = os.getenv(
     "FFUF_WORDLIST_HOST_PATH",
     "/home/killswitch/security-platform/config/wordlists/content-reviewed-small.txt",
+)
+DNSRECON_WORDLIST_HOST_PATH = os.getenv(
+    "DNSRECON_WORDLIST_HOST_PATH",
+    "/home/killswitch/security-platform/config/wordlists/dns-reviewed-small.txt",
 )
 FFUF_WORDLIST_RUNNER_PATH = Path(
     os.getenv("FFUF_WORDLIST_RUNNER_PATH", "/app/config/wordlists/content-reviewed-small.txt")
@@ -149,6 +161,8 @@ def build_command(
     excluded_paths: list[str] | None = None,
     dns_resolver: str | None = None,
 ) -> list[str]:
+    if tool_id == "codeql":
+        return ["-c", "exit 64"]
     if tool_id == "playwright":
         return ["/input/browser-observe.js", "/input/browser-config.json"]
     if tool_id == "dnsx":
@@ -284,6 +298,56 @@ def build_command(
             "--skip-download",
             "--download-external-modules", "false",
             "--soft-fail",
+        ]
+    if tool_id == "kubescape":
+        return [
+            "scan", "framework", "nsa", "/src",
+            "--use-from", "/policies/nsa.json",
+            "--format", "json",
+            "--scan-timeout", "90s",
+            "--control-timeout", "5s",
+        ]
+    if tool_id == "massdns":
+        return [
+            "-r", "/input/resolvers.txt",
+            "-t", "A",
+            "-o", "J",
+            "-q",
+            "-c", "1",
+            "-i", "1000",
+            "--processes", "1",
+            "--socket-count", "1",
+            "/input/hosts.txt",
+        ]
+    if tool_id == "dnsrecon":
+        if not dns_resolver:
+            raise ValueError("dnsrecon requires an explicitly approved DNS resolver")
+        if dns_resolver.startswith("["):
+            resolver_match = re.fullmatch(r"\[([^]]+)]:(\d{1,5})", dns_resolver)
+        else:
+            resolver_match = re.fullmatch(r"([^:]+):(\d{1,5})", dns_resolver)
+        if not resolver_match:
+            raise ValueError("dnsrecon resolver must be a canonical IP address with port")
+        resolver_ip, raw_port = resolver_match.groups()
+        try:
+            resolver_ip = str(ipaddress.ip_address(resolver_ip))
+        except ValueError as exc:
+            raise ValueError("dnsrecon resolver must be an IP address") from exc
+        if int(raw_port) != 53:
+            raise ValueError("dnsrecon supports approved DNS resolvers on port 53 only")
+        host = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+        return [
+            "-d", host,
+            "-n", resolver_ip,
+            "-t", "brt",
+            "-D", "/input/words.txt",
+            "--threads", "1",
+            "--lifetime", "2",
+            "--disable_check_recursion",
+            "--disable_check_bindversion",
+            "--disable_recurs",
+            "-j", "/output/raw.json",
+            "--loglevel", "ERROR",
         ]
     if tool_id == "hadolint":
         return [
@@ -1413,6 +1477,146 @@ def normalize_dnsx(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def write_massdns_output(raw_output: bytes, output_file: Path) -> None:
+    results = []
+    for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        host = str(item.get("name") or "").lower().rstrip(".")[:253]
+        if not host or str(item.get("type") or "").upper() != "A":
+            continue
+        addresses = []
+        ttls = []
+        for answer in ((item.get("data") or {}).get("answers") or [])[:32]:
+            if not isinstance(answer, dict):
+                continue
+            if str(answer.get("type") or "").upper() != "A":
+                continue
+            try:
+                addresses.append(str(ipaddress.ip_address(str(answer.get("data") or ""))))
+            except ValueError:
+                continue
+            try:
+                ttls.append(max(0, int(answer.get("ttl") or 0)))
+            except (TypeError, ValueError):
+                continue
+        results.append({
+            "host": host,
+            "record_type": "A",
+            "addresses": sorted(set(addresses)),
+            "status": str(item.get("status") or "")[:32],
+            "ttl": max(ttls or [0]),
+        })
+        if len(results) >= 10:
+            break
+    output_file.write_text(json.dumps({"results": results}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_massdns(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            host = str(finding.get("host") or "").lower().rstrip(".")[:253]
+            addresses = finding.get("addresses") or []
+            if not host or not isinstance(addresses, list):
+                continue
+            title = f"MassDNS A record observed: {host}"[:500]
+            details = {
+                "finding": title,
+                "record_type": "A",
+                "addresses": addresses[:32],
+                "status": finding.get("status"),
+                "ttl": finding.get("ttl"),
+                "resolver": "[OMITTED]",
+                "raw_response": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"massdns|{host}|A|{','.join(sorted(addresses))}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "dns-record", title, "info", host, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
+def write_dnsrecon_output(raw_file: Path, output_file: Path) -> None:
+    results = []
+    try:
+        report = json.loads(raw_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        report = []
+    if not isinstance(report, list):
+        report = []
+    for item in report[:256]:
+        if not isinstance(item, dict) or str(item.get("type") or "").upper() != "A":
+            continue
+        host = str(item.get("name") or "").lower().rstrip(".")[:253]
+        try:
+            address = str(ipaddress.ip_address(str(item.get("address") or "")))
+        except ValueError:
+            continue
+        if not host or ":" in address:
+            continue
+        results.append({"host": host, "record_type": "A", "addresses": [address]})
+        if len(results) >= 100:
+            break
+    output_file.write_text(json.dumps({"results": results}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_dnsrecon(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            host = str(finding.get("host") or "").lower().rstrip(".")[:253]
+            addresses = finding.get("addresses") or []
+            if not host or not isinstance(addresses, list):
+                continue
+            addresses = sorted({str(ipaddress.ip_address(value)) for value in addresses})[:32]
+            if not addresses:
+                continue
+            title = f"DNSRecon A record observed: {host}"[:500]
+            details = {
+                "finding": title,
+                "record_type": "A",
+                "addresses": addresses,
+                "resolver": "[OMITTED]",
+                "raw_response": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"dnsrecon|{host}|A|{','.join(addresses)}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "dns-record", title, "info", host, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
 def write_playwright_output(raw_output: bytes, output_file: Path) -> None:
     result = None
     for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
@@ -1481,6 +1685,150 @@ def normalize_playwright(run_id: UUID, output_file: Path) -> int:
                 record,
             )
     return 1
+
+
+def codeql_languages(source_root: Path) -> list[str]:
+    ignored = {".git", ".venv", "venv", "node_modules", "vendor", "dist", "build"}
+    python_count = 0
+    javascript_count = 0
+    for path in source_root.rglob("*"):
+        if not path.is_file() or any(part in ignored for part in path.parts):
+            continue
+        suffix = path.suffix.lower()
+        if suffix == ".py":
+            python_count += 1
+        elif suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+            javascript_count += 1
+    languages = []
+    if python_count:
+        languages.append("python")
+    if javascript_count:
+        languages.append("javascript")
+    if not languages:
+        raise ValueError("CodeQL currently requires authorized Python or JavaScript/TypeScript source")
+    return languages
+
+
+def build_codeql_command(languages: list[str]) -> list[str]:
+    suites = {
+        "python": "/opt/codeql-repo/python/ql/src/codeql-suites/python-security-and-quality.qls",
+        "javascript": "/opt/codeql-repo/javascript/ql/src/codeql-suites/javascript-security-and-quality.qls",
+    }
+    commands = ["set -eu"]
+    for language in languages:
+        database = f"/tmp/db-{language}"
+        report = f"/tmp/{language}.sarif"
+        commands.append(
+            f"codeql database create {database} --language={language} --build-mode=none "
+            "--source-root=/src --threads=1 --overwrite"
+        )
+        commands.append(
+            f"codeql database analyze {database} {suites[language]} "
+            f"--format=sarif-latest --output={report} --threads=1 --ram=3072 "
+            "--no-sarif-add-file-contents --no-sarif-add-snippets "
+            "--sarif-include-query-help=never"
+        )
+        commands.append(f"cat {report}")
+    return ["-c", "; ".join(commands)]
+
+
+def write_codeql_output(raw_output: bytes, output_file: Path) -> None:
+    text = raw_output.decode("utf-8", errors="replace")
+    decoder = json.JSONDecoder()
+    position = 0
+    findings = []
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            break
+        try:
+            report, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            break
+        for sarif_run in report.get("runs") or []:
+            rules = {}
+            driver = ((sarif_run.get("tool") or {}).get("driver") or {})
+            for rule in driver.get("rules") or []:
+                rule_id = str(rule.get("id") or "")[:200]
+                if rule_id:
+                    rules[rule_id] = rule
+            for result in sarif_run.get("results") or []:
+                if len(findings) >= 2000:
+                    break
+                rule_id = str(result.get("ruleId") or "")[:200]
+                location = ((result.get("locations") or [{}])[0].get("physicalLocation") or {})
+                artifact = location.get("artifactLocation") or {}
+                raw_uri = str(artifact.get("uri") or "")
+                parsed_uri = urlsplit(raw_uri)
+                path = parsed_uri.path if parsed_uri.scheme == "file" else raw_uri
+                path = path.replace("\\", "/")
+                if path.startswith("/src/"):
+                    path = path[5:]
+                path = path.lstrip("/")[:1000]
+                region = location.get("region") or {}
+                line = max(int(region.get("startLine") or 1), 1)
+                message = str((result.get("message") or {}).get("text") or "CodeQL finding")[:1000]
+                rule = rules.get(rule_id) or {}
+                properties = rule.get("properties") or {}
+                try:
+                    score = float(properties.get("security-severity") or 0)
+                except (TypeError, ValueError):
+                    score = 0
+                severity = "critical" if score >= 9 else "high" if score >= 7 else "medium" if score >= 4 else "low"
+                findings.append({
+                    "rule_id": rule_id,
+                    "message": message,
+                    "severity": severity,
+                    "security_score": score,
+                    "path": path,
+                    "line": line,
+                    "tags": [str(tag)[:200] for tag in (properties.get("tags") or [])[:20]],
+                })
+    output_file.write_text(json.dumps({"results": findings}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_codeql(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            rule_id = str(finding.get("rule_id") or "codeql")[:200]
+            path = str(finding.get("path") or "unknown")[:1000]
+            line = max(int(finding.get("line") or 1), 1)
+            severity = str(finding.get("severity") or "low")
+            if severity not in {"low", "medium", "high", "critical"}:
+                severity = "low"
+            title = f"CodeQL {rule_id}"[:500]
+            asset = f"{path}:{line}"[:2000]
+            details = {
+                "finding": str(finding.get("message") or title)[:1000],
+                "rule_id": rule_id,
+                "path": path,
+                "line": line,
+                "security_score": finding.get("security_score"),
+                "tags": finding.get("tags") or [],
+                "source_snippet": "[OMITTED]",
+                "code_flow": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"codeql|{rule_id}|{path}|{line}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "codeql-finding", title, severity, asset, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
 
 
 def write_kiterunner_output(raw_output: bytes, output_file: Path) -> None:
@@ -2281,6 +2629,84 @@ def normalize_bandit(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
+def write_kubescape_output(raw_output: bytes, output_file: Path) -> None:
+    findings = []
+    try:
+        report = json.loads(raw_output.decode("utf-8", errors="replace"))
+        seen = set()
+        for resource in report.get("results") or []:
+            resource_id = str(resource.get("resourceID") or "kubernetes-resource")[:1000]
+            for control in resource.get("controls") or []:
+                status = str((control.get("status") or {}).get("status") or "").lower()
+                if status != "failed":
+                    continue
+                control_id = str(control.get("controlID") or "kubescape")[:100]
+                key = (control_id, resource_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                severity = str(control.get("severity") or "medium").lower()
+                if severity not in {"low", "medium", "high", "critical"}:
+                    severity = "medium"
+                findings.append({
+                    "control_id": control_id,
+                    "name": str(control.get("name") or "Kubernetes control failed")[:500],
+                    "severity": severity,
+                    "resource": resource_id,
+                    "failed_rules": [
+                        str(rule.get("name") or "")[:200]
+                        for rule in (control.get("rules") or [])
+                        if str((rule.get("status") or "")).lower() == "failed"
+                    ][:20],
+                })
+                if len(findings) >= 2000:
+                    break
+            if len(findings) >= 2000:
+                break
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        findings = []
+    output_file.write_text(json.dumps({"results": findings}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def normalize_kubescape(run_id: UUID, output_file: Path) -> int:
+    records = []
+    try:
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        for finding in report.get("results") or []:
+            control_id = str(finding.get("control_id") or "kubescape")[:100]
+            resource = str(finding.get("resource") or "kubernetes-resource")[:1000]
+            severity = str(finding.get("severity") or "medium")
+            if severity not in {"low", "medium", "high", "critical"}:
+                severity = "medium"
+            title = f"{control_id}: {str(finding.get('name') or 'Kubernetes control failed')[:380]}"[:500]
+            details = {
+                "finding": title,
+                "control_id": control_id,
+                "resource": resource,
+                "failed_rules": finding.get("failed_rules") or [],
+                "resource_manifest": "[OMITTED]",
+                "fix_paths": "[OMITTED]",
+            }
+            fingerprint = hashlib.sha256(f"kubescape|{control_id}|{resource}".encode()).hexdigest()
+            records.append((uuid4(), run_id, "kubernetes-misconfiguration", title, severity, resource, json.dumps(details), fingerprint))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not records:
+        return 0
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO observations
+                (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (run_id,fingerprint) DO UPDATE SET
+                title=EXCLUDED.title,severity=EXCLUDED.severity,
+                asset=EXCLUDED.asset,details=EXCLUDED.details""",
+                records,
+            )
+    return len(records)
+
+
 def normalize_checkov(run_id: UUID, output_file: Path) -> int:
     severity_map = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
     records = []
@@ -3040,6 +3466,49 @@ def prepare_dnsx_input(run: dict, run_dir: Path) -> Path:
     return input_file
 
 
+def prepare_massdns_input(run: dict, run_dir: Path) -> tuple[Path, Path]:
+    if not run.get("dns_resolver"):
+        raise ValueError("massdns requires an explicitly approved DNS resolver")
+    host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("massdns target must contain a hostname")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("massdns requires a DNS hostname, not an IP literal")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+        raise ValueError("massdns target hostname is invalid")
+    hosts_file = run_dir / "massdns-hosts.txt"
+    resolver_file = run_dir / "massdns-resolvers.txt"
+    hosts_file.write_text(host + "\n", encoding="utf-8")
+    resolver_file.write_text(str(run["dns_resolver"]) + "\n", encoding="utf-8")
+    hosts_file.chmod(0o644)
+    resolver_file.chmod(0o644)
+    return hosts_file, resolver_file
+
+
+def prepare_dnsrecon_input(run: dict, run_dir: Path) -> Path:
+    if not run.get("dns_resolver"):
+        raise ValueError("dnsrecon requires an explicitly approved DNS resolver")
+    host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("dnsrecon target must contain a hostname")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("dnsrecon requires a DNS hostname, not an IP literal")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+        raise ValueError("dnsrecon target hostname is invalid")
+    raw_file = run_dir / "dnsrecon-raw.json"
+    raw_file.write_text("[]\n", encoding="utf-8")
+    raw_file.chmod(0o600)
+    return raw_file
+
+
 def prepare_playwright_input(run: dict, run_dir: Path) -> tuple[Path, Path]:
     target = urlsplit(run["base_url"])
     target_host = (target.hostname or "").lower().rstrip(".")
@@ -3244,6 +3713,10 @@ def execute_run(run_id: UUID) -> None:
             schemathesis_schema_file = prepare_schemathesis_schema(run, run_dir)
         if run["tool_id"] == "dnsx":
             prepare_dnsx_input(run, run_dir)
+        if run["tool_id"] == "massdns":
+            prepare_massdns_input(run, run_dir)
+        if run["tool_id"] == "dnsrecon":
+            prepare_dnsrecon_input(run, run_dir)
         if run["tool_id"] == "playwright":
             prepare_playwright_input(run, run_dir)
         if run["tool_id"] == "kiterunner":
@@ -3251,6 +3724,8 @@ def execute_run(run_id: UUID) -> None:
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"], run["dns_resolver"]
         )
+        if run["tool_id"] == "codeql":
+            command = build_codeql_command(codeql_languages(source_container_path))
         if run["tool_id"] == "shellcheck":
             shell_files = sorted(
                 f"/src/{path.relative_to(source_container_path).as_posix()}"
@@ -3269,6 +3744,10 @@ def execute_run(run_id: UUID) -> None:
                 container_volumes[OSV_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
             if run["tool_id"] == "grype":
                 container_volumes[GRYPE_CACHE_HOST_PATH] = {"bind": "/cache", "mode": "ro"}
+            if run["tool_id"] == "codeql":
+                container_volumes[CODEQL_CACHE_HOST_PATH] = {"bind": "/tmp/.codeql", "mode": "rw"}
+            if run["tool_id"] == "kubescape":
+                container_volumes[KUBESCAPE_POLICY_HOST_PATH] = {"bind": "/policies/nsa.json", "mode": "ro"}
         elif run["tool_id"] == "nuclei-reviewed":
             container_volumes[NUCLEI_TEMPLATES_HOST_PATH] = {"bind": "/templates", "mode": "ro"}
         elif run["tool_id"] == "schemathesis":
@@ -3277,6 +3756,20 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsx-hosts.txt")] = {
                 "bind": "/input/hosts.txt",
                 "mode": "ro",
+            }
+        elif run["tool_id"] == "massdns":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "massdns-hosts.txt")] = {
+                "bind": "/input/hosts.txt", "mode": "ro",
+            }
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "massdns-resolvers.txt")] = {
+                "bind": "/input/resolvers.txt", "mode": "ro",
+            }
+        elif run["tool_id"] == "dnsrecon":
+            container_volumes[DNSRECON_WORDLIST_HOST_PATH] = {
+                "bind": "/input/words.txt", "mode": "ro",
+            }
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "dnsrecon-raw.json")] = {
+                "bind": "/output/raw.json", "mode": "rw",
             }
         elif run["tool_id"] == "playwright":
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "browser-observe.js")] = {
@@ -3319,10 +3812,12 @@ def execute_run(run_id: UUID) -> None:
             network_mode="none" if input_type == "source" else "bridge",
             user=adapter.get("user"),
             environment=(
+                {"HOME": "/tmp", "CODEQL_SEARCH_PATH": "/opt/codeql-repo"}
+                if run["tool_id"] == "codeql" else
                 {"HOME": "/tmp", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
                 if run["tool_id"] == "playwright" else
                 {"HOME": "/tmp"}
-                if run["tool_id"] == "dnsx" else
+                if run["tool_id"] in {"dnsrecon", "dnsx", "massdns"} else
                 {
                     "HOME": "/tmp/semgrep-home",
                     "XDG_CACHE_HOME": "/tmp/semgrep-cache",
@@ -3333,6 +3828,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "bandit" else
                 {"HOME": "/tmp/checkov-home", "USER": "scanner"}
                 if run["tool_id"] == "checkov" else
+                {"HOME": "/tmp"}
+                if run["tool_id"] == "kubescape" else
                 {"HOME": "/tmp"}
                 if run["tool_id"] == "trufflehog" else
                 {"HOME": "/tmp", "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": "/cache"}
@@ -3349,15 +3846,18 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "trivy" else None
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
-            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node"}.get(run["tool_id"]),
+            entrypoint={"zap-passive": "zap-baseline.py", "zap-baseline": "zap-baseline.py", "zap-full": "zap-full-scan.py", "trivy": "/bin/sh", "hadolint": "/bin/sh", "kics": "/bin/sh", "dalfox": "./dalfox", "playwright": "node", "codeql": "/bin/sh"}.get(run["tool_id"]),
             # testssl and ZAP reports must survive process exit long enough for docker cp.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
                 None if run["tool_id"] in {"schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
                 else {
                     "/tmp": (
+                        "rw,nosuid,nodev,size=2g"
+                        if run["tool_id"] == "codeql"
+                        else
                         "rw,nosuid,nodev,noexec,size=128m"
-                        if run["tool_id"] == "kics"
+                        if run["tool_id"] in {"kics", "kubescape"}
                         else "rw,nosuid,nodev,noexec,size=64m"
                     ),
                     **(
@@ -3493,6 +3993,41 @@ def execute_run(run_id: UUID) -> None:
                     json.dumps({"results": [], "error": "dnsx execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
+        elif run["tool_id"] == "massdns":
+            (run_dir / "tool.log").write_text(
+                "MassDNS raw resolver and packet output omitted; A records normalized.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0:
+                write_massdns_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "MassDNS execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+        elif run["tool_id"] == "dnsrecon":
+            raw_file = run_dir / "dnsrecon-raw.json"
+            if exit_code == 0:
+                (run_dir / "tool.log").write_text(
+                    "DNSRecon raw resolver output and invocation metadata omitted; A records normalized.\n",
+                    encoding="utf-8",
+                )
+                write_dnsrecon_output(raw_file, output_file)
+            else:
+                diagnostic = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")[-4096:]
+                host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+                for sensitive in (str(run.get("dns_resolver") or ""), host, "/input/words.txt", "/output/raw.json"):
+                    if sensitive:
+                        diagnostic = diagnostic.replace(sensitive, "[OMITTED]")
+                (run_dir / "tool.log").write_text(
+                    diagnostic or "DNSRecon execution failed; diagnostic output unavailable.\n",
+                    encoding="utf-8",
+                )
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "DNSRecon execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+            raw_file.unlink(missing_ok=True)
         elif run["tool_id"] == "playwright":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -3500,6 +4035,18 @@ def execute_run(run_id: UUID) -> None:
             else:
                 output_file.write_text(
                     json.dumps({"kind": "browser-observation", "error": "Playwright execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
+        elif run["tool_id"] == "codeql":
+            (run_dir / "tool.log").write_text(
+                "CodeQL raw build and query logs omitted; normalized SARIF retained.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0:
+                write_codeql_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "CodeQL execution failed; raw output omitted"}) + "\n",
                     encoding="utf-8",
                 )
         elif run["tool_id"] == "kiterunner":
@@ -3553,6 +4100,18 @@ def execute_run(run_id: UUID) -> None:
                 write_checkov_output(container.logs(stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "kubescape":
+            (run_dir / "tool.log").write_text(
+                "Kubescape raw report omitted; failed controls normalized without manifests or fix paths.\n",
+                encoding="utf-8",
+            )
+            if exit_code == 0:
+                write_kubescape_output(container.logs(stdout=True, stderr=False), output_file)
+            else:
+                output_file.write_text(
+                    json.dumps({"results": [], "error": "Kubescape execution failed; raw output omitted"}) + "\n",
+                    encoding="utf-8",
+                )
         elif run["tool_id"] == "bandit":
             (run_dir / "tool.log").write_bytes(container.logs(stdout=False, stderr=True))
             if exit_code == 0:
@@ -3595,7 +4154,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "dalfox": normalize_dalfox, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             set_status(run_id, "succeeded")
             append_event(event_file, {"event": "normalized", "observations": observation_count, "time": time.time()})
@@ -3614,6 +4173,22 @@ def execute_run(run_id: UUID) -> None:
                 pass
         if run["tool_id"] == "playwright":
             for temporary_name in ("browser-observe.js", "browser-config.json"):
+                try:
+                    (run_dir / temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if run["tool_id"] == "dnsrecon":
+            try:
+                (run_dir / "dnsrecon-raw.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+        if run["tool_id"] == "dnsx":
+            try:
+                (run_dir / "dnsx-hosts.txt").unlink(missing_ok=True)
+            except OSError:
+                pass
+        if run["tool_id"] == "massdns":
+            for temporary_name in ("massdns-hosts.txt", "massdns-resolvers.txt"):
                 try:
                     (run_dir / temporary_name).unlink(missing_ok=True)
                 except OSError:

@@ -76,6 +76,8 @@ services:
       EVIDENCE_ROOT: /evidence/runs
       SOURCE_ROOT: /sources
       SOURCE_HOST_ROOT: /home/killswitch/security-platform/data/sources
+      CODEQL_CACHE_HOST_PATH: /home/killswitch/security-platform/data/codeql-cache
+      KUBESCAPE_POLICY_HOST_PATH: /home/killswitch/security-platform/config/kubescape/nsa.json
     volumes:
       - ./config:/app/config:ro
       - ./evidence:/evidence

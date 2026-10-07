@@ -167,6 +167,20 @@ adapters:
     controls: [read-only-source, network-disabled, single-worker, max-file-2mb, query-timeout-20s, secrets-scan-disabled, experimental-queries-disabled, raw-values-omitted, pinned-image]
     state: verified-image
 
+  kubescape:
+    version: 4.0.15
+    image: quay.io/kubescape/kubescape-cli@sha256:16f1383351936d4085f9eec4a01a08abe34e531629d2e849d3893aaed2c74052
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 120
+    user: "1000:1000"
+    resources: {cpus: 1.0, memory: 768m, pids: 128}
+    output: sanitized-json
+    capabilities: [kubernetes-manifest-analysis, nsa-framework, workload-misconfiguration]
+    controls: [read-only-source, network-disabled, no-cluster-or-kubeconfig-access, checksum-pinned-offline-nsa-policy, explicit-nsa-framework, submission-disabled, scan-timeout-90s, per-control-timeout-5s, raw-manifests-omitted, fix-paths-omitted, secrets-hidden, result-limit-2000, non-root-read-only-container, pinned-image]
+    state: verified-image
+
   dalfox:
     version: 3.2.3
     image: ghcr.io/hahwul/dalfox@sha256:0c052d4cd8115281e888ad11d214b34e9ccb222009805c7b77567c2b50d9e1ac
@@ -243,7 +257,7 @@ adapters:
     profile: extended-active
     approval: explicit-run-and-scope-required
     timeout_seconds: 180
-    user: scanner
+    user: "1000:1000"
     resources: {cpus: 0.5, memory: 512m, pids: 96}
     output: json
     capabilities: [get-parameter-discovery]
@@ -252,7 +266,7 @@ adapters:
 
   ffuf:
     version: 2.3.0
-    image: security-platform/ffuf:2.3.0
+    image: security-platform/ffuf@sha256:66a8489b296ff2b4f9b0dc24d8a9d8d8bbf02df426d825de35331717c0d4b52b
     profile: extended-active
     approval: explicit-run-and-scope-required
     timeout_seconds: 150
@@ -288,6 +302,34 @@ adapters:
     controls: [single-authorized-host, hostname-only-no-ip-literals, explicit-approved-ip-resolver-required, no-public-resolver-fallback, a-record-only, one-thread, rate-limit-2-rps, one-retry, pdcp-auth-disabled, update-check-disabled, raw-dns-omitted, tool-output-resolver-omitted, approved-resolver-recorded-in-audit-metadata, non-root-read-only-container, pinned-image]
     state: verified-image
 
+  massdns:
+    version: 1.1.0
+    image: security-platform/massdns@sha256:eb7eb3d01ae8bed498f430985de03784798ca64fbaf5bebd03ae43882870d834
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 30
+    user: "1000:1000"
+    resources: {cpus: 0.25, memory: 128m, pids: 32}
+    output: sanitized-json
+    capabilities: [single-host-a-record-resolution, independent-dns-cross-check]
+    controls: [single-authorized-host, hostname-only-no-ip-literals, explicit-approved-ip-resolver-required, no-public-resolver-fallback, a-record-only, one-process, one-socket, one-resolve-attempt, interval-1000ms, quiet-mode, enumeration-disabled, raw-dns-omitted, tool-output-resolver-omitted, approved-resolver-recorded-in-audit-metadata, non-root-read-only-container, pinned-image]
+    state: verified-local-image
+
+  dnsrecon:
+    version: 1.6.3
+    image: security-platform/dnsrecon@sha256:69486a6e1c039f9560ce0f7d7bf9ded8ca2dc2b084f62a041ec8ac93e7f40dcf
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 60
+    user: "1000:1000"
+    resources: {cpus: 0.5, memory: 256m, pids: 64}
+    output: sanitized-json
+    capabilities: [bounded-reviewed-subdomain-resolution, dns-a-record-observation]
+    controls: [single-authorized-domain, hostname-only-no-ip-literals, explicit-approved-ip-resolver-required, approved-resolver-port-53-only, no-public-resolver-fallback, reviewed-wordlist-20-entries, brute-mode-only, a-record-output-only, one-thread, lifetime-2s, recursion-check-disabled, bind-version-check-disabled, recursion-desired-disabled, external-search-providers-disabled, zone-transfer-disabled, reverse-lookup-disabled, raw-dns-and-invocation-omitted, raw-file-deleted-after-normalization, non-root-read-only-container, pinned-image]
+    state: verified-local-image
+
   playwright:
     version: 1.63.0
     image: security-platform/playwright@sha256:7d6a323f9a3eb0a46b87402846e684fb2fedeff92660dea555fcba7cd6cccf06
@@ -300,6 +342,20 @@ adapters:
     output: sanitized-json
     capabilities: [javascript-rendered-page-observation, browser-console-health, same-origin-resource-observation]
     controls: [single-approved-navigation, same-host-only-request-routing, cross-host-requests-blocked, excluded-paths-blocked-before-and-during-run, downloads-disabled, service-workers-blocked, navigation-timeout-15s, post-load-wait-500ms, no-user-supplied-scripts, no-authentication-material, request-and-response-content-omitted, cookies-omitted, target-query-omitted-from-metadata, ephemeral-browser-inputs-removed, non-root-read-only-container, pinned-image]
+    state: verified-local-image
+
+  codeql:
+    version: 2.27.1
+    image: security-platform/codeql@sha256:29c29ac8a5a93a34cb6302571e23c577b22071a74d575e6e181ef46f0bc3cdc4
+    input: source
+    profile: source-assisted
+    approval: explicit-source-authorization-required
+    timeout_seconds: 3600
+    user: "1000:1000"
+    resources: {cpus: 2.0, memory: 4g, pids: 256}
+    output: sanitized-sarif-json
+    capabilities: [python-security-and-quality, javascript-typescript-security-and-quality, multi-language-source-analysis]
+    controls: [read-only-source, network-disabled, interpreted-languages-only, official-security-and-quality-suites, one-thread, ram-limit-3072m, source-file-contents-disabled, source-snippets-disabled, query-help-disabled, result-limit-2000, raw-logs-omitted, ephemeral-analysis-database, persistent-official-query-compile-cache, serialized-runner-access, non-root-read-only-container, pinned-image]
     state: verified-local-image
 
   gobuster:
@@ -406,7 +462,7 @@ adapters:
 
   wapiti:
     version: 3.3.2
-    image: security-platform/wapiti:3.3.2
+    image: security-platform/wapiti@sha256:2717a85f854030ea75ab08f910384f8e246424b443f9e35c8735968bd47f979b
     profile: extended-active
     approval: explicit-run-and-scope-required
     timeout_seconds: 180
@@ -444,7 +500,7 @@ adapters:
 
   zap-passive:
     version: 2.17.0
-    image: security-platform/zap-runner:2.17.0
+    image: security-platform/zap-runner@sha256:334bd671a05b916dff69f533b1f0a3eb32dcf7c6cdb4fdd12795460e540da3e3
     profile: observe
     approval: scope-required
     timeout_seconds: 600
@@ -456,7 +512,7 @@ adapters:
 
   zap-baseline:
     version: 2.17.0
-    image: security-platform/zap-runner:2.17.0
+    image: security-platform/zap-runner@sha256:334bd671a05b916dff69f533b1f0a3eb32dcf7c6cdb4fdd12795460e540da3e3
     profile: observe
     approval: scope-required
     timeout_seconds: 1200
@@ -467,7 +523,7 @@ adapters:
 
   zap-full:
     version: 2.17.0
-    image: security-platform/zap-runner:2.17.0
+    image: security-platform/zap-runner@sha256:334bd671a05b916dff69f533b1f0a3eb32dcf7c6cdb4fdd12795460e540da3e3
     profile: extended-active
     approval: explicit-run-and-scope-required
     timeout_seconds: 1200
