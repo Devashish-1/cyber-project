@@ -268,7 +268,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.89.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.90.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -306,6 +306,10 @@ class TargetCreate(BaseModel):
         if start is not None and start == end:
             raise ValueError("Testing window start and end must differ")
         return self
+
+
+class TargetUpdate(TargetCreate):
+    requested_by: str = Field(min_length=2, max_length=120)
 
 
 def testing_window_allows(
@@ -446,6 +450,28 @@ def normalize_dns_resolver(value: str | None) -> str | None:
         raise HTTPException(status_code=422, detail="DNS resolver port must be between 1 and 65535")
     formatted = f"[{address}]" if address.version == 6 else str(address)
     return f"{formatted}:{port}"
+
+
+def normalize_target_policy(payload: TargetCreate) -> tuple[str, set[str], str | None]:
+    base_host = (payload.base_url.host or "").lower().rstrip(".")
+    allowed_hosts = {
+        str(host).strip().lower().rstrip(".") for host in payload.allowed_hosts
+        if str(host).strip()
+    }
+    if not base_host or base_host not in allowed_hosts:
+        raise HTTPException(status_code=422, detail="Base URL host must be present in allowed_hosts")
+    return base_host, allowed_hosts, normalize_dns_resolver(payload.dns_resolver)
+
+
+def target_path_is_excluded(path: str, excluded_paths: list[str]) -> bool:
+    normalized_path = "/" + str(path or "/").lstrip("/")
+    normalized_path = normalized_path.rstrip("/") or "/"
+    for excluded_path in excluded_paths:
+        blocked = "/" + str(excluded_path).lstrip("/")
+        blocked = blocked.rstrip("/") or "/"
+        if blocked == "/" or normalized_path == blocked or normalized_path.startswith(blocked + "/"):
+            return True
+    return False
 
 
 def validate_workflow_tool_ids(tool_ids: list[str]) -> dict:
@@ -1227,11 +1253,7 @@ def list_source_artifacts(project_id: UUID) -> dict:
 def create_target(project_id: UUID, payload: TargetCreate) -> dict:
     if not payload.authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit target authorization confirmation is required")
-    base_host = (payload.base_url.host or "").lower().rstrip(".")
-    normalized_allowed_hosts = {host.lower().rstrip(".") for host in payload.allowed_hosts}
-    if not base_host or base_host not in normalized_allowed_hosts:
-        raise HTTPException(status_code=422, detail="Base URL host must be present in allowed_hosts")
-    dns_resolver = normalize_dns_resolver(payload.dns_resolver)
+    _, _, dns_resolver = normalize_target_policy(payload)
 
     target_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
@@ -1308,6 +1330,120 @@ def list_targets(project_id: UUID) -> dict:
             }
             for row in rows
         ]
+    }
+
+
+@app.put("/projects/{project_id}/targets/{target_id}")
+def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> dict:
+    if not payload.authorization_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit target authorization confirmation is required")
+    base_host, allowed_hosts, dns_resolver = normalize_target_policy(payload)
+    updated_base_url = str(payload.base_url)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
+                       max_run_seconds, testing_window_start_minute_utc,
+                       testing_window_end_minute_utc, authorization_reference
+                FROM targets
+                WHERE id = %s AND project_id = %s
+                FOR UPDATE
+                """,
+                (target_id, project_id),
+            )
+            previous = cursor.fetchone()
+            if previous is None:
+                raise HTTPException(status_code=404, detail="Target not found in project")
+            if updated_base_url != previous[0]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Target base URL is immutable; create a new target for a different base URL",
+                )
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM runs
+                WHERE target_id = %s
+                  AND status IN ('queued', 'running', 'cancelling')
+                """,
+                (target_id,),
+            )
+            if cursor.fetchone()[0]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Target policy cannot change while it has active or queued runs",
+                )
+            cursor.execute(
+                "SELECT name, login_url FROM credential_profiles WHERE target_id = %s",
+                (target_id,),
+            )
+            for profile_name, login_url in cursor.fetchall():
+                parsed_login = urlsplit(login_url)
+                login_host = (parsed_login.hostname or "").lower().rstrip(".")
+                if (
+                    login_host != base_host
+                    or login_host not in allowed_hosts
+                    or target_path_is_excluded(parsed_login.path or "/", payload.excluded_paths)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Updated scope would invalidate stored credential profile: {profile_name}",
+                    )
+            cursor.execute(
+                """
+                UPDATE targets
+                SET allowed_hosts = %s::jsonb,
+                    excluded_paths = %s::jsonb,
+                    dns_resolver = %s,
+                    max_run_seconds = %s,
+                    testing_window_start_minute_utc = %s,
+                    testing_window_end_minute_utc = %s,
+                    authorization_reference = %s,
+                    authorization_confirmed = TRUE
+                WHERE id = %s AND project_id = %s
+                """,
+                (
+                    Jsonb(payload.allowed_hosts),
+                    Jsonb(payload.excluded_paths),
+                    dns_resolver,
+                    payload.max_run_seconds,
+                    payload.testing_window_start_minute_utc,
+                    payload.testing_window_end_minute_utc,
+                    payload.authorization_reference,
+                    target_id,
+                    project_id,
+                ),
+            )
+            record_audit(
+                cursor, project_id, "target.policy_updated", payload.requested_by,
+                "target", target_id,
+                {
+                    "previous": {
+                        "allowed_hosts": previous[1],
+                        "excluded_paths": previous[2],
+                        "dns_resolver": previous[3],
+                        "max_run_seconds": previous[4],
+                        "testing_window_start_minute_utc": previous[5],
+                        "testing_window_end_minute_utc": previous[6],
+                        "authorization_reference": previous[7],
+                    },
+                    "current": {
+                        "allowed_hosts": payload.allowed_hosts,
+                        "excluded_paths": payload.excluded_paths,
+                        "dns_resolver": dns_resolver,
+                        "max_run_seconds": payload.max_run_seconds,
+                        "testing_window_start_minute_utc": payload.testing_window_start_minute_utc,
+                        "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
+                        "authorization_reference": payload.authorization_reference,
+                    },
+                },
+            )
+    return {
+        "id": target_id,
+        "project_id": project_id,
+        **payload.model_dump(mode="json", exclude={"dns_resolver", "requested_by"}),
+        "dns_resolver": dns_resolver,
+        "updated_by": payload.requested_by,
     }
 
 
