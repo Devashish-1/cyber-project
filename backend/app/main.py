@@ -247,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.83.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.84.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -462,6 +462,36 @@ def sanitize_evidence(value):
     if isinstance(value, list):
         return [sanitize_evidence(item) for item in value]
     return value
+
+
+def sarif_review_metadata(finding: dict) -> tuple[dict, dict]:
+    status = str(finding.get("review_status") or "new")
+    notes = str(finding.get("review_notes") or "")
+    reviewed_by = finding.get("reviewed_by")
+    reviewed_at = finding.get("reviewed_at")
+    properties = {
+        "reviewStatus": status,
+        "reviewNotes": notes,
+        "reviewedBy": str(reviewed_by or ""),
+        "reviewedAt": str(reviewed_at or ""),
+    }
+    lifecycle: dict = {}
+    if status == "new":
+        lifecycle["baselineState"] = "new"
+    elif status == "confirmed":
+        lifecycle["baselineState"] = "unchanged"
+    elif status == "resolved":
+        lifecycle["baselineState"] = "absent"
+    elif status in {"false_positive", "accepted_risk"}:
+        justification = notes or (
+            "Reviewer marked this finding as a false positive."
+            if status == "false_positive"
+            else "Reviewer accepted the documented risk."
+        )
+        lifecycle["suppressions"] = [
+            {"kind": "external", "status": "accepted", "justification": justification}
+        ]
+    return properties, lifecycle
 
 
 def storage_admission(*, enforce: bool = False) -> dict:
@@ -1980,6 +2010,7 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
         "info": "note",
     }
     for finding in reported:
+        review_properties, review_lifecycle = sarif_review_metadata(finding)
         raw_rule_id = f"security-platform/{finding['tool_id']}/{finding['type']}"
         rule_id = re.sub(r"[^A-Za-z0-9._/-]+", "-", raw_rule_id).strip("-")
         rules.setdefault(
@@ -2011,14 +2042,15 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
                 },
                 "properties": {
                     "severity": str(finding["severity"]),
-                    "reviewStatus": str(finding["review_status"]),
                     "occurrenceCount": int(finding["occurrence_count"]),
                     "toolId": str(finding["tool_id"]),
                     "runId": str(finding["run_id"]),
                     "firstSeen": str(finding["first_seen"]),
                     "lastSeen": str(finding["last_seen"]),
                     "details": finding["details"],
+                    **review_properties,
                 },
+                **review_lifecycle,
             }
         )
 
@@ -2030,7 +2062,7 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
                 "tool": {
                     "driver": {
                         "name": "Security Testing Platform",
-                        "semanticVersion": "0.81.0",
+                        "semanticVersion": app.version,
                         "informationUri": "https://owasp.org/www-project-web-security-testing-guide/",
                         "rules": list(rules.values()),
                     }
@@ -2120,6 +2152,10 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         severity: sum(1 for item in findings if item["severity"] == severity)
         for severity in ("critical", "high", "medium", "low", "info")
     }
+    review_counts = {
+        status: sum(1 for item in findings if item["review_status"] == status)
+        for status in ("new", "confirmed", "false_positive", "accepted_risk", "resolved")
+    }
 
     def md(value: object) -> str:
         return (
@@ -2175,6 +2211,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Run outcomes: {md(', '.join(f'{status}={count}' for status, count in status_counts) or 'None')}",
         f"- Unique observations: {len(findings)}",
         f"- Severity totals: critical={severity_counts['critical']}, high={severity_counts['high']}, medium={severity_counts['medium']}, low={severity_counts['low']}, info={severity_counts['info']}",
+        f"- Review totals: new={review_counts['new']}, confirmed={review_counts['confirmed']}, false_positive={review_counts['false_positive']}, accepted_risk={review_counts['accepted_risk']}, resolved={review_counts['resolved']}",
         f"- Evidence sealed: {sealed_runs} of {completed_runs} completed runs",
         "",
         "### Run coverage matrix",
@@ -2217,6 +2254,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 f"- First seen: {item['first_seen'].isoformat()}",
                 f"- Last seen: {item['last_seen'].isoformat()}",
                 f"- Review notes: {md(item['review_notes']) or 'None'}",
+                f"- Reviewed by: {md(item['reviewed_by']) or 'Not reviewed'}",
+                f"- Reviewed at: {item['reviewed_at'].isoformat() if item['reviewed_at'] else 'Not reviewed'}",
                 f"- Sanitized details: `{md(details)}`",
                 "",
             ])
