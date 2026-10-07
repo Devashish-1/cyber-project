@@ -340,8 +340,8 @@ adapters:
     user: pwuser
     resources: {cpus: 1.0, memory: 1g, pids: 192}
     output: sanitized-json
-    capabilities: [javascript-rendered-page-observation, browser-console-health, same-origin-resource-observation, encrypted-form-login, role-based-session-observation]
-    controls: [single-approved-navigation, same-host-only-request-routing, cross-host-requests-blocked, excluded-paths-blocked-before-and-during-run, downloads-disabled, service-workers-blocked, navigation-timeout-15s, post-load-wait-500ms, no-user-supplied-scripts, optional-encrypted-form-login, credential-profile-same-target-only, server-key-encrypted-at-rest, secret-injected-into-ephemeral-tmpfs, secret-never-written-to-host-evidence, username-password-output-omitted, request-and-response-content-omitted, cookies-omitted, target-query-omitted-from-metadata, ephemeral-browser-inputs-removed, non-root-read-only-container, pinned-image]
+    capabilities: [javascript-rendered-page-observation, browser-console-health, same-origin-resource-observation, encrypted-form-login, role-based-session-observation, login-success-selector-verification]
+    controls: [single-approved-navigation, same-host-only-request-routing, cross-host-requests-blocked, excluded-paths-blocked-before-and-during-run, downloads-disabled, service-workers-blocked, navigation-timeout-15s, post-load-wait-500ms, no-user-supplied-scripts, optional-encrypted-form-login, optional-login-success-selector, fail-closed-on-success-selector-miss, credential-profile-same-target-only, server-key-encrypted-at-rest, secret-injected-into-ephemeral-tmpfs, secret-never-written-to-host-evidence, username-password-output-omitted, request-and-response-content-omitted, cookies-omitted, target-query-omitted-from-metadata, ephemeral-browser-inputs-removed, non-root-read-only-container, pinned-image]
     state: verified-local-image
 
   codeql:

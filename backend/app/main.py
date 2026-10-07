@@ -115,6 +115,7 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS credential_profiles_project_created_idx
                     ON credential_profiles(project_id, created_at DESC);
+                ALTER TABLE credential_profiles ADD COLUMN IF NOT EXISTS success_selector TEXT;
                 CREATE TABLE IF NOT EXISTS runs (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -230,7 +231,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.73.1", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.74.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -278,6 +279,7 @@ class CredentialProfileCreate(BaseModel):
     username_selector: str = Field(min_length=1, max_length=300)
     password_selector: str = Field(min_length=1, max_length=300)
     submit_selector: str = Field(min_length=1, max_length=300)
+    success_selector: str | None = Field(default=None, min_length=1, max_length=300)
     requested_by: str = Field(min_length=2, max_length=120)
 
 
@@ -1080,7 +1082,7 @@ def credential_profile_response(row: tuple) -> dict:
         "name": row[3], "role_name": row[4], "kind": row[5],
         "login_url": row[6], "username_selector": row[7],
         "password_selector": row[8], "submit_selector": row[9],
-        "created_at": row[10],
+        "success_selector": row[10], "created_at": row[11],
     }
 
 
@@ -1092,7 +1094,9 @@ def create_credential_profile(project_id: UUID, payload: CredentialProfileCreate
     login_path = parsed.path or "/"
     if parsed.query or parsed.fragment:
         raise HTTPException(status_code=422, detail="Login URL must not contain a query or fragment")
-    for selector in (payload.username_selector, payload.password_selector, payload.submit_selector):
+    for selector in (payload.username_selector, payload.password_selector, payload.submit_selector, payload.success_selector):
+        if selector is None:
+            continue
         if any(ord(character) < 32 for character in selector):
             raise HTTPException(status_code=422, detail="Login selectors must not contain control characters")
     secret = json.dumps(
@@ -1127,16 +1131,16 @@ def create_credential_profile(project_id: UUID, payload: CredentialProfileCreate
                     """
                     INSERT INTO credential_profiles
                         (id, project_id, target_id, name, role_name, kind, login_url,
-                         username_selector, password_selector, submit_selector, encrypted_secret)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         username_selector, password_selector, submit_selector, success_selector, encrypted_secret)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id, project_id, target_id, name, role_name, kind, login_url,
-                              username_selector, password_selector, submit_selector, created_at
+                              username_selector, password_selector, submit_selector, success_selector, created_at
                     """,
                     (
                         profile_id, project_id, payload.target_id, payload.name.strip(),
                         payload.role_name.strip(), payload.kind, login_url,
                         payload.username_selector, payload.password_selector,
-                        payload.submit_selector, encrypted_secret,
+                        payload.submit_selector, payload.success_selector, encrypted_secret,
                     ),
                 )
                 row = cursor.fetchone()
@@ -1160,7 +1164,7 @@ def list_credential_profiles(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, project_id, target_id, name, role_name, kind, login_url,
-                       username_selector, password_selector, submit_selector, created_at
+                       username_selector, password_selector, submit_selector, success_selector, created_at
                 FROM credential_profiles WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),

@@ -354,7 +354,7 @@ def get_run(run_id: UUID) -> dict | None:
                        r.source_artifact_id, s.filename, s.sha256,
                        r.credential_profile_id, cp.role_name, cp.login_url,
                        cp.username_selector, cp.password_selector, cp.submit_selector,
-                       cp.encrypted_secret
+                       cp.success_selector, cp.encrypted_secret
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -384,7 +384,8 @@ def get_run(run_id: UUID) -> dict | None:
         "credential_username_selector": row[14],
         "credential_password_selector": row[15],
         "credential_submit_selector": row[16],
-        "credential_encrypted_secret": row[17],
+        "credential_success_selector": row[17],
+        "credential_encrypted_secret": row[18],
     }
 
 
@@ -1916,6 +1917,7 @@ def write_playwright_output(raw_output: bytes, output_file: Path) -> None:
                 "status_code": int(item.get("status_code") or 0),
                 "content_type": str(item.get("content_type") or "")[:200],
                 "authentication_attempted": bool(item.get("authentication_attempted")),
+                "authentication_verified": bool(item.get("authentication_verified")),
                 "role_name": str(item.get("role_name") or "")[:120] or None,
                 "same_origin_requests": min(max(int(item.get("same_origin_requests") or 0), 0), 10000),
                 "blocked_requests": min(max(int(item.get("blocked_requests") or 0), 0), 10000),
@@ -1945,6 +1947,7 @@ def normalize_playwright(run_id: UUID, output_file: Path) -> int:
             "status_code": status,
             "content_type": item.get("content_type"),
             "authentication_attempted": bool(item.get("authentication_attempted")),
+            "authentication_verified": bool(item.get("authentication_verified")),
             "role_name": item.get("role_name"),
             "same_origin_requests": item.get("same_origin_requests"),
             "blocked_requests": item.get("blocked_requests"),
@@ -3820,6 +3823,7 @@ def prepare_playwright_input(run: dict, run_dir: Path) -> tuple[Path, Path]:
         "username_selector": run.get("credential_username_selector") if authenticated else None,
         "password_selector": run.get("credential_password_selector") if authenticated else None,
         "submit_selector": run.get("credential_submit_selector") if authenticated else None,
+        "success_selector": run.get("credential_success_selector") if authenticated else None,
     }, separators=(",", ":")) + "\n", encoding="utf-8")
     config_file.chmod(0o644)
     script_file = run_dir / "browser-observe.js"
@@ -3830,6 +3834,7 @@ const cleanUrl = value => { const u = new URL(value); return `${u.protocol}//${u
 const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pathname === p || pathname.startsWith(p + "/"));
 (async () => {
   let browser;
+  let authenticationVerified = false;
   const metrics = { same_origin_requests: 0, blocked_requests: 0, failed_requests: 0, console_errors: 0, page_errors: 0 };
   try {
     browser = await chromium.launch({headless: true, args: ["--disable-dev-shm-usage"]});
@@ -3858,6 +3863,10 @@ const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pat
       await page.locator(config.submit_selector).click();
       await page.waitForLoadState("domcontentloaded", {timeout: config.navigation_timeout_ms}).catch(() => {});
       await page.waitForTimeout(500);
+      if (config.success_selector) {
+        await page.locator(config.success_selector).waitFor({state: "visible", timeout: 5000});
+        authenticationVerified = true;
+      }
     }
     const response = await page.goto(config.target, {waitUntil: "domcontentloaded", timeout: config.navigation_timeout_ms});
     await page.waitForTimeout(500);
@@ -3869,6 +3878,7 @@ const blockedPath = pathname => config.excluded_paths.some(p => p === "/" || pat
       status_code: response ? response.status() : 0,
       content_type: response ? String((await response.allHeaders())["content-type"] || "").slice(0, 200) : "",
       authentication_attempted: Boolean(config.authenticated),
+      authentication_verified: authenticationVerified,
       role_name: config.authenticated ? String(config.role_name || "").slice(0, 120) : null,
       ...metrics,
     };
