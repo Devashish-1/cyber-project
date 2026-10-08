@@ -118,10 +118,12 @@ services:
       - no-new-privileges:true
 
   dashboard:
-    image: nginx:1.29-alpine
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     restart: unless-stopped
+    user: "101:101"
+    read_only: true
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./dashboard:/usr/share/nginx/html:ro
       - ./dashboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro
@@ -130,3 +132,11 @@ services:
         condition: service_healthy
     mem_limit: 256m
     cpus: 0.25
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/nginx:rw,nosuid,nodev,noexec,size=16m,uid=101,gid=101,mode=0755
+      - /var/run:rw,nosuid,nodev,noexec,size=4m,uid=101,gid=101,mode=0755
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,uid=101,gid=101,mode=1777
