@@ -6,6 +6,7 @@ cd "$platform_root"
 
 echo "Validating Compose configuration"
 docker compose config --quiet
+docker compose config --format json | python3 ops/validate-compose-security.py
 
 echo "Building control-plane services"
 docker compose build api runner
