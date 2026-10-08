@@ -55,6 +55,7 @@ SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
 MAX_IMAGE_AUDIT_AGE_HOURS = int(os.getenv("MAX_IMAGE_AUDIT_AGE_HOURS", "168"))
 BACKUP_ROOT = Path(os.getenv("BACKUP_ROOT", "/backups"))
+BACKUP_RESTORE_STATUS_PATH = Path(os.getenv("BACKUP_RESTORE_STATUS_PATH", "/validation/backup-restore-validation.json"))
 VALIDATION_STATUS_PATH = Path(os.getenv(
     "VALIDATION_STATUS_PATH",
     "/validation/local-validation-suite.json",
@@ -286,7 +287,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.116.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.117.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1464,6 +1465,23 @@ def backup_status() -> dict:
             config_valid = False
     created_at = datetime.fromtimestamp(database_backup.stat().st_mtime, timezone.utc)
     age_seconds = max(0, int((datetime.now(timezone.utc) - created_at).total_seconds()))
+    restore_validation = {"available": False, "status": "not-run", "matches_latest": False}
+    try:
+        if BACKUP_RESTORE_STATUS_PATH.is_symlink() or not BACKUP_RESTORE_STATUS_PATH.is_file():
+            raise OSError("restore status is unavailable")
+        if BACKUP_RESTORE_STATUS_PATH.stat().st_size > 64 * 1024:
+            raise OSError("restore status exceeds read limit")
+        restore_payload = json.loads(BACKUP_RESTORE_STATUS_PATH.read_text(encoding="utf-8"))
+        restore_validation = {
+            "available": True,
+            "status": str(restore_payload.get("status") or "unknown"),
+            "backup": restore_payload.get("backup"),
+            "finished_at": restore_payload.get("finished_at"),
+            "row_counts": restore_payload.get("row_counts") or [],
+            "matches_latest": restore_payload.get("backup") == database_backup.name,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
     return {
         "available": True,
         "timestamp": timestamp,
@@ -1483,6 +1501,7 @@ def backup_status() -> dict:
             "size_bytes": config_backup.stat().st_size if paired else None,
             "valid": config_valid,
         },
+        "restore_validation": restore_validation,
     }
 
 

@@ -85,7 +85,7 @@ jq -e '
 curl --config "$curl_config" "$base_url/image-audit-history?limit=10" > "$work_dir/image-audit-history.json"
 jq -e '(.audits | type == "array") and (.audits | length >= 1) and (.audits[0].integrity_verified == true)' "$work_dir/image-audit-history.json" >/dev/null
 curl --config "$curl_config" "$base_url/backup-status" > "$work_dir/backup-status.json"
-jq -e '(.available == true) and (.paired == true) and (.verified == true) and (.fresh | type == "boolean")' "$work_dir/backup-status.json" >/dev/null
+jq -e '(.available == true) and (.paired == true) and (.verified == true) and (.fresh | type == "boolean") and (.restore_validation.status == "passed") and (.restore_validation.matches_latest == true)' "$work_dir/backup-status.json" >/dev/null
 mkdir "$work_dir/image-audit"
 for kind in report sbom checksums; do
   filename="$(jq -r --arg kind "$kind" 'if $kind == "report" then .report.filename elif $kind == "sbom" then .sbom.filename else .checksums.filename end' "$work_dir/image-audit.json")"

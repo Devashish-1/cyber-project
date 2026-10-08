@@ -8,7 +8,7 @@ exec 9>data/tmp/backup-restore-validation.lock
 flock -n 9 || { echo 'Another restore validation is running' >&2; exit 1; }
 
 container=security-platform-restore-test
-status_file=data/exports/backup-restore-validation.json
+status_file=data/tmp/backup-restore-validation.json
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 passed=false
 backup_name=''
