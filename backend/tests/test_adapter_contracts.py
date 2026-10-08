@@ -36,6 +36,14 @@ class AdapterContractTests(unittest.TestCase):
                     if "--status-codes-blacklist" in command else [],
                 )
 
+    def test_every_adapter_image_is_pinned_by_sha256_digest(self):
+        for tool_id, adapter in sorted(self.adapters.items()):
+            with self.subTest(tool_id=tool_id):
+                self.assertRegex(
+                    adapter.get("image", ""),
+                    r"^[^\s@]+@sha256:[0-9a-f]{64}$",
+                )
+
     def test_sqlmap_remains_low_risk_and_non_destructive(self):
         command = self.command_for("sqlmap-controlled")
         joined = " ".join(command)

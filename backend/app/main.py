@@ -278,7 +278,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.107.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.108.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1007,6 +1007,10 @@ def coverage() -> dict:
         by_input[input_type] = by_input.get(input_type, 0) + 1
     eligible_count = len(eligible)
     implemented_count = len(implemented_names)
+    immutable_images = sum(
+        1 for name in implemented_names
+        if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", str(configured[name].get("image") or ""))
+    )
     by_execution: dict[str, int] = {}
     for metadata in registry.values():
         mode = str(metadata.get("execution") or "unspecified")
@@ -1021,6 +1025,8 @@ def coverage() -> dict:
             "catalogued": len(registry),
             "adapter_eligible": eligible_count,
             "implemented": implemented_count,
+            "immutable_images": immutable_images,
+            "floating_images": implemented_count - immutable_images,
             "pending": len(pending_names),
             "non_adapter": len(non_adapter),
             "coverage_percent": round((implemented_count / eligible_count) * 100, 1) if eligible_count else 0,
