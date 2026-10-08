@@ -648,6 +648,23 @@ def url_is_in_target_scope(
     return True
 
 
+def hostname_is_exact_target(candidate: str, expected: str) -> bool:
+    value = candidate.strip().lower().rstrip(".")
+    target = expected.strip().lower().rstrip(".")
+    return bool(value and target and value == target)
+
+
+def nmap_host_is_target(address: str, hostnames: list[str], expected: str) -> bool:
+    try:
+        expected_ip = str(ipaddress.ip_address(expected))
+    except ValueError:
+        return any(hostname_is_exact_target(name, expected) for name in hostnames)
+    try:
+        return str(ipaddress.ip_address(address)) == expected_ip
+    except ValueError:
+        return False
+
+
 def build_command(
     tool_id: str,
     base_url: str | None,
@@ -1353,7 +1370,12 @@ def read_container_file(container, container_path: str) -> bytes:
     return data
 
 
-def normalize_httpx(run_id: UUID, output_file: Path) -> int:
+def normalize_httpx(
+    run_id: UUID,
+    output_file: Path,
+    base_url: str,
+    excluded_paths: list[str] | None,
+) -> int:
     records = []
     try:
         for raw_line in output_file.read_text(encoding="utf-8").splitlines():
@@ -1361,7 +1383,7 @@ def normalize_httpx(run_id: UUID, output_file: Path) -> int:
                 continue
             item = json.loads(raw_line)
             asset = str(item.get("url") or item.get("input") or "")[:2000]
-            if not asset:
+            if not asset or not url_is_in_target_scope(asset, base_url, excluded_paths):
                 continue
             details = {
                 "status_code": item.get("status_code"),
@@ -1566,7 +1588,7 @@ def normalize_wpscan(run_id: UUID, output_file: Path) -> int:
     return 1
 
 
-def normalize_naabu(run_id: UUID, output_file: Path) -> int:
+def normalize_naabu(run_id: UUID, output_file: Path, expected_host: str) -> int:
     records = []
     try:
         for raw_line in output_file.read_text(encoding="utf-8").splitlines():
@@ -1576,7 +1598,7 @@ def normalize_naabu(run_id: UUID, output_file: Path) -> int:
             host = str(item.get("host") or item.get("ip") or "")[:1000]
             ip = str(item.get("ip") or host)[:1000]
             port = int(item.get("port") or 0)
-            if not host or not (1 <= port <= 65535):
+            if not hostname_is_exact_target(host, expected_host) or not (1 <= port <= 65535):
                 continue
             asset = f"{host}:{port}"[:2000]
             details = {
@@ -1608,7 +1630,7 @@ def normalize_naabu(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def normalize_nmap(run_id: UUID, output_file: Path) -> int:
+def normalize_nmap(run_id: UUID, output_file: Path, expected_host: str) -> int:
     records = []
     try:
         raw = output_file.read_text(encoding="utf-8", errors="replace")
@@ -1619,6 +1641,12 @@ def normalize_nmap(run_id: UUID, output_file: Path) -> int:
         for host_node in root.findall("host"):
             address_node = host_node.find("address")
             address = (address_node.get("addr") if address_node is not None else "") or "network-target"
+            hostnames = [
+                str(node.get("name") or "")
+                for node in host_node.findall("./hostnames/hostname")
+            ]
+            if not nmap_host_is_target(address, hostnames, expected_host):
+                continue
             for port_node in host_node.findall("./ports/port"):
                 state_node = port_node.find("state")
                 if state_node is None or state_node.get("state") != "open":
@@ -5488,13 +5516,16 @@ def execute_run(run_id: UUID) -> None:
         if exit_code in successful_exit_codes:
             normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             normalizer = normalizers[run["tool_id"]]
-            if run["tool_id"] in {"ffuf", "katana", "nuclei-reviewed"}:
+            if run["tool_id"] in {"ffuf", "httpx", "katana", "nuclei-reviewed"}:
                 observation_count = normalizer(
                     run_id,
                     output_file,
                     run["base_url"],
                     run["excluded_paths"],
                 )
+            elif run["tool_id"] in {"naabu", "nmap"}:
+                expected_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+                observation_count = normalizer(run_id, output_file, expected_host)
             else:
                 observation_count = normalizer(run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)

@@ -16,6 +16,8 @@ from app.runner import (
     write_dnsx_output,
     write_massdns_output,
     url_is_in_target_scope,
+    hostname_is_exact_target,
+    nmap_host_is_target,
 )
 
 
@@ -217,6 +219,17 @@ class AdapterContractTests(unittest.TestCase):
         self.assertFalse(url_is_in_target_scope("https://authorized.example.test/%6cogout", base, excluded))
         self.assertFalse(url_is_in_target_scope("https://authorized.example.test/public/../admin/users", base, excluded))
         self.assertTrue(url_is_in_target_scope("https://authorized.example.test/public", base, excluded))
+
+    def test_network_output_requires_exact_target_hostname(self):
+        self.assertTrue(hostname_is_exact_target("AUTHORIZED.EXAMPLE.TEST.", "authorized.example.test"))
+        self.assertFalse(hostname_is_exact_target("api.authorized.example.test", "authorized.example.test"))
+        self.assertFalse(hostname_is_exact_target("authorized.example.test.evil.invalid", "authorized.example.test"))
+
+    def test_nmap_output_binds_to_requested_hostname_or_ip(self):
+        self.assertTrue(nmap_host_is_target("192.0.2.10", ["authorized.example.test"], "authorized.example.test"))
+        self.assertFalse(nmap_host_is_target("192.0.2.10", ["evil.invalid"], "authorized.example.test"))
+        self.assertTrue(nmap_host_is_target("192.0.2.10", [], "192.0.2.10"))
+        self.assertFalse(nmap_host_is_target("192.0.2.11", [], "192.0.2.10"))
 
 
 if __name__ == "__main__":
