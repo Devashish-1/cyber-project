@@ -13,10 +13,21 @@ set +a
 
 umask 077
 work_dir="$(mktemp -d /tmp/security-platform-smoke.XXXXXX)"
-trap 'rm -rf "$work_dir"' EXIT
 curl_config="$work_dir/curl.conf"
 printf 'silent\nshow-error\nfail\nheader = "x-control-plane-token: %s"\n' \
   "$CONTROL_PLANE_TOKEN" > "$curl_config"
+smoke_source_project_id=""
+smoke_source_artifact_id=""
+cleanup_smoke_test() {
+  if [ -n "$smoke_source_project_id" ] && [ -n "$smoke_source_artifact_id" ]; then
+    curl --config "$curl_config" --no-fail -sS -o /dev/null \
+      -H 'Content-Type: application/json' -X DELETE \
+      "$base_url/projects/$smoke_source_project_id/source-artifacts/$smoke_source_artifact_id" \
+      -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE SOURCE ARCHIVE"}' || true
+  fi
+  rm -rf "$work_dir"
+}
+trap cleanup_smoke_test EXIT
 
 curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
@@ -184,6 +195,54 @@ for kind in report sbom checksums; do
 done
 (cd "$work_dir/image-audit" && sha256sum -c "$(jq -r '.checksums.filename' ../image-audit.json)" >/dev/null)
 project_id="$(jq -r '.projects[0].id // empty' "$work_dir/projects.json")"
+
+if [ -n "$project_id" ]; then
+  smoke_source_project_id="$project_id"
+  python3 - "$work_dir/source-delete-fixture.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("README.txt", "Disposable local source-deletion smoke fixture.\n")
+PY
+  curl --config "$curl_config" -X POST \
+    "$base_url/projects/$project_id/source-artifacts" \
+    -F "archive=@$work_dir/source-delete-fixture.zip;type=application/zip" \
+    -F 'requested_by=smoke-source-delete' \
+    -F 'authorization_reference=local-disposable-smoke-fixture' \
+    -F 'authorization_confirmed=true' \
+    > "$work_dir/source-upload.json"
+  smoke_source_artifact_id="$(jq -er '.id' "$work_dir/source-upload.json")"
+  test -d "$platform_root/data/sources/$smoke_source_artifact_id"
+  curl --config "$curl_config" \
+    -H 'Content-Type: application/json' -X DELETE \
+    "$base_url/projects/$project_id/source-artifacts/$smoke_source_artifact_id" \
+    -d '{"requested_by":"smoke-source-delete","confirmation":"DELETE SOURCE ARCHIVE"}' \
+    > "$work_dir/source-delete.json"
+  jq -e --arg artifact_id "$smoke_source_artifact_id" '
+    .id == $artifact_id and
+    .status == "deleted" and
+    .deleted_file_count == 1 and
+    .storage_cleanup_complete == true
+  ' "$work_dir/source-delete.json" >/dev/null
+  test ! -e "$platform_root/data/sources/$smoke_source_artifact_id"
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/source-artifacts" \
+    > "$work_dir/source-artifacts-after-delete.json"
+  jq -e --arg artifact_id "$smoke_source_artifact_id" '
+    all(.artifacts[]; (.id | tostring) != $artifact_id)
+  ' "$work_dir/source-artifacts-after-delete.json" >/dev/null
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/audit-events" \
+    > "$work_dir/source-delete-audit.json"
+  jq -e --arg artifact_id "$smoke_source_artifact_id" '
+    any(.events[];
+      .event_type == "source_artifact.deleted" and
+      (.object_id | tostring) == $artifact_id and
+      .actor == "smoke-source-delete")
+  ' "$work_dir/source-delete-audit.json" >/dev/null
+  smoke_source_artifact_id=""
+fi
 
 local_project_id="$(jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' "$work_dir/projects.json" | head -n1)"
 if [ -n "$local_project_id" ]; then
