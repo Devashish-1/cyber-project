@@ -270,7 +270,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.98.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.99.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2481,6 +2481,166 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
         media_type="application/sarif+json",
         headers={
             "Content-Disposition": f'attachment; filename="security-platform-{project_id}.sarif"'
+        },
+    )
+
+
+@app.get("/projects/{project_id}/report.json")
+def get_project_json_report(project_id: UUID, include_info: bool = True) -> Response:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT name, description, created_at FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            project = cursor.fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
+                       max_run_seconds, testing_window_start_minute_utc,
+                       testing_window_end_minute_utc, allow_state_changing,
+                       allow_third_party_services, authorization_reference, created_at
+                FROM targets WHERE project_id = %s ORDER BY created_at
+                """,
+                (project_id,),
+            )
+            targets = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT filename, sha256, file_count, compressed_size, extracted_size,
+                       authorization_reference, created_at
+                FROM source_artifacts WHERE project_id = %s ORDER BY created_at
+                """,
+                (project_id,),
+            )
+            sources = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT tool_id, profile, status, COUNT(*),
+                       COUNT(*) FILTER (WHERE evidence_manifest_sha256 IS NOT NULL),
+                       MAX(finished_at)
+                FROM runs WHERE project_id = %s
+                GROUP BY tool_id, profile, status
+                ORDER BY tool_id, profile, status
+                """,
+                (project_id,),
+            )
+            run_coverage = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT status, COUNT(*) FROM runs WHERE project_id = %s
+                GROUP BY status ORDER BY status
+                """,
+                (project_id,),
+            )
+            status_counts = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FILTER (WHERE status IN ('succeeded','failed','cancelled')),
+                       COUNT(*) FILTER (
+                           WHERE status IN ('succeeded','failed','cancelled')
+                           AND evidence_manifest_sha256 IS NOT NULL
+                       )
+                FROM runs WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            completed_runs, sealed_runs = cursor.fetchone()
+
+    finding_data = get_project_findings(project_id)
+    findings = finding_data["findings"]
+    reported = findings if include_info else [item for item in findings if item["severity"] != "info"]
+    severity_counts = {
+        severity: sum(1 for item in findings if item["severity"] == severity)
+        for severity in ("critical", "high", "medium", "low", "info")
+    }
+    review_counts = {
+        status: sum(1 for item in findings if item["review_status"] == status)
+        for status in ("new", "confirmed", "false_positive", "accepted_risk", "resolved")
+    }
+    report = {
+        "schema": "security-platform-report/v1",
+        "generated_at": datetime.now(timezone.utc),
+        "platform_version": app.version,
+        "project": {
+            "id": project_id,
+            "name": project[0],
+            "description": project[1],
+            "created_at": project[2],
+        },
+        "scope": {
+            "targets": [
+                {
+                    "id": row[0],
+                    "base_url": row[1],
+                    "allowed_hosts": row[2],
+                    "excluded_paths": row[3],
+                    "dns_resolver": row[4],
+                    "max_run_seconds": row[5],
+                    "testing_window_utc": {
+                        "start_minute": row[6],
+                        "end_minute": row[7],
+                        "display": format_testing_window(row[6], row[7]),
+                    },
+                    "allow_state_changing": row[8],
+                    "allow_third_party_services": row[9],
+                    "authorization_reference": row[10],
+                    "created_at": row[11],
+                }
+                for row in targets
+            ],
+            "source_artifacts": [
+                {
+                    "filename": row[0],
+                    "sha256": row[1],
+                    "file_count": row[2],
+                    "compressed_size": row[3],
+                    "extracted_size": row[4],
+                    "authorization_reference": row[5],
+                    "created_at": row[6],
+                }
+                for row in sources
+            ],
+        },
+        "coverage": {
+            "tools_executed": sorted({row[0] for row in run_coverage}),
+            "run_status_counts": {row[0]: row[1] for row in status_counts},
+            "run_matrix": [
+                {
+                    "tool_id": row[0],
+                    "profile": row[1],
+                    "status": row[2],
+                    "run_count": row[3],
+                    "sealed_run_count": row[4],
+                    "last_finished_at": row[5],
+                }
+                for row in run_coverage
+            ],
+            "completed_runs": completed_runs,
+            "sealed_runs": sealed_runs,
+        },
+        "summary": {
+            "unique_findings": len(findings),
+            "reported_findings": len(reported),
+            "includes_informational": include_info,
+            "severity_counts": severity_counts,
+            "review_counts": review_counts,
+        },
+        "findings": [sanitize_evidence(item) for item in reported],
+        "limitations": [
+            "Automated coverage does not prove the absence of vulnerabilities.",
+            "Business-logic, authorization, and exploit-chain risks may require human testing.",
+            "Only saved scope, completed runs, and normalized findings are represented.",
+            "Raw evidence and credentials are intentionally excluded from this export.",
+        ],
+    }
+    return Response(
+        content=json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="security-platform-{project_id}.json"'
         },
     )
 
