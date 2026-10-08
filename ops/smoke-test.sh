@@ -196,6 +196,29 @@ fi
 
 if [ -n "$project_id" ]; then
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/imports/burp" \
+    > "$work_dir/burp-imports.json"
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.imports | type == "array") and
+    (.imports | length <= 500) and
+    all(.imports[];
+      ((keys | sort) == ([
+        "authorization_reference", "created_at", "duplicate_count", "filename",
+        "imported_count", "requested_by", "run_id", "sha256", "skipped_excluded",
+        "skipped_out_of_scope", "status", "target", "target_id"
+      ] | sort)) and
+      (.filename | type == "string") and
+      (.sha256 | type == "string") and
+      (.authorization_reference | type == "string") and
+      (.imported_count | type == "number") and
+      (.skipped_out_of_scope | type == "number") and
+      (.skipped_excluded | type == "number") and
+      (.duplicate_count | type == "number")
+    ) and
+    (tostring | test("raw_request|raw_response|cookie|password|authorization: bearer"; "i") | not)
+  ' "$work_dir/burp-imports.json" >/dev/null
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.json?include_info=true" \
     > "$work_dir/report.json"
   curl --config "$curl_config" \
