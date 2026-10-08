@@ -286,7 +286,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.115.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.116.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1089,11 +1089,34 @@ def coverage() -> dict:
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, HTTPException):
                 integrity_status = "failed"
         image_matches = bool(proven_image and proven_image == current_image)
+        validated = image_matches and integrity_status == "verified"
+        requires_external_approval = bool(configured[name].get("uses_third_party_services"))
+        if validated:
+            validation_state = "proven"
+            validation_note = "Current pinned image has a successful run with verified sealed evidence."
+        elif requires_external_approval and not history["succeeded"]:
+            validation_state = "external-approval-required"
+            validation_note = (
+                "Runtime proof requires an explicitly authorized domain and separate opt-in "
+                "to third-party providers; local fixtures cannot prove provider connectivity."
+            )
+        elif not run_id:
+            validation_state = "not-run"
+            validation_note = "No successful runtime proof has been recorded for this adapter."
+        elif not image_matches:
+            validation_state = "image-mismatch"
+            validation_note = "The latest successful proof used a different image digest."
+        else:
+            validation_state = "evidence-unverified"
+            validation_note = "The latest successful run does not have verified sealed evidence."
         validation.append({
             "id": name,
             "input": str(configured[name].get("input") or "target"),
             "profile": str(configured[name].get("profile") or "unknown"),
-            "validated": image_matches and integrity_status == "verified",
+            "validated": validated,
+            "validation_state": validation_state,
+            "validation_note": validation_note,
+            "requires_external_approval": requires_external_approval,
             "succeeded": history["succeeded"],
             "failed": history["failed"],
             "last_run_id": run_id,
