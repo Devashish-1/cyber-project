@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.130.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.131.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3296,6 +3296,24 @@ def summarize_role_coverage(rows: list[tuple]) -> dict:
     }
 
 
+def fetch_role_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
+    cursor.execute(
+        """
+        SELECT cp.id, cp.name, cp.role_name, cp.target_id, t.base_url,
+               r.status, COUNT(r.id), MAX(r.finished_at)
+        FROM credential_profiles cp
+        JOIN targets t ON t.id = cp.target_id
+        LEFT JOIN runs r
+          ON r.credential_profile_id = cp.id AND r.tool_id = 'playwright'
+        WHERE cp.project_id = %s
+        GROUP BY cp.id, cp.name, cp.role_name, cp.target_id, t.base_url, r.status
+        ORDER BY cp.role_name, cp.name, r.status
+        """,
+        (project_id,),
+    )
+    return cursor.fetchall()
+
+
 def available_report_adapters() -> list[str]:
     configured = load_adapters().get("adapters", {})
     return sorted(name for name in configured if name in RUNNER_IMPLEMENTED_TOOLS)
@@ -3333,21 +3351,7 @@ def get_project_role_coverage(project_id: UUID) -> dict:
             cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
             if cursor.fetchone() is None:
                 raise HTTPException(status_code=404, detail="Project not found")
-            cursor.execute(
-                """
-                SELECT cp.id, cp.name, cp.role_name, cp.target_id, t.base_url,
-                       r.status, COUNT(r.id), MAX(r.finished_at)
-                FROM credential_profiles cp
-                JOIN targets t ON t.id = cp.target_id
-                LEFT JOIN runs r
-                  ON r.credential_profile_id = cp.id AND r.tool_id = 'playwright'
-                WHERE cp.project_id = %s
-                GROUP BY cp.id, cp.name, cp.role_name, cp.target_id, t.base_url, r.status
-                ORDER BY cp.role_name, cp.name, r.status
-                """,
-                (project_id,),
-            )
-            rows = cursor.fetchall()
+            rows = fetch_role_coverage_rows(cursor, project_id)
     return {"project_id": project_id, **summarize_role_coverage(rows)}
 
 
@@ -3414,6 +3418,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
                 (project_id,),
             )
             completed_runs, sealed_runs = cursor.fetchone()
+            role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3427,6 +3432,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         for status in ("new", "confirmed", "false_positive", "accepted_risk", "resolved")
     }
     adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
+    role_coverage = summarize_role_coverage(role_coverage_rows)
     report = {
         "schema": "security-platform-report/v1",
         "generated_at": datetime.now(timezone.utc),
@@ -3474,6 +3480,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         "coverage": {
             "tools_executed": sorted({row[0] for row in run_coverage}),
             "adapter_gaps": adapter_coverage,
+            "role_coverage": role_coverage,
             "run_status_counts": {row[0]: row[1] for row in status_counts},
             "run_matrix": [
                 {
@@ -3580,6 +3587,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 (project_id,),
             )
             completed_runs, sealed_runs = cursor.fetchone()
+            role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3594,6 +3602,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     }
 
     adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
+    role_coverage = summarize_role_coverage(role_coverage_rows)
 
     def md(value: object) -> str:
         return (
@@ -3670,6 +3679,21 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Adapter coverage successful: {adapter_coverage['successful_coverage_percent']}% ({len(adapter_coverage['successful_adapters'])} of {len(adapter_coverage['available_adapters'])})",
         f"- Untested adapters: {md(', '.join(adapter_coverage['unattempted_adapters']) or 'None')}",
         f"- Attempted without a successful run: {md(', '.join(adapter_coverage['attempted_without_success']) or 'None')}",
+        f"- Authenticated roles tested: {role_coverage['summary']['tested_coverage_percent']}% ({role_coverage['summary']['tested_profiles']} of {role_coverage['summary']['configured_profiles']})",
+        f"- Authenticated roles with a successful run: {role_coverage['summary']['successful_coverage_percent']}% ({role_coverage['summary']['successful_profiles']} of {role_coverage['summary']['configured_profiles']})",
+        "",
+        "### Authenticated role coverage",
+        "",
+        "| Profile | Role | Target | Attempts | Successful | Failed | Latest completion |",
+        "|---|---|---|---:|---:|---:|---|",
+    ])
+    lines.extend(
+        f"| {md(item['name'])} | {md(item['role_name'])} | {md(item['target'])} | {item['attempted_runs']} | {item['successful_runs']} | {item['failed_runs']} | {item['last_finished_at'].isoformat() if item['last_finished_at'] else '—'} |"
+        for item in role_coverage["profiles"]
+    )
+    if not role_coverage["profiles"]:
+        lines.append("| — | — | No authenticated profiles configured | 0 | 0 | 0 | — |")
+    lines.extend([
         "",
         "### Run coverage matrix",
         "",

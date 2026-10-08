@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.130' "$work_dir/dashboard.html"
+grep -q 'UI v0.131' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -192,7 +192,12 @@ if [ -n "$project_id" ]; then
     (.summary.unique_findings == (.findings | length)) and
     all(.findings[]; (.credential_role == null or (.credential_role | type) == "string")) and
     (.coverage.adapter_gaps.unattempted_adapters | type == "array") and
-    (.coverage.adapter_gaps.attempted_coverage_percent | type == "number")
+    (.coverage.adapter_gaps.attempted_coverage_percent | type == "number") and
+    (.coverage.role_coverage.profiles | type == "array") and
+    (.coverage.role_coverage.summary.configured_profiles == (.coverage.role_coverage.profiles | length)) and
+    all(.coverage.role_coverage.profiles[];
+      (has("username") | not) and (has("password") | not)
+    )
   ' "$work_dir/report.json" >/dev/null
   jq -e --arg project_id "$project_id" '
     .project_id == $project_id and
@@ -240,6 +245,7 @@ if [ -n "$project_id" ]; then
     )
   ' "$work_dir/report.defectdojo.json" >/dev/null
   grep -q '^# Security assessment report' "$work_dir/report.md"
+  grep -q '^### Authenticated role coverage' "$work_dir/report.md"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-audit/v1" and
     .project_id == $project_id and
