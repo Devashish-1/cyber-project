@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.132.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.133.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3351,6 +3351,21 @@ def summarize_target_coverage(rows: list[tuple], available_adapters: list[str]) 
     return {"available_adapters": available, "targets": ordered}
 
 
+def fetch_target_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
+    cursor.execute(
+        """
+        SELECT t.id, t.base_url, r.tool_id, r.status, COUNT(r.id), MAX(r.finished_at)
+        FROM targets t
+        LEFT JOIN runs r ON r.target_id = t.id
+        WHERE t.project_id = %s
+        GROUP BY t.id, t.base_url, r.tool_id, r.status
+        ORDER BY t.base_url, r.tool_id, r.status
+        """,
+        (project_id,),
+    )
+    return cursor.fetchall()
+
+
 def available_report_adapters(input_type: str | None = None) -> list[str]:
     configured = load_adapters().get("adapters", {})
     return sorted(
@@ -3392,18 +3407,7 @@ def get_project_target_coverage(project_id: UUID) -> dict:
             cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
             if cursor.fetchone() is None:
                 raise HTTPException(status_code=404, detail="Project not found")
-            cursor.execute(
-                """
-                SELECT t.id, t.base_url, r.tool_id, r.status, COUNT(r.id), MAX(r.finished_at)
-                FROM targets t
-                LEFT JOIN runs r ON r.target_id = t.id
-                WHERE t.project_id = %s
-                GROUP BY t.id, t.base_url, r.tool_id, r.status
-                ORDER BY t.base_url, r.tool_id, r.status
-                """,
-                (project_id,),
-            )
-            rows = cursor.fetchall()
+            rows = fetch_target_coverage_rows(cursor, project_id)
     return {
         "project_id": project_id,
         **summarize_target_coverage(rows, available_report_adapters("target")),
@@ -3485,6 +3489,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             )
             completed_runs, sealed_runs = cursor.fetchone()
             role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
+            target_coverage_rows = fetch_target_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3499,6 +3504,9 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
     }
     adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
     role_coverage = summarize_role_coverage(role_coverage_rows)
+    target_coverage = summarize_target_coverage(
+        target_coverage_rows, available_report_adapters("target")
+    )
     report = {
         "schema": "security-platform-report/v1",
         "generated_at": datetime.now(timezone.utc),
@@ -3547,6 +3555,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             "tools_executed": sorted({row[0] for row in run_coverage}),
             "adapter_gaps": adapter_coverage,
             "role_coverage": role_coverage,
+            "target_coverage": target_coverage,
             "run_status_counts": {row[0]: row[1] for row in status_counts},
             "run_matrix": [
                 {
@@ -3654,6 +3663,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             )
             completed_runs, sealed_runs = cursor.fetchone()
             role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
+            target_coverage_rows = fetch_target_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3669,6 +3679,9 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
 
     adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
     role_coverage = summarize_role_coverage(role_coverage_rows)
+    target_coverage = summarize_target_coverage(
+        target_coverage_rows, available_report_adapters("target")
+    )
 
     def md(value: object) -> str:
         return (
@@ -3759,6 +3772,19 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     )
     if not role_coverage["profiles"]:
         lines.append("| — | — | No authenticated profiles configured | 0 | 0 | 0 | — |")
+    lines.extend([
+        "",
+        "### Per-target adapter coverage",
+        "",
+        "| Target | Attempted | Successful | Untested | Runs | Latest completion |",
+        "|---|---:|---:|---:|---:|---|",
+    ])
+    lines.extend(
+        f"| {md(item['base_url'])} | {len(item['attempted_adapters'])}/{item['available_adapter_count']} ({item['attempted_coverage_percent']}%) | {len(item['successful_adapters'])}/{item['available_adapter_count']} ({item['successful_coverage_percent']}%) | {len(item['unattempted_adapters'])} | {item['run_count']} | {item['last_finished_at'].isoformat() if item['last_finished_at'] else '—'} |"
+        for item in target_coverage["targets"]
+    )
+    if not target_coverage["targets"]:
+        lines.append("| — | 0 | 0 | 0 | 0 | No authorized targets configured |")
     lines.extend([
         "",
         "### Run coverage matrix",
