@@ -2,7 +2,14 @@ import unittest
 
 import yaml
 
-from app.runner import ADAPTERS_PATH, FFUF_WORDLIST_RUNNER_PATH, build_command
+from app.runner import (
+    ADAPTERS_PATH,
+    FFUF_WORDLIST_RUNNER_PATH,
+    build_command,
+    parse_amass_names,
+    parse_spiderfoot_hosts,
+    parse_theharvester_hosts,
+)
 
 
 BASE_URL = "https://authorized.example.test/?id=1"
@@ -115,6 +122,40 @@ class AdapterContractTests(unittest.TestCase):
             if value == "--exclude-path"
         ]
         self.assertEqual(exclusions, ["/logout", "/payments"])
+
+    def test_amass_parser_rejects_suffix_confusion(self):
+        malicious_only = "api.authorized.example.test.evil.invalid\nnotauthorized.example.test\n"
+        self.assertEqual(parse_amass_names(malicious_only, "authorized.example.test"), [])
+        scoped = "authorized.example.test\nAPI.AUTHORIZED.EXAMPLE.TEST.\n"
+        self.assertEqual(
+            parse_amass_names(scoped, "authorized.example.test"),
+            ["api.authorized.example.test", "authorized.example.test"],
+        )
+
+    def test_theharvester_parser_keeps_only_valid_scoped_hosts(self):
+        payload = {"hosts": [
+            "api.authorized.example.test:443",
+            "api.authorized.example.test.evil.invalid",
+            "notauthorized.example.test",
+            "bad_label.authorized.example.test",
+            123,
+        ]}
+        self.assertEqual(
+            parse_theharvester_hosts(payload, "authorized.example.test"),
+            ["api.authorized.example.test"],
+        )
+
+    def test_spiderfoot_parser_requires_crt_module_type_and_scope(self):
+        payload = [
+            {"module": "sfp_crt", "type": "Internet Name", "data": "*.api.authorized.example.test"},
+            {"module": "sfp_dns", "type": "Internet Name", "data": "dns.authorized.example.test"},
+            {"module": "sfp_crt", "type": "IP Address", "data": "other.authorized.example.test"},
+            {"module": "sfp_crt", "type": "Domain Name", "data": "api.authorized.example.test.evil.invalid"},
+        ]
+        self.assertEqual(
+            parse_spiderfoot_hosts(payload, "authorized.example.test"),
+            ["api.authorized.example.test"],
+        )
 
 
 if __name__ == "__main__":

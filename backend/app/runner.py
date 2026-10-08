@@ -1686,7 +1686,8 @@ def parse_amass_names(raw_text: str, root_domain: str) -> list[str]:
         return []
     label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     pattern = re.compile(
-        rf"(?i)(?<![a-z0-9_-])(?:{label}\.)*{re.escape(root)}(?![a-z0-9_-])"
+        rf"(?i)(?<![a-z0-9_-])(?:{label}\.)*{re.escape(root)}"
+        rf"(?![a-z0-9_-]|\.[a-z0-9])"
     )
     return sorted(
         {
