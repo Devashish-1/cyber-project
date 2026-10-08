@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.148.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.149.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3673,6 +3673,32 @@ def get_project_adapter_coverage(project_id: UUID) -> dict:
     return {
         "project_id": project_id,
         **summarize_adapter_coverage(run_coverage, available_report_adapters()),
+    }
+
+
+@app.get("/projects/{project_id}/assessment-provenance")
+def get_project_assessment_provenance(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT tool_id, profile, status, COUNT(*),
+                       COUNT(*) FILTER (WHERE evidence_manifest_sha256 IS NOT NULL),
+                       MAX(finished_at)
+                FROM runs WHERE project_id = %s
+                GROUP BY tool_id, profile, status
+                ORDER BY tool_id, profile, status
+                """,
+                (project_id,),
+            )
+            run_coverage = cursor.fetchall()
+    findings = get_project_findings(project_id)["findings"]
+    return {
+        "project_id": project_id,
+        **summarize_assessment_provenance(run_coverage, findings),
     }
 
 

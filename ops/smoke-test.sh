@@ -22,7 +22,9 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.148' "$work_dir/dashboard.html"
+grep -q 'UI v0.149' "$work_dir/dashboard.html"
+grep -q 'Assessment provenance' "$work_dir/dashboard.html"
+grep -q 'assessment-provenance' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -195,6 +197,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/adapter-coverage" \
     > "$work_dir/adapter-coverage.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/assessment-provenance" \
+    > "$work_dir/assessment-provenance.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/role-coverage" \
     > "$work_dir/role-coverage.json"
   curl --config "$curl_config" \
@@ -282,6 +287,15 @@ if [ -n "$project_id" ]; then
   ' "$work_dir/adapter-coverage.json" >/dev/null
   jq -e --arg project_id "$project_id" '
     .project_id == $project_id and
+    (.supervised_run_count | type == "number") and
+    (.manual_import_run_count | type == "number") and
+    (.supervised_tools | type == "array") and
+    (.manual_import_sources | type == "array") and
+    (.supervised_finding_count | type == "number") and
+    (.manual_import_finding_count | type == "number")
+  ' "$work_dir/assessment-provenance.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
     (.profiles | type == "array") and
     (.summary.configured_profiles == (.profiles | length)) and
     (.summary.tested_coverage_percent | type == "number") and
@@ -343,7 +357,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.148.0" and
+    .platform_version == "0.149.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
