@@ -64,7 +64,7 @@ cat >"$fixture/package.json" <<'JSON'
 JSON
 printf '%s\n' 'fixture_aws_access_key = "AKIAIOSFODNN7EXAMPLE"' >"$fixture/example.txt"
 chmod 700 "$fixture/check.sh"
-(cd "$fixture" && zip -qr ../source-validation.zip .)
+(cd "$fixture" && python3 -m zipfile -c ../source-validation.zip .)
 
 project_id="$(api_get /projects | jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' | head -n1)"
 [[ -n "$project_id" ]]
