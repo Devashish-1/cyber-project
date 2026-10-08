@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 
 from uuid import UUID
 
-from app.main import build_audit_export, build_defectdojo_report, summarize_adapter_coverage
+from app.main import (
+    build_audit_export,
+    build_defectdojo_report,
+    summarize_adapter_coverage,
+    summarize_role_coverage,
+)
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
@@ -133,6 +138,36 @@ class AdapterCoverageSummaryTests(unittest.TestCase):
         self.assertEqual(summary["attempted_coverage_percent"], 0)
         self.assertEqual(summary["successful_coverage_percent"], 0)
         self.assertEqual(summary["unattempted_adapters"], [])
+
+
+class RoleCoverageSummaryTests(unittest.TestCase):
+    def test_reports_tested_successful_and_untested_profiles_without_secrets(self):
+        user_id = UUID("44444444-4444-4444-4444-444444444444")
+        admin_id = UUID("55555555-5555-5555-5555-555555555555")
+        target_id = UUID("66666666-6666-6666-6666-666666666666")
+        rows = [
+            (user_id, "Standard user", "user", target_id, "https://app.example.test", "succeeded", 2, NOW),
+            (user_id, "Standard user", "user", target_id, "https://app.example.test", "failed", 1, NOW),
+            (admin_id, "Administrator", "admin", target_id, "https://app.example.test", None, 0, None),
+        ]
+        coverage = summarize_role_coverage(rows)
+        self.assertEqual(coverage["summary"]["configured_profiles"], 2)
+        self.assertEqual(coverage["summary"]["tested_profiles"], 1)
+        self.assertEqual(coverage["summary"]["successful_profiles"], 1)
+        self.assertEqual(coverage["summary"]["untested_profiles"], 1)
+        self.assertEqual(coverage["summary"]["tested_coverage_percent"], 50.0)
+        profiles = {str(item["id"]): item for item in coverage["profiles"]}
+        self.assertEqual(profiles[str(user_id)]["attempted_runs"], 3)
+        self.assertEqual(profiles[str(user_id)]["successful_runs"], 2)
+        self.assertEqual(profiles[str(admin_id)]["attempted_runs"], 0)
+        self.assertNotIn("username", profiles[str(user_id)])
+        self.assertNotIn("password", profiles[str(user_id)])
+
+    def test_empty_role_inventory_is_explicit(self):
+        coverage = summarize_role_coverage([])
+        self.assertEqual(coverage["profiles"], [])
+        self.assertEqual(coverage["summary"]["configured_profiles"], 0)
+        self.assertEqual(coverage["summary"]["tested_coverage_percent"], 0)
 
 
 if __name__ == "__main__":

@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.129.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.130.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3257,6 +3257,45 @@ def summarize_adapter_coverage(run_coverage: list[tuple], available_adapters: li
     }
 
 
+def summarize_role_coverage(rows: list[tuple]) -> dict:
+    profiles: dict[str, dict] = {}
+    for profile_id, name, role_name, target_id, base_url, status, run_count, last_finished_at in rows:
+        key = str(profile_id)
+        profile = profiles.setdefault(key, {
+            "id": profile_id, "name": name, "role_name": role_name,
+            "target_id": target_id, "target": base_url,
+            "attempted_runs": 0, "successful_runs": 0,
+            "failed_runs": 0, "cancelled_runs": 0, "last_finished_at": None,
+        })
+        count = int(run_count or 0)
+        profile["attempted_runs"] += count
+        if status == "succeeded":
+            profile["successful_runs"] += count
+        elif status == "failed":
+            profile["failed_runs"] += count
+        elif status == "cancelled":
+            profile["cancelled_runs"] += count
+        if last_finished_at and (
+            profile["last_finished_at"] is None or last_finished_at > profile["last_finished_at"]
+        ):
+            profile["last_finished_at"] = last_finished_at
+    ordered = sorted(profiles.values(), key=lambda item: (item["role_name"].lower(), item["name"].lower()))
+    total = len(ordered)
+    tested = sum(item["attempted_runs"] > 0 for item in ordered)
+    successful = sum(item["successful_runs"] > 0 for item in ordered)
+    return {
+        "profiles": ordered,
+        "summary": {
+            "configured_profiles": total,
+            "tested_profiles": tested,
+            "successful_profiles": successful,
+            "untested_profiles": total - tested,
+            "tested_coverage_percent": round((tested / total) * 100, 1) if total else 0,
+            "successful_coverage_percent": round((successful / total) * 100, 1) if total else 0,
+        },
+    }
+
+
 def available_report_adapters() -> list[str]:
     configured = load_adapters().get("adapters", {})
     return sorted(name for name in configured if name in RUNNER_IMPLEMENTED_TOOLS)
@@ -3285,6 +3324,31 @@ def get_project_adapter_coverage(project_id: UUID) -> dict:
         "project_id": project_id,
         **summarize_adapter_coverage(run_coverage, available_report_adapters()),
     }
+
+
+@app.get("/projects/{project_id}/role-coverage")
+def get_project_role_coverage(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT cp.id, cp.name, cp.role_name, cp.target_id, t.base_url,
+                       r.status, COUNT(r.id), MAX(r.finished_at)
+                FROM credential_profiles cp
+                JOIN targets t ON t.id = cp.target_id
+                LEFT JOIN runs r
+                  ON r.credential_profile_id = cp.id AND r.tool_id = 'playwright'
+                WHERE cp.project_id = %s
+                GROUP BY cp.id, cp.name, cp.role_name, cp.target_id, t.base_url, r.status
+                ORDER BY cp.role_name, cp.name, r.status
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+    return {"project_id": project_id, **summarize_role_coverage(rows)}
 
 
 @app.get("/projects/{project_id}/report.json")

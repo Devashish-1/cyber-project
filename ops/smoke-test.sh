@@ -22,8 +22,9 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.129' "$work_dir/dashboard.html"
+grep -q 'UI v0.130' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
+grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
@@ -72,6 +73,7 @@ jq -e '
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
+  and (.paths["/projects/{project_id}/role-coverage"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -167,6 +169,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/adapter-coverage" \
     > "$work_dir/adapter-coverage.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/role-coverage" \
+    > "$work_dir/role-coverage.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
@@ -196,6 +201,20 @@ if [ -n "$project_id" ]; then
     (.successful_adapters | type == "array") and
     (.unattempted_adapters | type == "array")
   ' "$work_dir/adapter-coverage.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.profiles | type == "array") and
+    (.summary.configured_profiles == (.profiles | length)) and
+    (.summary.tested_coverage_percent | type == "number") and
+    all(.profiles[];
+      (.name | type == "string") and
+      (.role_name | type == "string") and
+      (.attempted_runs | type == "number") and
+      (.successful_runs | type == "number") and
+      (has("username") | not) and
+      (has("password") | not)
+    )
+  ' "$work_dir/role-coverage.json" >/dev/null
   jq -e '
     .version == "2.1.0" and
     (.runs | type == "array") and
