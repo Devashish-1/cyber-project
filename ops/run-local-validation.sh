@@ -2,6 +2,8 @@
 set -euo pipefail
 
 cd /home/killswitch/security-platform
+tool_id="${1:-whatweb}"
+target_url="${2:-http://172.17.0.2/}"
 set -a
 # shellcheck disable=SC1091
 source ./.env
@@ -22,22 +24,26 @@ if [[ -z "$project_id" ]]; then
   exit 1
 fi
 
-target_id="$(api_get "/projects/$project_id/targets" | jq -r '.targets[] | select(.base_url == "http://172.17.0.2/") | .id' | head -n1)"
+target_id="$(api_get "/projects/$project_id/targets" | jq -r --arg url "$target_url" '.targets[] | select(.base_url == $url) | .id' | head -n1)"
 if [[ -z "$target_id" ]]; then
-  echo 'Authorized local HTTP lab target was not found' >&2
+  echo "Authorized local lab target was not found: $target_url" >&2
   exit 1
 fi
 
 adapter_json="$(api_get /adapters)"
-tool_id="$(jq -r '.adapters | to_entries[] | select(.value.profile == "observe") | select(.key == "whatweb") | .key' <<<"$adapter_json")"
-if [[ -z "$tool_id" ]]; then
-  echo 'WhatWeb observe adapter is unavailable' >&2
+profile="$(jq -r --arg tool "$tool_id" '.adapters[$tool].profile // empty' <<<"$adapter_json")"
+if [[ -z "$profile" ]]; then
+  echo "Adapter is unavailable: $tool_id" >&2
+  exit 1
+fi
+if [[ "$profile" != observe ]]; then
+  echo "Local validation only permits observe-profile adapters (got: $profile)" >&2
   exit 1
 fi
 
-payload="$(jq -nc --arg target "$target_id" --arg tool "$tool_id" '{target_id:$target,tool_id:$tool,profile:"observe",requested_by:"local-validation",approval_confirmed:true}')"
+payload="$(jq -nc --arg target "$target_id" --arg tool "$tool_id" --arg profile "$profile" '{target_id:$target,tool_id:$tool,profile:$profile,requested_by:"local-validation",approval_confirmed:true}')"
 run_id="$(api_post "/projects/$project_id/runs" "$payload" | jq -r .id)"
-echo "Queued local-only run: $run_id ($tool_id -> 172.17.0.2)"
+echo "Queued local-only run: $run_id ($tool_id -> $target_url)"
 
 status=queued
 for _ in $(seq 1 90); do
