@@ -87,6 +87,12 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertEqual(command[command.index("-T") + 1], minutes)
                 self.assertIn("-s", command)
 
+    def test_zap_profiles_bound_the_jvm_heap(self):
+        for tool_id in ("zap-passive", "zap-baseline", "zap-full"):
+            with self.subTest(tool_id=tool_id):
+                command = self.command_for(tool_id)
+                self.assertEqual(command[command.index("-z") + 1], "-Xmx2048m")
+
     def test_trivy_flushes_reports_before_readiness_marker(self):
         command = self.command_for("trivy")
         self.assertEqual(command[0], "-c")

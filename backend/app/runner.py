@@ -1287,6 +1287,7 @@ def build_command(
             "-T", "3",
             "-I",
             "-s",
+            "-z", "-Xmx2048m",
             "--autooff",
         ]
     if tool_id == "zap-baseline":
@@ -1299,6 +1300,7 @@ def build_command(
             "-T", "5",
             "-I",
             "-s",
+            "-z", "-Xmx2048m",
             "--autooff",
         ]
     if tool_id == "zap-full":
@@ -1311,6 +1313,7 @@ def build_command(
             "-T", "15",
             "-I",
             "-s",
+            "-z", "-Xmx2048m",
         ]
     raise ValueError(f"Runner does not implement adapter: {tool_id}")
 
@@ -5284,6 +5287,18 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         elif run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"}:
             write_tool_log(run_dir / "tool.log", logs)
+            if exit_code not in {0, 1, 2}:
+                diagnostic_parts = []
+                for diagnostic_path in ("/home/zap/.ZAP/zap.log", "/zap/wrk/zap.out"):
+                    try:
+                        diagnostic_parts.append(
+                            f"\n--- {diagnostic_path} ---\n".encode("utf-8")
+                            + read_container_file(container, diagnostic_path)
+                        )
+                    except (docker.errors.DockerException, OSError, RuntimeError):
+                        continue
+                if diagnostic_parts:
+                    write_tool_log(run_dir / "zap-internal.log", b"".join(diagnostic_parts))
             if exit_code in {0, 1, 2}:
                 capture_json_output(container, "/zap/wrk/report.json", output_file)
             else:
