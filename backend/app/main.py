@@ -270,7 +270,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.99.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.100.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2856,6 +2856,35 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
     ])
     return "\n".join(lines)
+
+
+@app.get("/projects/{project_id}/report-bundle.zip")
+def get_project_report_bundle(project_id: UUID, include_info: bool = True) -> Response:
+    json_response = get_project_json_report(project_id, include_info)
+    sarif_response = get_project_sarif_report(project_id, include_info)
+    files = {
+        "report.json": bytes(json_response.body),
+        "report.sarif": bytes(sarif_response.body),
+        "report.md": get_project_report(project_id, include_info).encode("utf-8"),
+    }
+    manifest = "".join(
+        f"{hashlib.sha256(content).hexdigest()}  {filename}\n"
+        for filename, content in sorted(files.items())
+    ).encode("ascii")
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, content in files.items():
+            archive.writestr(filename, content)
+        archive.writestr("manifest.sha256", manifest)
+    return Response(
+        content=bundle.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="security-platform-{project_id}-report-bundle.zip"'
+            )
+        },
+    )
 
 
 @app.get("/projects/{project_id}/audit-events")

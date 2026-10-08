@@ -28,7 +28,8 @@ jq -e '
   (.info.version | type == "string") and
   (.paths["/projects/{project_id}/report.json"] != null) and
   (.paths["/projects/{project_id}/report.sarif"] != null) and
-  (.paths["/projects/{project_id}/report.md"] != null)
+  (.paths["/projects/{project_id}/report.md"] != null) and
+  (.paths["/projects/{project_id}/report-bundle.zip"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
@@ -48,6 +49,9 @@ if [ -n "$project_id" ]; then
   curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.md?include_info=true" \
     > "$work_dir/report.md"
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/report-bundle.zip?include_info=true" \
+    > "$work_dir/report-bundle.zip"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-report/v1" and
     .project.id == $project_id and
@@ -58,6 +62,10 @@ if [ -n "$project_id" ]; then
   grep -q '^# Security assessment report' "$work_dir/report.md"
   test "$(jq -r '.summary.unique_findings' "$work_dir/report.json")" = \
     "$(jq -r '.unique_count' "$work_dir/findings.json")"
+  mkdir "$work_dir/bundle"
+  unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
+  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "4"
+  (cd "$work_dir/bundle" && sha256sum -c manifest.sha256 >/dev/null)
 fi
 
 sha256sum -c config/manifest.sha256 >/dev/null
