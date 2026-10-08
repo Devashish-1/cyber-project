@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.133' "$work_dir/dashboard.html"
+grep -q 'UI v0.134' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -76,6 +76,7 @@ jq -e '
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
   and (.paths["/projects/{project_id}/role-coverage"] != null)
   and (.paths["/projects/{project_id}/target-coverage"] != null)
+  and (.paths["/projects/{project_id}/source-coverage"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -177,6 +178,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/target-coverage" \
     > "$work_dir/target-coverage.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/source-coverage" \
+    > "$work_dir/source-coverage.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
@@ -245,6 +249,18 @@ if [ -n "$project_id" ]; then
       (.successful_coverage_percent | type == "number")
     )
   ' "$work_dir/target-coverage.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.available_adapters | type == "array") and
+    (.artifacts | type == "array") and
+    all(.artifacts[];
+      (.filename | type == "string") and
+      (.sha256 | type == "string") and
+      (.attempted_adapters | type == "array") and
+      (.successful_adapters | type == "array") and
+      (.unattempted_adapters | type == "array")
+    )
+  ' "$work_dir/source-coverage.json" >/dev/null
   jq -e '
     .version == "2.1.0" and
     (.runs | type == "array") and

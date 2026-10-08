@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.133.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.134.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3366,6 +3366,59 @@ def fetch_target_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
     return cursor.fetchall()
 
 
+def summarize_source_coverage(rows: list[tuple], available_adapters: list[str]) -> dict:
+    available = sorted(set(available_adapters))
+    available_set = set(available)
+    artifacts: dict[str, dict] = {}
+    for artifact_id, filename, sha256, tool_id, status, run_count, last_finished_at in rows:
+        key = str(artifact_id)
+        artifact = artifacts.setdefault(key, {
+            "id": artifact_id, "filename": filename, "sha256": sha256,
+            "attempted_adapters": set(), "successful_adapters": set(),
+            "run_count": 0, "last_finished_at": None,
+        })
+        if tool_id in available_set:
+            artifact["attempted_adapters"].add(tool_id)
+            if status == "succeeded" and int(run_count or 0) > 0:
+                artifact["successful_adapters"].add(tool_id)
+            artifact["run_count"] += int(run_count or 0)
+        if last_finished_at and (
+            artifact["last_finished_at"] is None or last_finished_at > artifact["last_finished_at"]
+        ):
+            artifact["last_finished_at"] = last_finished_at
+    total = len(available)
+    ordered = []
+    for artifact in sorted(artifacts.values(), key=lambda item: item["filename"].lower()):
+        attempted = sorted(artifact.pop("attempted_adapters"))
+        successful = sorted(artifact.pop("successful_adapters"))
+        ordered.append({
+            **artifact,
+            "available_adapter_count": total,
+            "attempted_adapters": attempted,
+            "successful_adapters": successful,
+            "unattempted_adapters": sorted(available_set - set(attempted)),
+            "attempted_coverage_percent": round((len(attempted) / total) * 100, 1) if total else 0,
+            "successful_coverage_percent": round((len(successful) / total) * 100, 1) if total else 0,
+        })
+    return {"available_adapters": available, "artifacts": ordered}
+
+
+def fetch_source_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
+    cursor.execute(
+        """
+        SELECT s.id, s.filename, s.sha256, r.tool_id, r.status,
+               COUNT(r.id), MAX(r.finished_at)
+        FROM source_artifacts s
+        LEFT JOIN runs r ON r.source_artifact_id = s.id
+        WHERE s.project_id = %s
+        GROUP BY s.id, s.filename, s.sha256, r.tool_id, r.status
+        ORDER BY s.filename, r.tool_id, r.status
+        """,
+        (project_id,),
+    )
+    return cursor.fetchall()
+
+
 def available_report_adapters(input_type: str | None = None) -> list[str]:
     configured = load_adapters().get("adapters", {})
     return sorted(
@@ -3411,6 +3464,20 @@ def get_project_target_coverage(project_id: UUID) -> dict:
     return {
         "project_id": project_id,
         **summarize_target_coverage(rows, available_report_adapters("target")),
+    }
+
+
+@app.get("/projects/{project_id}/source-coverage")
+def get_project_source_coverage(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            rows = fetch_source_coverage_rows(cursor, project_id)
+    return {
+        "project_id": project_id,
+        **summarize_source_coverage(rows, available_report_adapters("source")),
     }
 
 

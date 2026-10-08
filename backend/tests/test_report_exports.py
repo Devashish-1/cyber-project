@@ -8,6 +8,7 @@ from app.main import (
     build_defectdojo_report,
     summarize_adapter_coverage,
     summarize_role_coverage,
+    summarize_source_coverage,
     summarize_target_coverage,
 )
 
@@ -197,6 +198,33 @@ class TargetCoverageSummaryTests(unittest.TestCase):
         target = coverage["targets"][0]
         self.assertEqual(target["attempted_adapters"], [])
         self.assertEqual(target["run_count"], 0)
+
+
+class SourceCoverageSummaryTests(unittest.TestCase):
+    def test_keeps_coverage_separate_for_each_source_archive(self):
+        first = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        second = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        rows = [
+            (first, "app.zip", "1" * 64, "semgrep", "succeeded", 1, NOW),
+            (first, "app.zip", "1" * 64, "gitleaks", "failed", 1, NOW),
+            (second, "api.zip", "2" * 64, None, None, 0, None),
+        ]
+        coverage = summarize_source_coverage(rows, ["gitleaks", "semgrep"])
+        artifacts = {str(item["id"]): item for item in coverage["artifacts"]}
+        self.assertEqual(artifacts[str(first)]["attempted_adapters"], ["gitleaks", "semgrep"])
+        self.assertEqual(artifacts[str(first)]["successful_adapters"], ["semgrep"])
+        self.assertEqual(artifacts[str(first)]["successful_coverage_percent"], 50.0)
+        self.assertEqual(artifacts[str(second)]["attempted_adapters"], [])
+        self.assertEqual(artifacts[str(second)]["unattempted_adapters"], ["gitleaks", "semgrep"])
+
+    def test_ignores_target_only_adapters(self):
+        artifact_id = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        coverage = summarize_source_coverage([
+            (artifact_id, "source.zip", "3" * 64, "httpx", "succeeded", 1, NOW),
+        ], ["semgrep"])
+        artifact = coverage["artifacts"][0]
+        self.assertEqual(artifact["attempted_adapters"], [])
+        self.assertEqual(artifact["run_count"], 0)
 
 
 if __name__ == "__main__":
