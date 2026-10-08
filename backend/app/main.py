@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.154.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.155.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -489,6 +489,11 @@ class CredentialProfileDelete(BaseModel):
 class ManualImportDelete(BaseModel):
     requested_by: str = Field(min_length=2, max_length=120)
     confirmation: str = Field(pattern="^DELETE MANUAL IMPORT$")
+
+
+class SourceArtifactDelete(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^DELETE SOURCE ARCHIVE$")
 
 
 class BatchCreate(BaseModel):
@@ -2057,6 +2062,94 @@ def list_source_artifacts(project_id: UUID) -> dict:
             }
             for row in rows
         ]
+    }
+
+
+@app.delete("/projects/{project_id}/source-artifacts/{artifact_id}")
+def delete_source_artifact(
+    project_id: UUID, artifact_id: UUID, payload: SourceArtifactDelete
+) -> dict:
+    artifact_root = SOURCE_ROOT / str(artifact_id)
+    quarantine_root = SOURCE_ROOT / f".delete-{artifact_id}-{uuid4()}"
+    moved_to_quarantine = False
+    artifact = None
+    try:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT filename, sha256, file_count
+                    FROM source_artifacts
+                    WHERE id = %s AND project_id = %s
+                    FOR UPDATE
+                    """,
+                    (artifact_id, project_id),
+                )
+                artifact = cursor.fetchone()
+                if artifact is None:
+                    raise HTTPException(status_code=404, detail="Source archive not found")
+                cursor.execute(
+                    "SELECT COUNT(*) FROM runs WHERE source_artifact_id = %s",
+                    (artifact_id,),
+                )
+                run_count = int(cursor.fetchone()[0])
+                if run_count:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Source archive has run history and cannot be deleted without "
+                            "destroying assessment provenance"
+                        ),
+                    )
+                if artifact_root.is_symlink():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Source archive storage path is not a managed directory",
+                    )
+                if artifact_root.exists():
+                    if not artifact_root.is_dir():
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Source archive storage path is not a managed directory",
+                        )
+                    artifact_root.rename(quarantine_root)
+                    moved_to_quarantine = True
+                cursor.execute(
+                    "DELETE FROM source_artifacts WHERE id = %s AND project_id = %s",
+                    (artifact_id, project_id),
+                )
+                record_audit(
+                    cursor, project_id, "source_artifact.deleted", payload.requested_by,
+                    "source_artifact", artifact_id,
+                    {
+                        "filename": artifact[0], "sha256": artifact[1],
+                        "file_count": artifact[2], "run_count": 0,
+                        "source_content_quarantined": moved_to_quarantine,
+                    },
+                )
+    except Exception:
+        if moved_to_quarantine and quarantine_root.exists() and not artifact_root.exists():
+            quarantine_root.rename(artifact_root)
+        raise
+
+    storage_cleanup_complete = True
+    if moved_to_quarantine:
+        try:
+            shutil.rmtree(quarantine_root)
+        except OSError:
+            storage_cleanup_complete = False
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    record_audit(
+                        cursor, project_id, "source_artifact.cleanup_failed",
+                        payload.requested_by, "source_artifact", artifact_id,
+                        {"operator_cleanup_required": True},
+                    )
+    return {
+        "id": artifact_id,
+        "status": "deleted",
+        "deleted_file_count": int(artifact[2]),
+        "storage_cleanup_complete": storage_cleanup_complete,
     }
 
 

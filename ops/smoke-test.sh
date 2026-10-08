@@ -55,6 +55,8 @@ grep -q 'Import sanitized findings' "$work_dir/dashboard.html"
 grep -q 'raw HTTP requests, responses, cookies, and credentials are discarded' "$work_dir/dashboard.html"
 grep -q 'manualImport' "$work_dir/dashboard.html"
 grep -q 'Manual retest required' "$work_dir/dashboard.html"
+grep -q 'DELETE SOURCE ARCHIVE' "$work_dir/dashboard.html"
+grep -q 'deleteSourceArtifact' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -102,6 +104,7 @@ jq -e '
   and (.paths["/projects/{project_id}/coverage-gaps.json"] != null)
   and (.paths["/projects/{project_id}/imports/burp"].get != null)
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
+  and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -389,7 +392,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.154.0" and
+    .platform_version == "0.155.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
