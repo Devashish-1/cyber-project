@@ -6,6 +6,8 @@ from uuid import UUID
 
 from app.main import (
     ManualImportDelete,
+    ProjectArchive,
+    ProjectRestore,
     SourceArtifactDelete,
     TargetDelete,
     SUPERVISED_ADAPTER_EXECUTION_MODES,
@@ -75,6 +77,22 @@ class TargetDeleteTests(unittest.TestCase):
     def test_rejects_ambiguous_confirmation(self):
         with self.assertRaises(ValidationError):
             TargetDelete(requested_by="operator", confirmation="delete target")
+
+
+class ProjectArchiveTests(unittest.TestCase):
+    def test_requires_exact_archive_confirmation(self):
+        request = ProjectArchive(
+            requested_by="operator", confirmation="ARCHIVE PROJECT"
+        )
+        self.assertEqual(request.confirmation, "ARCHIVE PROJECT")
+
+    def test_rejects_ambiguous_archive_confirmation(self):
+        with self.assertRaises(ValidationError):
+            ProjectArchive(requested_by="operator", confirmation="archive")
+
+    def test_restore_records_an_operator(self):
+        request = ProjectRestore(requested_by="operator")
+        self.assertEqual(request.requested_by, "operator")
 
 
 class CoverageClassificationTests(unittest.TestCase):

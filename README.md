@@ -7,7 +7,7 @@ The dashboard is bound to server localhost and is intended to be reached through
 ## Current capabilities
 
 - FastAPI control plane, PostgreSQL, Redis, and a multi-view web dashboard.
-- Projects, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
+- Projects with reversible read-only archival, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
 - 74 catalogued tools with 45 supervised adapters; adapter images are pinned by digest.
 - Observe, controlled-active, extended-active, and source-assisted execution profiles.
 - Reviewed single-tool runs and ordered workflow templates with cancellation and emergency stop.

@@ -126,6 +126,8 @@ def init_database() -> None:
                     description TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS archived_by TEXT;
                 CREATE TABLE IF NOT EXISTS targets (
                     id UUID PRIMARY KEY,
                     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -308,7 +310,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.156.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.157.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -354,6 +356,15 @@ def session(request: Request) -> dict:
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     description: str = Field(default="", max_length=1000)
+
+
+class ProjectArchive(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^ARCHIVE PROJECT$")
+
+
+class ProjectRestore(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
 
 
 class TargetCreate(BaseModel):
@@ -1860,9 +1871,7 @@ def create_workflow_template(project_id: UUID, payload: WorkflowTemplateCreate) 
     try:
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
-                if cursor.fetchone() is None:
-                    raise HTTPException(status_code=404, detail="Project not found")
+                require_project_active(cursor, project_id)
                 cursor.execute(
                     """
                     INSERT INTO workflow_templates (id, project_id, name, tool_ids, created_by)
@@ -1884,17 +1893,34 @@ def delete_workflow_template(template_id: UUID, payload: WorkflowTemplateDelete)
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM workflow_templates WHERE id = %s RETURNING project_id, name, tool_ids",
+                "SELECT project_id, name, tool_ids FROM workflow_templates WHERE id = %s FOR UPDATE",
                 (template_id,),
             )
             deleted = cursor.fetchone()
             if deleted is None:
                 raise HTTPException(status_code=404, detail="Workflow template not found")
+            require_project_active(cursor, deleted[0])
+            cursor.execute("DELETE FROM workflow_templates WHERE id = %s", (template_id,))
             record_audit(
                 cursor, deleted[0], "workflow_template.deleted", payload.requested_by,
                 "workflow_template", template_id, {"name": deleted[1], "tools": deleted[2]},
             )
     return {"id": template_id, "deleted": True}
+
+
+def require_project_active(cursor, project_id: UUID) -> None:
+    cursor.execute(
+        "SELECT archived_at FROM projects WHERE id = %s FOR SHARE",
+        (project_id,),
+    )
+    project = cursor.fetchone()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project[0] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Project is archived and read-only; restore it before making changes",
+        )
 
 
 @app.post("/projects", status_code=201)
@@ -1911,17 +1937,98 @@ def create_project(payload: ProjectCreate) -> dict:
 
 
 @app.get("/projects")
-def list_projects() -> dict:
+def list_projects(include_archived: bool = False) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id, name, description, created_at FROM projects ORDER BY created_at DESC")
+            cursor.execute(
+                """
+                SELECT id, name, description, created_at, archived_at, archived_by
+                FROM projects
+                WHERE archived_at IS NULL OR %s
+                ORDER BY archived_at NULLS FIRST, created_at DESC
+                """,
+                (include_archived,),
+            )
             rows = cursor.fetchall()
     return {
         "projects": [
-            {"id": row[0], "name": row[1], "description": row[2], "created_at": row[3]}
+            {
+                "id": row[0], "name": row[1], "description": row[2],
+                "created_at": row[3], "archived_at": row[4], "archived_by": row[5],
+            }
             for row in rows
         ]
     }
+
+
+@app.post("/projects/{project_id}/archive")
+def archive_project(project_id: UUID, payload: ProjectArchive) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT name, archived_at FROM projects WHERE id = %s FOR UPDATE",
+                (project_id,),
+            )
+            project = cursor.fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            if project[1] is not None:
+                raise HTTPException(status_code=409, detail="Project is already archived")
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM runs
+                WHERE project_id = %s AND status IN ('queued', 'running', 'cancelling')
+                """,
+                (project_id,),
+            )
+            active_run_count = int(cursor.fetchone()[0])
+            if active_run_count:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Project cannot be archived while runs are queued, running, or cancelling",
+                )
+            cursor.execute(
+                """
+                UPDATE projects SET archived_at = NOW(), archived_by = %s
+                WHERE id = %s RETURNING archived_at
+                """,
+                (payload.requested_by, project_id),
+            )
+            archived_at = cursor.fetchone()[0]
+            record_audit(
+                cursor, project_id, "project.archived", payload.requested_by,
+                "project", project_id,
+                {"name": project[0], "active_run_count": active_run_count},
+            )
+    return {
+        "id": project_id, "status": "archived", "archived_at": archived_at,
+        "archived_by": payload.requested_by,
+    }
+
+
+@app.post("/projects/{project_id}/restore")
+def restore_project(project_id: UUID, payload: ProjectRestore) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE projects SET archived_at = NULL, archived_by = NULL
+                WHERE id = %s AND archived_at IS NOT NULL
+                RETURNING name
+                """,
+                (project_id,),
+            )
+            project = cursor.fetchone()
+            if project is None:
+                cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                raise HTTPException(status_code=409, detail="Project is not archived")
+            record_audit(
+                cursor, project_id, "project.restored", payload.requested_by,
+                "project", project_id, {"name": project[0]},
+            )
+    return {"id": project_id, "status": "active"}
 
 
 @app.post("/projects/{project_id}/source-artifacts", status_code=201)
@@ -1944,9 +2051,7 @@ async def upload_source_artifact(
 
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
-            if cursor.fetchone() is None:
-                raise HTTPException(status_code=404, detail="Project not found")
+            require_project_active(cursor, project_id)
 
     artifact_id = uuid4()
     artifact_root = SOURCE_ROOT / str(artifact_id)
@@ -2004,6 +2109,7 @@ async def upload_source_artifact(
 
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
+                require_project_active(cursor, project_id)
                 cursor.execute(
                     """
                     INSERT INTO source_artifacts
@@ -2081,6 +2187,7 @@ def delete_source_artifact(
     try:
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
+                require_project_active(cursor, project_id)
                 cursor.execute(
                     """
                     SELECT filename, sha256, file_count
@@ -2169,6 +2276,9 @@ async def import_burp_findings(
 ) -> dict:
     if not authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit Burp import authorization is required")
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
     try:
         filename = normalize_upload_filename(report.filename)
     except ValueError as exc:
@@ -2183,6 +2293,7 @@ async def import_burp_findings(
 
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 SELECT base_url, allowed_hosts, excluded_paths, authorization_confirmed
@@ -2312,6 +2423,7 @@ def list_burp_imports(project_id: UUID) -> dict:
 def delete_burp_import(project_id: UUID, run_id: UUID, payload: ManualImportDelete) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 SELECT target_id, requested_by, created_at
@@ -2356,9 +2468,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
     target_id = uuid4()
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
-            if cursor.fetchone() is None:
-                raise HTTPException(status_code=404, detail="Project not found")
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 INSERT INTO targets
@@ -2447,6 +2557,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
     updated_base_url = str(payload.base_url)
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
@@ -2566,6 +2677,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
 def delete_target(project_id: UUID, target_id: UUID, payload: TargetDelete) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 SELECT base_url, authorization_reference
@@ -2645,6 +2757,7 @@ def create_credential_profile(project_id: UUID, payload: CredentialProfileCreate
     try:
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
+                require_project_active(cursor, project_id)
                 cursor.execute(
                     """
                     SELECT base_url, allowed_hosts, excluded_paths, authorization_confirmed
@@ -2721,6 +2834,7 @@ def delete_credential_profile(profile_id: UUID, payload: CredentialProfileDelete
             profile = cursor.fetchone()
             if profile is None:
                 raise HTTPException(status_code=404, detail="Credential profile not found")
+            require_project_active(cursor, profile[0])
             cursor.execute("SELECT COUNT(*) FROM runs WHERE credential_profile_id = %s", (profile_id,))
             if cursor.fetchone()[0]:
                 raise HTTPException(status_code=409, detail="Credential profile is referenced by run history and cannot be deleted")
@@ -2772,6 +2886,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
     credential_role = None
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             if input_type == "source":
                 cursor.execute(
                     "SELECT authorization_confirmed FROM source_artifacts WHERE id = %s AND project_id = %s",
@@ -2879,6 +2994,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     run_ids = [uuid4() for _ in tool_ids]
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
             cursor.execute(
                 """
                 SELECT authorization_confirmed, testing_window_start_minute_utc,
@@ -4753,6 +4869,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             if origin is None:
                 raise HTTPException(status_code=404, detail="Observation not found")
             project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile, input_authorized = origin
+            require_project_active(cursor, project_id)
             registry_tool = load_registry().get("tools", {}).get(tool_id)
             adapter = load_adapters().get("adapters", {}).get(tool_id)
             if not input_authorized:
@@ -4838,6 +4955,18 @@ def apply_project_fingerprint_review(
 def review_observation(observation_id: UUID, payload: ObservationReview) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT r.project_id FROM observations o
+                JOIN runs r ON r.id = o.run_id
+                WHERE o.id = %s
+                """,
+                (observation_id,),
+            )
+            origin = cursor.fetchone()
+            if origin is None:
+                raise HTTPException(status_code=404, detail="Observation not found")
+            require_project_active(cursor, origin[0])
             result = apply_project_fingerprint_review(
                 cursor, observation_id, payload.status, payload.notes, payload.reviewed_by
             )

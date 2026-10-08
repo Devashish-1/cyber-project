@@ -20,6 +20,7 @@ smoke_source_project_id=""
 smoke_source_artifact_id=""
 smoke_target_project_id=""
 smoke_target_id=""
+smoke_archived_project_id=""
 cleanup_smoke_test() {
   if [ -n "$smoke_source_project_id" ] && [ -n "$smoke_source_artifact_id" ]; then
     curl --config "$curl_config" --no-fail -sS -o /dev/null \
@@ -33,6 +34,12 @@ cleanup_smoke_test() {
       "$base_url/projects/$smoke_target_project_id/targets/$smoke_target_id" \
       -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE AUTHORIZED TARGET"}' || true
   fi
+  if [ -n "$smoke_archived_project_id" ]; then
+    curl --config "$curl_config" --no-fail -sS -o /dev/null \
+      -H 'Content-Type: application/json' -X POST \
+      "$base_url/projects/$smoke_archived_project_id/restore" \
+      -d '{"requested_by":"smoke-cleanup"}' || true
+  fi
   rm -rf "$work_dir"
 }
 trap cleanup_smoke_test EXIT
@@ -41,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.156' "$work_dir/dashboard.html"
+grep -q 'UI v0.157' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -78,6 +85,9 @@ grep -q 'DELETE SOURCE ARCHIVE' "$work_dir/dashboard.html"
 grep -q 'deleteSourceArtifact' "$work_dir/dashboard.html"
 grep -q 'DELETE AUTHORIZED TARGET' "$work_dir/dashboard.html"
 grep -q 'deleteTarget' "$work_dir/dashboard.html"
+grep -q 'ARCHIVE PROJECT' "$work_dir/dashboard.html"
+grep -q 'archiveProject' "$work_dir/dashboard.html"
+grep -q 'restoreProject' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -127,6 +137,8 @@ jq -e '
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
   and (.paths["/projects/{project_id}/targets/{target_id}"].delete != null)
+  and (.paths["/projects/{project_id}/archive"].post != null)
+  and (.paths["/projects/{project_id}/restore"].post != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -140,7 +152,12 @@ jq -e '
 ' "$work_dir/deployment-security.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
-jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null
+jq -e '(.projects | type == "array") and all(.projects[]; .archived_at == null and .archived_by == null)' "$work_dir/projects.json" >/dev/null
+curl --config "$curl_config" "$base_url/projects?include_archived=true" > "$work_dir/projects-all.json"
+jq -e '
+  (.projects | type == "array") and
+  all(.projects[]; has("archived_at") and has("archived_by"))
+' "$work_dir/projects-all.json" >/dev/null
 curl --config "$curl_config" "$base_url/coverage" > "$work_dir/coverage.json"
 jq -e '
   .totals.implemented > 0 and
@@ -206,6 +223,48 @@ for kind in report sbom checksums; do
 done
 (cd "$work_dir/image-audit" && sha256sum -c "$(jq -r '.checksums.filename' ../image-audit.json)" >/dev/null)
 project_id="$(jq -r '.projects[0].id // empty' "$work_dir/projects.json")"
+
+lifecycle_project_id="$(jq -r '.projects[] | select(.name == "Platform Lifecycle Validation") | .id' "$work_dir/projects-all.json" | head -n1)"
+if [ -z "$lifecycle_project_id" ]; then
+  lifecycle_project_id="$(curl --config "$curl_config" \
+    -H 'Content-Type: application/json' -X POST "$base_url/projects" \
+    -d '{"name":"Platform Lifecycle Validation","description":"Disposable local control-plane lifecycle fixture; never used for target scanning."}' \
+    | jq -er '.id')"
+fi
+smoke_archived_project_id="$lifecycle_project_id"
+curl --config "$curl_config" -H 'Content-Type: application/json' -X POST \
+  "$base_url/projects/$lifecycle_project_id/archive" \
+  -d '{"requested_by":"smoke-project-archive","confirmation":"ARCHIVE PROJECT"}' \
+  > "$work_dir/project-archive.json"
+jq -e --arg project_id "$lifecycle_project_id" '
+  .id == $project_id and .status == "archived" and
+  (.archived_at | type == "string") and .archived_by == "smoke-project-archive"
+' "$work_dir/project-archive.json" >/dev/null
+curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects-active-after-archive.json"
+jq -e --arg project_id "$lifecycle_project_id" '
+  all(.projects[]; (.id | tostring) != $project_id)
+' "$work_dir/projects-active-after-archive.json" >/dev/null
+archived_write_status="$(curl --config "$curl_config" --no-fail -sS \
+  -o "$work_dir/archived-write-denied.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -X POST \
+  "$base_url/projects/$lifecycle_project_id/targets" \
+  -d '{"base_url":"http://127.0.0.1:65534/","allowed_hosts":["127.0.0.1"],"authorization_reference":"must-be-blocked","authorization_confirmed":true}')"
+test "$archived_write_status" = "409"
+jq -e '.detail | contains("archived and read-only")' "$work_dir/archived-write-denied.json" >/dev/null
+curl --config "$curl_config" -H 'Content-Type: application/json' -X POST \
+  "$base_url/projects/$lifecycle_project_id/restore" \
+  -d '{"requested_by":"smoke-project-restore"}' \
+  > "$work_dir/project-restore.json"
+jq -e --arg project_id "$lifecycle_project_id" '
+  .id == $project_id and .status == "active"
+' "$work_dir/project-restore.json" >/dev/null
+curl --config "$curl_config" "$base_url/projects/$lifecycle_project_id/audit-events" \
+  > "$work_dir/project-lifecycle-audit.json"
+jq -e --arg project_id "$lifecycle_project_id" '
+  any(.events[]; .event_type == "project.archived" and .actor == "smoke-project-archive" and (.object_id | tostring) == $project_id) and
+  any(.events[]; .event_type == "project.restored" and .actor == "smoke-project-restore" and (.object_id | tostring) == $project_id)
+' "$work_dir/project-lifecycle-audit.json" >/dev/null
+smoke_archived_project_id=""
 
 if [ -n "$project_id" ]; then
   smoke_source_project_id="$project_id"
@@ -500,7 +559,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.156.0" and
+    .platform_version == "0.157.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
