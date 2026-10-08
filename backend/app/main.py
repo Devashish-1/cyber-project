@@ -298,7 +298,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.122.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.123.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
