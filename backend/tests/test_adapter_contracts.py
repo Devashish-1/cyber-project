@@ -2,7 +2,7 @@ import unittest
 
 import yaml
 
-from app.runner import ADAPTERS_PATH, build_command
+from app.runner import ADAPTERS_PATH, FFUF_WORDLIST_RUNNER_PATH, build_command
 
 
 BASE_URL = "https://authorized.example.test/?id=1"
@@ -81,6 +81,32 @@ class AdapterContractTests(unittest.TestCase):
             with self.subTest(tool_id=tool_id):
                 command = self.command_for(tool_id)
                 self.assertEqual(command[command.index(flag) + 1], maximum)
+
+    def test_content_discovery_rejects_excluded_wordlist_routes(self):
+        candidate = next(
+            line.strip().lstrip("/")
+            for line in FFUF_WORDLIST_RUNNER_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        for tool_id in ("ffuf", "gobuster", "feroxbuster"):
+            with self.subTest(tool_id=tool_id, excluded=candidate):
+                with self.assertRaisesRegex(ValueError, "intersects excluded path"):
+                    build_command(
+                        tool_id,
+                        BASE_URL,
+                        self.adapters[tool_id],
+                        excluded_paths=[f"/{candidate}"],
+                        dns_resolver="1.1.1.1:53",
+                    )
+
+    def test_schemathesis_receives_every_excluded_path(self):
+        command = self.command_for("schemathesis")
+        exclusions = [
+            command[index + 1]
+            for index, value in enumerate(command[:-1])
+            if value == "--exclude-path"
+        ]
+        self.assertEqual(exclusions, ["/logout", "/payments"])
 
 
 if __name__ == "__main__":
