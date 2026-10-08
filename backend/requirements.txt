@@ -4,5 +4,10 @@ redis==8.1.0
 psycopg[binary]==3.3.6
 PyYAML==6.0.3
 docker==7.1.0
-python-multipart==0.0.22
+python-multipart==0.0.30
 cryptography==50.0.2
+msgpack==1.2.1
+jaraco.context==6.1.0
+setuptools==84.0.0
+urllib3==2.8.0
+wheel==0.46.2
