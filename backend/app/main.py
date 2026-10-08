@@ -59,6 +59,10 @@ VALIDATION_STATUS_PATH = Path(os.getenv(
     "VALIDATION_STATUS_PATH",
     "/validation/local-validation-suite.json",
 ))
+SOURCE_VALIDATION_STATUS_PATH = Path(os.getenv(
+    "SOURCE_VALIDATION_STATUS_PATH",
+    "/validation/local-source-validation.json",
+))
 MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
@@ -282,7 +286,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.111.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.112.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1079,6 +1083,42 @@ def local_validation_status() -> dict:
         "mode": payload["mode"],
         "status": payload["status"],
         "age_seconds": age_seconds,
+    }
+
+
+@app.get("/local-source-validation-status")
+def local_source_validation_status() -> dict:
+    path = SOURCE_VALIDATION_STATUS_PATH
+    if not path.is_file() or path.is_symlink():
+        return {"available": False, "detail": "No local source validation result is available"}
+    if path.stat().st_size > 16 * 1024:
+        raise HTTPException(status_code=413, detail="Local source validation status exceeds the read limit")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="Local source validation status is unreadable") from exc
+    required = {"started_at", "finished_at", "mode", "status", "completed_tools", "total_observations"}
+    if (
+        not required.issubset(payload)
+        or payload["mode"] not in {"quick", "full"}
+        or payload["status"] not in {"running", "passed", "failed"}
+        or (payload["status"] == "running") != (payload["finished_at"] is None)
+        or not isinstance(payload["completed_tools"], int)
+        or not isinstance(payload["total_observations"], int)
+        or payload["completed_tools"] < 0
+        or payload["total_observations"] < 0
+    ):
+        raise HTTPException(status_code=503, detail="Local source validation status has an invalid schema")
+    try:
+        reference_at = datetime.fromisoformat(
+            str(payload["finished_at"] or payload["started_at"]).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Local source validation timestamp is invalid") from exc
+    return {
+        "available": True,
+        **{key: payload[key] for key in required},
+        "age_seconds": max(0, int((datetime.now(timezone.utc) - reference_at).total_seconds())),
     }
 
 

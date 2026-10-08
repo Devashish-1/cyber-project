@@ -29,6 +29,7 @@ curl --config "$curl_config" "$base_url/openapi.json" > "$work_dir/openapi.json"
 jq -e '
   (.info.version | type == "string") and
   (.paths["/local-validation-status"] != null) and
+  (.paths["/local-source-validation-status"] != null) and
   (.paths["/image-audit-status"] != null) and
   (.paths["/image-audit-history"] != null) and
   (.paths["/backup-status"] != null) and
@@ -50,6 +51,15 @@ jq -e '
   (.mode == "quick" or .mode == "full") and
   (.age_seconds | type == "number")
 ' "$work_dir/local-validation.json" >/dev/null
+curl --config "$curl_config" "$base_url/local-source-validation-status" > "$work_dir/local-source-validation.json"
+jq -e '
+  (.available == true) and
+  (.status == "running" or .status == "passed" or .status == "failed") and
+  (.mode == "quick" or .mode == "full") and
+  (.completed_tools | type == "number") and
+  (.total_observations | type == "number") and
+  (.age_seconds | type == "number")
+' "$work_dir/local-source-validation.json" >/dev/null
 curl --config "$curl_config" "$base_url/image-audit-status" > "$work_dir/image-audit.json"
 jq -e '
   (.available == true) and

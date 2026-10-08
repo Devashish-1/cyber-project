@@ -12,9 +12,36 @@ source ./.env
 set +a
 
 api=http://127.0.0.1:8080/api
+mkdir -p data/tmp logs/tools
+exec 8>data/tmp/local-source-validation.lock
+if ! flock -n 8; then
+  echo 'Another local source validation suite is already running' >&2
+  exit 1
+fi
+
 work_dir="$(mktemp -d data/tmp/source-validation.XXXXXX)"
 auth_file="$work_dir/curl.conf"
-trap 'rm -rf "$work_dir"' EXIT
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+status_file=data/tmp/local-source-validation.json
+suite_passed=false
+completed_tools=0
+total_observations=0
+write_status() {
+  local status="$1" finished_at="$2"
+  jq -nc --arg started "$started_at" --arg finished "$finished_at" --arg mode "$mode" \
+    --arg status "$status" --argjson tools "$completed_tools" --argjson observations "$total_observations" \
+    '{started_at:$started,finished_at:(if $finished=="" then null else $finished end),mode:$mode,status:$status,completed_tools:$tools,total_observations:$observations}' >"$status_file"
+  chmod 600 "$status_file"
+}
+finish_suite() {
+  local rc=$? status=failed
+  [[ "$suite_passed" == true ]] && status=passed
+  write_status "$status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  rm -rf "$work_dir"
+  return "$rc"
+}
+trap finish_suite EXIT
+write_status running ''
 chmod 700 "$work_dir"
 printf 'silent\nshow-error\nfail\nheader = "X-Control-Plane-Token: %s"\n' "$CONTROL_PLANE_TOKEN" >"$auth_file"
 chmod 600 "$auth_file"
@@ -90,7 +117,6 @@ if [[ -n "$tool_filter" ]]; then
   IFS=',' read -r -a tools <<<"$tool_filter"
 fi
 
-total_observations=0
 for tool_id in "${tools[@]}"; do
   payload="$(jq -nc --arg source "$artifact_id" --arg tool "$tool_id" '{source_artifact_id:$source,tool_id:$tool,profile:"source-assisted",requested_by:"local-source-validation",approval_confirmed:true}')"
   run_id="$(api_post "/projects/$project_id/runs" "$payload" | jq -r .id)"
@@ -108,6 +134,8 @@ for tool_id in "${tools[@]}"; do
   fi
   observations="$(api_get "/runs/$run_id/observations" | jq '.observations | length')"
   total_observations=$((total_observations + observations))
+  completed_tools=$((completed_tools + 1))
+  write_status running ''
   integrity="$(api_get "/projects/$project_id/evidence-integrity" | jq -r --arg run "$run_id" '.runs[] | select(.run_id == $run) | .integrity_status')"
   echo "$tool_id succeeded: observations=$observations integrity=$integrity"
   [[ "$integrity" == verified ]]
@@ -115,4 +143,5 @@ done
 
 echo "Source validation observations: $total_observations"
 [[ "$total_observations" -ge 1 ]]
+suite_passed=true
 echo "LOCAL SOURCE VALIDATION PASSED ($mode)"
