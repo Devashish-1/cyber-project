@@ -271,7 +271,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.101.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.102.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1087,6 +1087,32 @@ def image_audit_status() -> dict:
         "fixable_counts": fixable_counts,
         "total_vulnerabilities": len(vulnerabilities),
     }
+
+
+@app.get("/image-audit-artifacts/{artifact_kind}")
+def download_image_audit_artifact(artifact_kind: str) -> FileResponse:
+    artifact_suffixes = {
+        "report": (".trivy.json", "application/json"),
+        "sbom": (".sbom.json", "application/vnd.cyclonedx+json"),
+        "checksums": (".sha256", "text/plain"),
+    }
+    if artifact_kind not in artifact_suffixes:
+        raise HTTPException(status_code=404, detail="Unknown image audit artifact")
+    reports = [
+        path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json") if path.is_file()
+    ]
+    if not reports:
+        raise HTTPException(status_code=404, detail="No container image audit is available")
+    latest = max(reports, key=lambda path: path.stat().st_mtime)
+    suffix, media_type = artifact_suffixes[artifact_kind]
+    prefix = latest.name.removesuffix(".trivy.json")
+    artifact = (IMAGE_AUDIT_ROOT / f"{prefix}{suffix}").resolve()
+    audit_root = IMAGE_AUDIT_ROOT.resolve()
+    if artifact.parent != audit_root or not artifact.is_file():
+        raise HTTPException(status_code=404, detail="Image audit artifact is not available")
+    if artifact.stat().st_size > 64 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image audit artifact exceeds the download limit")
+    return FileResponse(artifact, media_type=media_type, filename=artifact.name)
 
 
 @app.get("/run-plans")
