@@ -93,6 +93,11 @@ class AdapterContractTests(unittest.TestCase):
                 command = self.command_for(tool_id)
                 self.assertEqual(command[command.index("-z") + 1], "-Xmx2048m")
 
+    def test_subfinder_requires_separate_third_party_opt_in(self):
+        adapter = self.adapters["subfinder"]
+        self.assertTrue(adapter.get("uses_third_party_services"))
+        self.assertIn("explicit-third-party-provider-opt-in", adapter.get("controls", []))
+
     def test_trivy_flushes_reports_before_readiness_marker(self):
         command = self.command_for("trivy")
         self.assertEqual(command[0], "-c")

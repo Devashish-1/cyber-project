@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd /home/killswitch/security-platform
 mode="${1:-quick}"
-if [[ "$mode" != quick && "$mode" != full ]]; then
-  echo 'Usage: run-local-validation-suite.sh [quick|full]' >&2
+if [[ "$mode" != quick && "$mode" != full && "$mode" != exhaustive ]]; then
+  echo 'Usage: run-local-validation-suite.sh [quick|full|exhaustive]' >&2
   exit 2
 fi
 
@@ -49,9 +49,16 @@ docker compose ps --status running --services | grep -Fxq runner
 ./ops/run-local-validation.sh whatweb
 ./ops/run-local-cancellation-validation.sh
 
-if [[ "$mode" == full ]]; then
+if [[ "$mode" == full || "$mode" == exhaustive ]]; then
   ./ops/run-local-validation.sh testssl https://172.17.0.3:8443/
   ./ops/run-local-batch-validation.sh
+  ./ops/run-local-target-adapter-validation.sh 'arjun,dalfox,feroxbuster,ffuf,gobuster,katana,kiterunner,naabu,nikto,nmap,nuclei-reviewed,sqlmap-controlled,wapiti,zap-baseline,zap-full'
+  ./ops/run-local-remaining-adapter-validation.sh
+  echo 'Subfinder runtime proof intentionally omitted: it requires an authorized domain and third-party provider opt-in.'
+fi
+
+if [[ "$mode" == exhaustive ]]; then
+  ./ops/run-local-source-validation.sh
 fi
 
 suite_passed=true
