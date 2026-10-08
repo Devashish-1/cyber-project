@@ -31,6 +31,7 @@ tools:
   zap-passive: {category: dast, risk: low, availability: core, execution: adapter}
   zap-baseline: {category: dast, risk: medium, availability: core, execution: adapter}
   zap-full: {category: dast, risk: high, availability: core, execution: approval-gated}
+  burp-suite-community: {category: intercepting-proxy, risk: medium, availability: optional-desktop, execution: manual-desktop, official_url: "https://portswigger.net/burp/communitydownload", automation_note: "Official Community Edition is retained as an operator-controlled desktop proxy. It is not installed in the headless runner, does not receive platform credentials, and is never launched or automated by the control plane."}
   testssl: {category: tls, risk: low, availability: core, execution: adapter}
   nikto: {category: web-server, risk: medium, availability: core, execution: adapter}
   wapiti: {category: dast, risk: high, availability: optional, execution: approval-gated}

@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.144' "$work_dir/dashboard.html"
+grep -q 'UI v0.145' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -41,6 +41,7 @@ grep -q 'prepareCoverageGapRun' "$work_dir/dashboard.html"
 grep -q "el('run-approved').checked=false" "$work_dir/dashboard.html"
 grep -q 'Download coverage gaps' "$work_dir/dashboard.html"
 grep -q 'downloadCoverageGaps' "$work_dir/dashboard.html"
+grep -q 'Official project' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -117,7 +118,13 @@ jq -e '
 ' "$work_dir/coverage.json" >/dev/null
 jq -e '
   ([.non_adapter[] | select(.id == "defectdojo")][0].export_format == "generic-findings-json") and
-  ([.non_adapter[] | select(.id == "faraday")][0].export_format == "sarif-2.1.0")
+  ([.non_adapter[] | select(.id == "faraday")][0].export_format == "sarif-2.1.0") and
+  ([.non_adapter[] | select(.id == "burp-suite-community")][0] |
+    .execution == "manual-desktop" and
+    .availability == "optional-desktop" and
+    .official_url == "https://portswigger.net/burp/communitydownload" and
+    (.automation_note | contains("not installed in the headless runner"))) and
+  ([.validation[] | select(.id == "burp-suite-community")] | length) == 0
 ' "$work_dir/coverage.json" >/dev/null
 curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
 jq -e '
@@ -322,7 +329,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.144.0" and
+    .platform_version == "0.145.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
