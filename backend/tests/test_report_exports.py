@@ -7,6 +7,7 @@ from uuid import UUID
 from app.main import (
     ManualImportDelete,
     SourceArtifactDelete,
+    TargetDelete,
     SUPERVISED_ADAPTER_EXECUTION_MODES,
     build_audit_export,
     build_defectdojo_report,
@@ -62,6 +63,18 @@ class SourceArtifactDeleteTests(unittest.TestCase):
     def test_rejects_ambiguous_confirmation(self):
         with self.assertRaises(ValidationError):
             SourceArtifactDelete(requested_by="operator", confirmation="delete source")
+
+
+class TargetDeleteTests(unittest.TestCase):
+    def test_requires_exact_destructive_confirmation(self):
+        request = TargetDelete(
+            requested_by="operator", confirmation="DELETE AUTHORIZED TARGET"
+        )
+        self.assertEqual(request.confirmation, "DELETE AUTHORIZED TARGET")
+
+    def test_rejects_ambiguous_confirmation(self):
+        with self.assertRaises(ValidationError):
+            TargetDelete(requested_by="operator", confirmation="delete target")
 
 
 class CoverageClassificationTests(unittest.TestCase):

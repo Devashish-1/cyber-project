@@ -18,12 +18,20 @@ printf 'silent\nshow-error\nfail\nheader = "x-control-plane-token: %s"\n' \
   "$CONTROL_PLANE_TOKEN" > "$curl_config"
 smoke_source_project_id=""
 smoke_source_artifact_id=""
+smoke_target_project_id=""
+smoke_target_id=""
 cleanup_smoke_test() {
   if [ -n "$smoke_source_project_id" ] && [ -n "$smoke_source_artifact_id" ]; then
     curl --config "$curl_config" --no-fail -sS -o /dev/null \
       -H 'Content-Type: application/json' -X DELETE \
       "$base_url/projects/$smoke_source_project_id/source-artifacts/$smoke_source_artifact_id" \
       -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE SOURCE ARCHIVE"}' || true
+  fi
+  if [ -n "$smoke_target_project_id" ] && [ -n "$smoke_target_id" ]; then
+    curl --config "$curl_config" --no-fail -sS -o /dev/null \
+      -H 'Content-Type: application/json' -X DELETE \
+      "$base_url/projects/$smoke_target_project_id/targets/$smoke_target_id" \
+      -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE AUTHORIZED TARGET"}' || true
   fi
   rm -rf "$work_dir"
 }
@@ -33,7 +41,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.155' "$work_dir/dashboard.html"
+grep -q 'UI v0.156' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -68,6 +76,8 @@ grep -q 'manualImport' "$work_dir/dashboard.html"
 grep -q 'Manual retest required' "$work_dir/dashboard.html"
 grep -q 'DELETE SOURCE ARCHIVE' "$work_dir/dashboard.html"
 grep -q 'deleteSourceArtifact' "$work_dir/dashboard.html"
+grep -q 'DELETE AUTHORIZED TARGET' "$work_dir/dashboard.html"
+grep -q 'deleteTarget' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -116,6 +126,7 @@ jq -e '
   and (.paths["/projects/{project_id}/imports/burp"].get != null)
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
+  and (.paths["/projects/{project_id}/targets/{target_id}"].delete != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -242,6 +253,44 @@ PY
       .actor == "smoke-source-delete")
   ' "$work_dir/source-delete-audit.json" >/dev/null
   smoke_source_artifact_id=""
+
+  smoke_target_project_id="$project_id"
+  curl --config "$curl_config" \
+    -H 'Content-Type: application/json' -X POST \
+    "$base_url/projects/$project_id/targets" \
+    -d '{
+      "base_url":"http://127.0.0.1:65535/",
+      "allowed_hosts":["127.0.0.1"],
+      "excluded_paths":["/logout"],
+      "max_run_seconds":30,
+      "allow_state_changing":false,
+      "allow_third_party_services":false,
+      "authorization_reference":"local-disposable-smoke-fixture",
+      "authorization_confirmed":true
+    }' > "$work_dir/target-create.json"
+  smoke_target_id="$(jq -er '.id' "$work_dir/target-create.json")"
+  curl --config "$curl_config" \
+    -H 'Content-Type: application/json' -X DELETE \
+    "$base_url/projects/$project_id/targets/$smoke_target_id" \
+    -d '{"requested_by":"smoke-target-delete","confirmation":"DELETE AUTHORIZED TARGET"}' \
+    > "$work_dir/target-delete.json"
+  jq -e --arg target_id "$smoke_target_id" '
+    .id == $target_id and .status == "deleted"
+  ' "$work_dir/target-delete.json" >/dev/null
+  curl --config "$curl_config" "$base_url/projects/$project_id/targets" \
+    > "$work_dir/targets-after-delete.json"
+  jq -e --arg target_id "$smoke_target_id" '
+    all(.targets[]; (.id | tostring) != $target_id)
+  ' "$work_dir/targets-after-delete.json" >/dev/null
+  curl --config "$curl_config" "$base_url/projects/$project_id/audit-events" \
+    > "$work_dir/target-delete-audit.json"
+  jq -e --arg target_id "$smoke_target_id" '
+    any(.events[];
+      .event_type == "target.deleted" and
+      (.object_id | tostring) == $target_id and
+      .actor == "smoke-target-delete")
+  ' "$work_dir/target-delete-audit.json" >/dev/null
+  smoke_target_id=""
 fi
 
 local_project_id="$(jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' "$work_dir/projects.json" | head -n1)"
@@ -451,7 +500,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.155.0" and
+    .platform_version == "0.156.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and

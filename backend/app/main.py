@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.155.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.156.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -382,6 +382,11 @@ class TargetCreate(BaseModel):
 
 class TargetUpdate(TargetCreate):
     requested_by: str = Field(min_length=2, max_length=120)
+
+
+class TargetDelete(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^DELETE AUTHORIZED TARGET$")
 
 
 def testing_window_allows(
@@ -2555,6 +2560,57 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
         "dns_resolver": dns_resolver,
         "updated_by": payload.requested_by,
     }
+
+
+@app.delete("/projects/{project_id}/targets/{target_id}")
+def delete_target(project_id: UUID, target_id: UUID, payload: TargetDelete) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT base_url, authorization_reference
+                FROM targets
+                WHERE id = %s AND project_id = %s
+                FOR UPDATE
+                """,
+                (target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Target not found in project")
+            cursor.execute("SELECT COUNT(*) FROM runs WHERE target_id = %s", (target_id,))
+            run_count = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM run_batches WHERE target_id = %s", (target_id,))
+            batch_count = int(cursor.fetchone()[0])
+            cursor.execute(
+                "SELECT COUNT(*) FROM credential_profiles WHERE target_id = %s",
+                (target_id,),
+            )
+            credential_count = int(cursor.fetchone()[0])
+            if run_count or batch_count or credential_count:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Target has assessment history or credential profiles and cannot be "
+                        "deleted without destroying provenance or stored configuration"
+                    ),
+                )
+            cursor.execute(
+                "DELETE FROM targets WHERE id = %s AND project_id = %s",
+                (target_id, project_id),
+            )
+            record_audit(
+                cursor, project_id, "target.deleted", payload.requested_by,
+                "target", target_id,
+                {
+                    "base_url": target[0],
+                    "authorization_reference": target[1],
+                    "run_count": run_count,
+                    "batch_count": batch_count,
+                    "credential_profile_count": credential_count,
+                },
+            )
+    return {"id": target_id, "status": "deleted"}
 
 
 def credential_profile_response(row: tuple) -> dict:
