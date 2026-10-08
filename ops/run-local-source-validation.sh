@@ -49,7 +49,7 @@ api_get() { curl --config "$auth_file" "$api$1"; }
 api_post() { curl --config "$auth_file" -H 'Content-Type: application/json' -X POST "$api$1" -d "$2"; }
 
 fixture="$work_dir/fixture"
-mkdir -p "$fixture"
+mkdir -p "$fixture/app/controllers" "$fixture/config"
 cat >"$fixture/app.py" <<'PY'
 import subprocess
 
@@ -97,8 +97,33 @@ cat >"$fixture/package.json" <<'JSON'
 JSON
 printf '%s\n' 'django==2.2.0' >"$fixture/requirements.txt"
 printf '%s\n' 'fixture_aws_access_key = "AKIAIOSFODNN7EXAMPLE"' >"$fixture/example.txt"
+cat >"$fixture/Gemfile" <<'RUBY'
+source "https://rubygems.org"
+gem "rails", "7.1.5"
+RUBY
+cat >"$fixture/config/application.rb" <<'RUBY'
+require "rails"
+require "action_controller/railtie"
+class ValidationFixture < Rails::Application
+end
+RUBY
+cat >"$fixture/config/routes.rb" <<'RUBY'
+Rails.application.routes.draw do
+  get "/lookup", to: "lookup#show"
+end
+RUBY
+cat >"$fixture/app/controllers/lookup_controller.rb" <<'RUBY'
+class LookupController < ActionController::Base
+  def show
+    render html: params[:content].html_safe
+  end
+end
+RUBY
 chmod 700 "$fixture/check.sh"
 (cd "$fixture" && python3 -m zipfile -c ../source-validation.zip .)
+mkdir -p "$work_dir/codeql-fixture"
+cp "$fixture/app.py" "$work_dir/codeql-fixture/app.py"
+(cd "$work_dir/codeql-fixture" && python3 -m zipfile -c ../codeql-validation.zip .)
 
 project_id="$(api_get /projects | jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' | head -n1)"
 [[ -n "$project_id" ]]
@@ -108,17 +133,26 @@ artifact_id="$(curl --config "$auth_file" -X POST "$api/projects/$project_id/sou
   -F 'authorization_reference=locally-generated-validation-fixture' \
   -F 'authorization_confirmed=true' | jq -r .id)"
 echo "Uploaded authorized local source fixture: $artifact_id"
+codeql_artifact_id="$(curl --config "$auth_file" -X POST "$api/projects/$project_id/source-artifacts" \
+  -F "archive=@$work_dir/codeql-validation.zip;type=application/zip" \
+  -F 'requested_by=local-source-validation' \
+  -F 'authorization_reference=locally-generated-codeql-validation-fixture' \
+  -F 'authorization_confirmed=true' | jq -r .id)"
+echo "Uploaded Python-only CodeQL fixture: $codeql_artifact_id"
 
 tools=(semgrep bandit shellcheck hadolint njsscan checkov)
 if [[ "$mode" == full ]]; then
-  tools+=(gitleaks trufflehog trivy osv-scanner syft grype kics kubescape)
+  tools+=(brakeman codeql gitleaks trufflehog trivy osv-scanner syft grype kics kubescape)
 fi
 if [[ -n "$tool_filter" ]]; then
   IFS=',' read -r -a tools <<<"$tool_filter"
 fi
+expected_tools="${#tools[@]}"
 
 for tool_id in "${tools[@]}"; do
-  payload="$(jq -nc --arg source "$artifact_id" --arg tool "$tool_id" '{source_artifact_id:$source,tool_id:$tool,profile:"source-assisted",requested_by:"local-source-validation",approval_confirmed:true}')"
+  source_id="$artifact_id"
+  [[ "$tool_id" == codeql ]] && source_id="$codeql_artifact_id"
+  payload="$(jq -nc --arg source "$source_id" --arg tool "$tool_id" '{source_artifact_id:$source,tool_id:$tool,profile:"source-assisted",requested_by:"local-source-validation",approval_confirmed:true}')"
   run_id="$(api_post "/projects/$project_id/runs" "$payload" | jq -r .id)"
   echo "Queued $tool_id: $run_id"
   status=queued
@@ -142,6 +176,6 @@ for tool_id in "${tools[@]}"; do
 done
 
 echo "Source validation observations: $total_observations"
-[[ "$total_observations" -ge 1 ]]
+[[ "$completed_tools" -eq "$expected_tools" ]]
 suite_passed=true
 echo "LOCAL SOURCE VALIDATION PASSED ($mode)"
