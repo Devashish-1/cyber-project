@@ -7,6 +7,7 @@ from app.main import (
     build_audit_export,
     build_defectdojo_report,
     summarize_adapter_coverage,
+    summarize_coverage_gaps,
     summarize_role_coverage,
     summarize_source_coverage,
     summarize_target_coverage,
@@ -225,6 +226,38 @@ class SourceCoverageSummaryTests(unittest.TestCase):
         artifact = coverage["artifacts"][0]
         self.assertEqual(artifact["attempted_adapters"], [])
         self.assertEqual(artifact["run_count"], 0)
+
+
+class CoverageGapSummaryTests(unittest.TestCase):
+    def test_aggregates_asset_role_and_adapter_gaps(self):
+        result = summarize_coverage_gaps(
+            {"unattempted_adapters": ["testssl"], "attempted_without_success": ["nuclei-reviewed"]},
+            {"targets": [
+                {"id": "t1", "base_url": "https://a.test", "attempted_adapters": [], "successful_adapters": []},
+                {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": []},
+            ]},
+            {"artifacts": [
+                {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "attempted_adapters": [], "successful_adapters": []},
+            ]},
+            {"profiles": [
+                {"id": "r1", "name": "Admin", "role_name": "admin", "target": "https://a.test", "attempted_runs": 1, "successful_runs": 0},
+            ]},
+        )
+        self.assertEqual(result["status"], "gaps-present")
+        self.assertEqual(result["gap_count"], 6)
+        self.assertEqual(result["gaps"]["untested_targets"][0]["id"], "t1")
+        self.assertEqual(result["gaps"]["targets_without_success"][0]["id"], "t2")
+        self.assertEqual(result["gaps"]["untested_sources"][0]["filename"], "app.zip")
+        self.assertEqual(result["gaps"]["roles_without_success"][0]["role_name"], "admin")
+
+    def test_no_recorded_gaps_does_not_claim_security(self):
+        result = summarize_coverage_gaps(
+            {"unattempted_adapters": [], "attempted_without_success": []},
+            {"targets": []}, {"artifacts": []}, {"profiles": []},
+        )
+        self.assertEqual(result["status"], "no-recorded-gaps")
+        self.assertEqual(result["gap_count"], 0)
+        self.assertIn("does not prove", result["disclaimer"])
 
 
 if __name__ == "__main__":

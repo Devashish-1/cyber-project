@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.135' "$work_dir/dashboard.html"
+grep -q 'UI v0.136' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -35,6 +35,8 @@ grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
 grep -q 'Per-target coverage' "$work_dir/dashboard.html"
+grep -q 'Coverage gap rollup' "$work_dir/dashboard.html"
+grep -q 'project-coverage-gap-details' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -77,6 +79,7 @@ jq -e '
   and (.paths["/projects/{project_id}/role-coverage"] != null)
   and (.paths["/projects/{project_id}/target-coverage"] != null)
   and (.paths["/projects/{project_id}/source-coverage"] != null)
+  and (.paths["/projects/{project_id}/coverage-gaps"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -181,6 +184,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/source-coverage" \
     > "$work_dir/source-coverage.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/coverage-gaps" \
+    > "$work_dir/coverage-gaps.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
@@ -270,6 +276,20 @@ if [ -n "$project_id" ]; then
       (.unattempted_adapters | type == "array")
     )
   ' "$work_dir/source-coverage.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.status == "gaps-present" or .status == "no-recorded-gaps") and
+    (.gap_count | type == "number") and
+    (.gaps.unattempted_adapters | type == "array") and
+    (.gaps.attempted_without_success | type == "array") and
+    (.gaps.untested_targets | type == "array") and
+    (.gaps.targets_without_success | type == "array") and
+    (.gaps.untested_sources | type == "array") and
+    (.gaps.sources_without_success | type == "array") and
+    (.gaps.untested_roles | type == "array") and
+    (.gaps.roles_without_success | type == "array") and
+    (.disclaimer | contains("does not prove"))
+  ' "$work_dir/coverage-gaps.json" >/dev/null
   jq -e '
     .version == "2.1.0" and
     (.runs | type == "array") and

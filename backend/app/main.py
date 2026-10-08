@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.135.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.136.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3478,6 +3478,69 @@ def get_project_source_coverage(project_id: UUID) -> dict:
     return {
         "project_id": project_id,
         **summarize_source_coverage(rows, available_report_adapters("source")),
+    }
+
+
+def summarize_coverage_gaps(
+    adapter_coverage: dict,
+    target_coverage: dict,
+    source_coverage: dict,
+    role_coverage: dict,
+) -> dict:
+    gaps = {
+        "unattempted_adapters": list(adapter_coverage.get("unattempted_adapters", [])),
+        "attempted_without_success": list(adapter_coverage.get("attempted_without_success", [])),
+        "untested_targets": [
+            {"id": item["id"], "base_url": item["base_url"]}
+            for item in target_coverage.get("targets", []) if not item.get("attempted_adapters")
+        ],
+        "targets_without_success": [
+            {"id": item["id"], "base_url": item["base_url"]}
+            for item in target_coverage.get("targets", [])
+            if item.get("attempted_adapters") and not item.get("successful_adapters")
+        ],
+        "untested_sources": [
+            {"id": item["id"], "filename": item["filename"], "sha256": item["sha256"]}
+            for item in source_coverage.get("artifacts", []) if not item.get("attempted_adapters")
+        ],
+        "sources_without_success": [
+            {"id": item["id"], "filename": item["filename"], "sha256": item["sha256"]}
+            for item in source_coverage.get("artifacts", [])
+            if item.get("attempted_adapters") and not item.get("successful_adapters")
+        ],
+        "untested_roles": [
+            {"id": item["id"], "name": item["name"], "role_name": item["role_name"], "target": item["target"]}
+            for item in role_coverage.get("profiles", []) if not item.get("attempted_runs")
+        ],
+        "roles_without_success": [
+            {"id": item["id"], "name": item["name"], "role_name": item["role_name"], "target": item["target"]}
+            for item in role_coverage.get("profiles", [])
+            if item.get("attempted_runs") and not item.get("successful_runs")
+        ],
+    }
+    gap_count = sum(len(items) for items in gaps.values())
+    return {
+        "status": "gaps-present" if gap_count else "no-recorded-gaps",
+        "gap_count": gap_count,
+        "gaps": gaps,
+        "disclaimer": (
+            "No recorded gaps means only that every configured coverage item has qualifying run history; "
+            "it does not prove the assessed system is secure."
+        ),
+    }
+
+
+@app.get("/projects/{project_id}/coverage-gaps")
+def get_project_coverage_gaps(project_id: UUID) -> dict:
+    adapter_coverage = get_project_adapter_coverage(project_id)
+    target_coverage = get_project_target_coverage(project_id)
+    source_coverage = get_project_source_coverage(project_id)
+    role_coverage = get_project_role_coverage(project_id)
+    return {
+        "project_id": project_id,
+        **summarize_coverage_gaps(
+            adapter_coverage, target_coverage, source_coverage, role_coverage
+        ),
     }
 
 
