@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.143' "$work_dir/dashboard.html"
+grep -q 'UI v0.144' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -322,7 +322,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.143.0" and
+    .platform_version == "0.144.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
@@ -378,8 +378,9 @@ if [ -n "$project_id" ]; then
     "$work_dir/findings.json" >/dev/null
   mkdir "$work_dir/bundle"
   unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
-  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "6"
+  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "7"
   jq -e '.schema == "security-platform-audit/v1"' "$work_dir/bundle/audit-events.json" >/dev/null
+  jq -e '.schema == "security-platform-coverage-gaps/v1"' "$work_dir/bundle/coverage-gaps.json" >/dev/null
   jq -e '(.coverage.coverage_gaps.gap_count | type == "number")' "$work_dir/bundle/report.json" >/dev/null
   grep -q '^### Coverage gap rollup' "$work_dir/bundle/report.md"
   (cd "$work_dir/bundle" && sha256sum -c manifest.sha256 >/dev/null)

@@ -304,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.143.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.144.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -4154,8 +4154,10 @@ def get_project_report_bundle(project_id: UUID, include_info: bool = True) -> Re
     sarif_response = get_project_sarif_report(project_id, include_info)
     defectdojo_response = get_project_defectdojo_report(project_id, include_info)
     audit_response = get_project_audit_export(project_id)
+    coverage_gaps_response = get_project_coverage_gaps_export(project_id)
     files = {
         "audit-events.json": bytes(audit_response.body),
+        "coverage-gaps.json": bytes(coverage_gaps_response.body),
         "report.json": bytes(json_response.body),
         "report.sarif": bytes(sarif_response.body),
         "report.defectdojo.json": bytes(defectdojo_response.body),
