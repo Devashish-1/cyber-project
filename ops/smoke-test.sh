@@ -22,11 +22,12 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.123' "$work_dir/dashboard.html"
+grep -q 'UI v0.124' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
 grep -q "const mutatingActions=new Set" "$work_dir/dashboard.html"
+grep -q 'new MutationObserver' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
