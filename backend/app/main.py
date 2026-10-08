@@ -55,6 +55,10 @@ SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
 MAX_IMAGE_AUDIT_AGE_HOURS = int(os.getenv("MAX_IMAGE_AUDIT_AGE_HOURS", "168"))
 BACKUP_ROOT = Path(os.getenv("BACKUP_ROOT", "/backups"))
+VALIDATION_STATUS_PATH = Path(os.getenv(
+    "VALIDATION_STATUS_PATH",
+    "/validation/local-validation-suite.json",
+))
 MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
@@ -278,7 +282,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.108.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.109.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1040,6 +1044,34 @@ def coverage() -> dict:
             for name in pending_names
         ],
         "non_adapter": non_adapter,
+    }
+
+
+@app.get("/local-validation-status")
+def local_validation_status() -> dict:
+    if not VALIDATION_STATUS_PATH.is_file() or VALIDATION_STATUS_PATH.is_symlink():
+        return {"available": False, "detail": "No local validation suite result is available"}
+    if VALIDATION_STATUS_PATH.stat().st_size > 16 * 1024:
+        raise HTTPException(status_code=413, detail="Local validation status exceeds the read limit")
+    try:
+        payload = json.loads(VALIDATION_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="Local validation status is unreadable") from exc
+    required = {"started_at", "finished_at", "mode", "status"}
+    if not required.issubset(payload) or payload["mode"] not in {"quick", "full"} or payload["status"] != "passed":
+        raise HTTPException(status_code=503, detail="Local validation status has an invalid schema")
+    try:
+        finished_at = datetime.fromisoformat(str(payload["finished_at"]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Local validation timestamp is invalid") from exc
+    age_seconds = max(0, int((datetime.now(timezone.utc) - finished_at).total_seconds()))
+    return {
+        "available": True,
+        "started_at": payload["started_at"],
+        "finished_at": payload["finished_at"],
+        "mode": payload["mode"],
+        "status": payload["status"],
+        "age_seconds": age_seconds,
     }
 
 

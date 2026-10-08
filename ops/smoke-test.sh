@@ -28,6 +28,7 @@ test "$unauthenticated_status" = "401"
 curl --config "$curl_config" "$base_url/openapi.json" > "$work_dir/openapi.json"
 jq -e '
   (.info.version | type == "string") and
+  (.paths["/local-validation-status"] != null) and
   (.paths["/image-audit-status"] != null) and
   (.paths["/image-audit-history"] != null) and
   (.paths["/backup-status"] != null) and
@@ -42,6 +43,13 @@ curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
 jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null
 curl --config "$curl_config" "$base_url/coverage" > "$work_dir/coverage.json"
 jq -e '.totals.implemented > 0 and (.totals.immutable_images == .totals.implemented) and (.totals.floating_images == 0)' "$work_dir/coverage.json" >/dev/null
+curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
+jq -e '
+  (.available == true) and
+  (.status == "passed") and
+  (.mode == "quick" or .mode == "full") and
+  (.age_seconds | type == "number")
+' "$work_dir/local-validation.json" >/dev/null
 curl --config "$curl_config" "$base_url/image-audit-status" > "$work_dir/image-audit.json"
 jq -e '
   (.available == true) and

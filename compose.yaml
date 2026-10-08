@@ -47,6 +47,7 @@ services:
       SOURCE_ROOT: /sources
       IMAGE_AUDIT_ROOT: /image-audits
       BACKUP_ROOT: /backups
+      VALIDATION_STATUS_PATH: /validation/local-validation-suite.json
       MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-10737418240}
       MAX_STORAGE_USED_PERCENT: ${MAX_STORAGE_USED_PERCENT:-90}
       MAX_PENDING_RUNS: ${MAX_PENDING_RUNS:-100}
@@ -61,6 +62,7 @@ services:
       - ./data/sources:/sources
       - ./data/exports/image-audits:/image-audits:ro
       - ./backups:/backups:ro
+      - ./data/tmp:/validation:ro
     depends_on:
       postgres:
         condition: service_healthy
