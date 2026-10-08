@@ -33,6 +33,13 @@ REDIS_URL = os.environ["REDIS_URL"]
 CONTROL_PLANE_TOKEN = os.environ["CONTROL_PLANE_TOKEN"]
 if len(CONTROL_PLANE_TOKEN) < 32:
     raise RuntimeError("CONTROL_PLANE_TOKEN must contain at least 32 characters")
+CONTROL_PLANE_VIEWER_TOKEN = os.getenv("CONTROL_PLANE_VIEWER_TOKEN", "")
+if CONTROL_PLANE_VIEWER_TOKEN and len(CONTROL_PLANE_VIEWER_TOKEN) < 32:
+    raise RuntimeError("CONTROL_PLANE_VIEWER_TOKEN must contain at least 32 characters")
+if CONTROL_PLANE_VIEWER_TOKEN and secrets.compare_digest(
+    CONTROL_PLANE_VIEWER_TOKEN, CONTROL_PLANE_TOKEN
+):
+    raise RuntimeError("Operator and viewer control-plane tokens must differ")
 CREDENTIAL_ENCRYPTION_KEY = os.environ["CREDENTIAL_ENCRYPTION_KEY"].encode("ascii")
 try:
     CREDENTIAL_CIPHER = Fernet(CREDENTIAL_ENCRYPTION_KEY)
@@ -291,7 +298,23 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.121.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.122.0", lifespan=lifespan)
+
+
+def control_plane_role(supplied: str) -> str | None:
+    if supplied and secrets.compare_digest(supplied, CONTROL_PLANE_TOKEN):
+        return "operator"
+    if (
+        supplied
+        and CONTROL_PLANE_VIEWER_TOKEN
+        and secrets.compare_digest(supplied, CONTROL_PLANE_VIEWER_TOKEN)
+    ):
+        return "viewer"
+    return None
+
+
+def control_plane_role_allows(role: str, method: str) -> bool:
+    return role == "operator" or method.upper() in {"GET", "HEAD", "OPTIONS"}
 
 
 @app.middleware("http")
@@ -299,9 +322,23 @@ async def require_control_plane_token(request: Request, call_next):
     if request.url.path == "/health":
         return await call_next(request)
     supplied = request.headers.get("x-control-plane-token", "")
-    if not secrets.compare_digest(supplied, CONTROL_PLANE_TOKEN):
+    role = control_plane_role(supplied)
+    if role is None:
         return JSONResponse(status_code=401, content={"detail": "Control-plane authentication required"})
+    if not control_plane_role_allows(role, request.method):
+        return JSONResponse(status_code=403, content={"detail": "Viewer role is read-only"})
+    request.state.control_plane_role = role
     return await call_next(request)
+
+
+@app.get("/session")
+def session(request: Request) -> dict:
+    role = request.state.control_plane_role
+    return {
+        "role": role,
+        "read_only": role == "viewer",
+        "permissions": ["read"] if role == "viewer" else ["read", "operate"],
+    }
 
 
 class ProjectCreate(BaseModel):

@@ -22,12 +22,30 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.121' "$work_dir/dashboard.html"
+grep -q 'UI v0.122' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
+
+curl --config "$curl_config" "$base_url/session" | jq -e '
+  .role == "operator" and .read_only == false and (.permissions | index("operate") != null)
+' >/dev/null
+if [ -n "${CONTROL_PLANE_VIEWER_TOKEN:-}" ]; then
+  viewer_config="$work_dir/viewer-curl.conf"
+  printf 'silent\nshow-error\nfail\nheader = "x-control-plane-token: %s"\n' \
+    "$CONTROL_PLANE_VIEWER_TOKEN" > "$viewer_config"
+  curl --config "$viewer_config" "$base_url/session" | jq -e '
+    .role == "viewer" and .read_only == true and .permissions == ["read"]
+  ' >/dev/null
+  curl --config "$viewer_config" "$base_url/projects" | jq -e '.projects | type == "array"' >/dev/null
+  viewer_write_status="$(curl --config "$viewer_config" --no-fail -sS -o "$work_dir/viewer-write.json" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -X POST "$base_url/projects" \
+    -d '{"name":"Viewer must not create","description":"RBAC smoke test"}')"
+  test "$viewer_write_status" = "403"
+  jq -e '.detail == "Viewer role is read-only"' "$work_dir/viewer-write.json" >/dev/null
+fi
 
 curl --config "$curl_config" "$base_url/openapi.json" > "$work_dir/openapi.json"
 jq -e '
