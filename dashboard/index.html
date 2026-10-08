@@ -10,10 +10,17 @@
   <style>
     :root{--panel:#111a31;--line:#263557;--muted:#9eabc9;--blue:#4f7cff;--cyan:#45d7ff}body{background:radial-gradient(circle at 88% 0,#122755 0,transparent 32rem),#07101f}.app-shell{min-height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr)}.sidebar{position:sticky;top:0;height:100vh;padding:1.4rem 1rem;border-right:1px solid #1f2d49;background:rgba(6,13,27,.95);display:flex;flex-direction:column;gap:1.25rem}.brand{display:flex;align-items:center;gap:.8rem;padding:.25rem .4rem}.brand-mark{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(145deg,var(--blue),#7159e9);font-weight:900}.brand strong,.brand small{display:block}.brand small,.sidebar-foot{color:var(--muted)}.nav{display:grid;gap:.35rem}.nav button{margin:0;padding:.75rem .8rem;border:1px solid transparent;background:transparent;color:#b6c2df;text-align:left}.nav button:hover{background:#121f3a;border-color:#263c66}.nav button.active{background:linear-gradient(90deg,#1c376f,#182846);border-color:#365da8;color:#fff;box-shadow:inset 3px 0 var(--cyan)}.sidebar-foot{margin-top:auto;padding:.9rem;border-radius:12px;background:#0e1830;border:1px solid #213153;font-size:.8rem}.workspace{width:min(1600px,96%);margin:0 auto;padding:1.6rem 1.4rem 4rem}.topbar{position:sticky;top:.8rem;z-index:5;padding:1rem 1.1rem;border:1px solid #243657;border-radius:16px;background:rgba(9,18,36,.92);backdrop-filter:blur(16px);box-shadow:0 16px 45px #0005}.topbar h1{font-size:1.55rem}.view-hidden{display:none!important}article,details.registry-card{border-radius:14px;background:linear-gradient(150deg,rgba(18,28,53,.98),rgba(12,21,42,.98));box-shadow:0 14px 35px #0002}th{color:#aab9dc;font-size:.77rem;text-transform:uppercase;letter-spacing:.04em}tbody tr:hover{background:#ffffff05}@media(max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid #1f2d49}.nav{display:flex;overflow-x:auto}.nav button{min-width:max-content}.sidebar-foot{display:none}.workspace{width:100%;padding:1rem}.topbar{top:.35rem}}@media(max-width:620px){.topbar{display:block}.grid{grid-template-columns:1fr}.workspace{padding:.7rem}.nav{margin:0 -.5rem}}
   </style>
+  <style>
+    .context-bar{display:flex;align-items:end;justify-content:space-between;gap:1rem;margin-top:1rem;padding:.85rem 1rem;border:1px solid #263b62;border-radius:14px;background:linear-gradient(105deg,#111e38,#0c172b)}
+    .context-project{display:grid;gap:.35rem;min-width:min(520px,60%)}.context-label{color:#8fa2c9;font-size:.72rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase}.project-context-select{margin:0;background:#081327;border-color:#3b5484}.context-actions{display:flex;gap:.55rem}.context-actions button{width:auto;margin:0;white-space:nowrap}
+    .tool-filters{display:grid;grid-template-columns:minmax(260px,2fr) minmax(180px,1fr);gap:1rem;margin:1rem 0}.tool-card{min-height:190px;display:flex;flex-direction:column}.tool-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.tool-card-head h3{margin:.1rem 0}.tool-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;margin:.9rem 0}.tool-meta span{padding:.55rem;border:1px solid #293b60;border-radius:9px;background:#0a1428;color:#8fa2c9;font-size:.72rem}.tool-meta strong{display:block;margin-top:.2rem;color:#e8eeff;font-size:.8rem}.tool-card p{margin-top:auto}
+    details.registry-card>summary{font-size:1.15rem}.nav button{transition:background .15s,border-color .15s,transform .15s}.nav button:hover{transform:translateX(2px)}
+    @media(max-width:760px){.context-bar{align-items:stretch;flex-direction:column}.context-project{min-width:0;width:100%}.context-actions button{flex:1}.tool-filters{grid-template-columns:1fr}.tool-meta{grid-template-columns:1fr}}
+  </style>
 </head>
 <body>
 <div class="app-shell">
-<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.95<br>Private operator console</div></aside>
+<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="tools" onclick="showView('tools')">⌘ Tool Catalog</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.99<br>Private operator console</div></aside>
 <main class="workspace">
   <header class="topbar">
 <div>
@@ -27,6 +34,10 @@
 <button class="secondary" id="resume-button" style="width:auto;height:42px;display:none" onclick="resumePlatform()">Resume testing</button>
 </div>
 </header>
+<section class="context-bar" aria-label="Workspace context">
+  <div class="context-project"><span class="context-label">Active project</span><div id="project-context-slot"></div></div>
+  <div class="context-actions"><button class="secondary" onclick="showView('scope')">Manage scope</button><button onclick="showView('runs')">New run</button></div>
+</section>
 <article data-view="overview" style="margin-top:1rem" id="auth-panel">
 <h2>Control-plane access</h2>
 <p class="muted">Enter the server's operator token. It is retained only for this browser tab.</p>
@@ -175,8 +186,8 @@
   <section class="grid">
     <article>
 <h2 data-section="scope">Project</h2>
-      <label>Current project</label>
-<select id="projects" onchange="findingReviewDirty=false;projectChanged()">
+      <p class="muted">Create projects here. Use the workspace bar above to switch the active project from any view.</p>
+<select id="projects" class="project-context-select" aria-label="Active project" onchange="findingReviewDirty=false;projectChanged()">
 <option value="">Select a project</option>
 </select>
       <label>New project name</label>
@@ -565,18 +576,19 @@
 <div id="retest-content">
 </div>
 </article>
-<details data-view="operations" class="registry-card" style="margin-top:1rem">
-<summary>Tool registry</summary>
+<details data-view="tools" class="registry-card" style="margin-top:1rem" open>
+<summary>Tool catalog</summary>
 <p id="tool-summary">
 </p>
+<div class="tool-filters"><label>Search tools<input id="tool-search" placeholder="Name, category, mode, or capability" oninput="renderTools()"></label><label>Execution mode<select id="tool-mode" onchange="renderTools()"><option value="all">All modes</option></select></label></div>
 <section class="grid" id="tool-grid">
 </section>
 </details>
 </main></div><script>
-const api='/api';let adapterMap={},targetMap={},credentialProfiles=[],planMap={},workflowTemplates=[],workflowTemplateProjectId='',customWorkflowToolIds=[],currentObservationData=null,currentFindings=[],findingReviewDirty=false,integrityProjectId='',controlPlaneToken=sessionStorage.getItem('security-platform-token')||'',watchedRunId='',watchedRunAfter=0,watchedRunEvents=[],watchedRunTerminal=false;
+const api='/api';let adapterMap={},targetMap={},credentialProfiles=[],planMap={},workflowTemplates=[],workflowTemplateProjectId='',customWorkflowToolIds=[],currentObservationData=null,currentFindings=[],findingReviewDirty=false,integrityProjectId='',controlPlaneToken=sessionStorage.getItem('security-platform-token')||'',watchedRunId='',watchedRunAfter=0,watchedRunEvents=[],watchedRunTerminal=false,toolCatalog=[];
 const el=id=>document.getElementById(id), lines=v=>v.split('\n').map(x=>x.trim()).filter(Boolean);
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-const viewMeta={overview:['Platform overview','Health, runtime readiness, and adapter coverage.'],scope:['Projects & Scope','Manage authorized assets, source archives, and test identities.'],runs:['Runs','Queue approved tools and watch live execution.'],workflows:['Workflows','Build and monitor reviewed multi-tool sequences.'],findings:['Findings & Review','Triage observations, record decisions, and retest fixes.'],reports:['Reports & Evidence','Verify sealed evidence and export assessment results.'],operations:['Operations','Inspect audit history and the full tool registry.']};
+const viewMeta={overview:['Platform overview','Health, runtime readiness, and adapter coverage.'],scope:['Projects & Scope','Manage authorized assets, source archives, and test identities.'],runs:['Runs','Queue approved tools and watch live execution.'],workflows:['Workflows','Build and monitor reviewed multi-tool sequences.'],findings:['Findings & Review','Triage observations, record decisions, and retest fixes.'],reports:['Reports & Evidence','Verify sealed evidence and export assessment results.'],tools:['Tool Catalog','Search registered tools and review how each one can run.'],operations:['Operations','Inspect audit history and platform activity.']};
 document.querySelectorAll('[data-section]').forEach(node=>{const card=node.closest('article');if(card)card.dataset.view=node.dataset.section});
 function showView(name,updateHash=true){if(!viewMeta[name])name='overview';document.querySelectorAll('[data-view]').forEach(node=>node.classList.toggle('view-hidden',node.dataset.view!==name));document.querySelectorAll('[data-nav]').forEach(button=>{const active=button.dataset.nav===name;button.classList.toggle('active',active);button.setAttribute('aria-current',active?'page':'false')});el('view-title').textContent=viewMeta[name][0];el('view-description').textContent=viewMeta[name][1];sessionStorage.setItem('security-platform-view',name);if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);window.scrollTo({top:0,behavior:'smooth'})}
 window.addEventListener('hashchange',()=>showView(location.hash.slice(1),false));
@@ -649,10 +661,12 @@ async function downloadReport(includeInfo){const project=el('projects').value;if
 async function downloadSarif(){const project=el('projects').value;if(!project)return msg('run-message','Select a project first.',true);try{const response=await fetch(`${api}/projects/${project}/report.sarif?include_info=true`,{headers:authHeaders()});if(!response.ok)throw new Error(`SARIF export failed (${response.status})`);const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`security-platform-${project}.sarif`;link.click();URL.revokeObjectURL(url)}catch(e){msg('run-message',e.message,true)}}
 async function downloadSbom(runId){try{const response=await fetch(`${api}/runs/${runId}/sbom`,{headers:authHeaders()});if(!response.ok)throw new Error(`SBOM download failed (${response.status})`);const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`security-platform-${runId}-sbom.cdx.json`;link.click();URL.revokeObjectURL(url)}catch(e){msg('run-message',e.message,true)}}
 async function downloadEvidenceBundle(runId){try{const response=await fetch(`${api}/runs/${runId}/evidence-bundle`,{headers:authHeaders()});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`Evidence bundle failed (${response.status})`)}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`security-platform-${runId}-evidence.zip`;link.click();URL.revokeObjectURL(url);msg('run-message',`Sanitized evidence bundle downloaded for ${runId}.`)}catch(e){msg('run-message',e.message,true)}}
-async function loadTools(){const {tools}=await req('/tools'),entries=Object.entries(tools);el('tool-summary').textContent=`${entries.length} tools catalogued.`;el('tool-grid').innerHTML=entries.map(([name,t])=>`<article><h3>${esc(name)}</h3><span class="tag">${esc(t.category)}</span><p>Risk: ${esc(t.risk)}<br>Mode: ${esc(t.execution)}<br>Tier: ${esc(t.availability)}</p>${t.automation_note?`<p class="muted">${esc(t.automation_note)}</p>`:''}</article>`).join('')}
+function renderTools(){const query=(el('tool-search')?.value||'').trim().toLowerCase(),mode=el('tool-mode')?.value||'all',shown=toolCatalog.filter(([name,t])=>(mode==='all'||t.execution===mode)&&(!query||[name,t.category,t.execution,t.availability,t.automation_note].some(value=>String(value||'').toLowerCase().includes(query))));el('tool-summary').textContent=`Showing ${shown.length} of ${toolCatalog.length} catalogued tools.`;el('tool-grid').innerHTML=shown.length?shown.map(([name,t])=>`<article class="tool-card"><div class="tool-card-head"><h3>${esc(name)}</h3><span class="tag">${esc(t.category)}</span></div><div class="tool-meta"><span>Risk <strong>${esc(t.risk)}</strong></span><span>Mode <strong>${esc(t.execution)}</strong></span><span>Tier <strong>${esc(t.availability)}</strong></span></div>${t.automation_note?`<p class="muted">${esc(t.automation_note)}</p>`:''}</article>`).join(''):'<p class="muted">No tools match these filters.</p>'}
+async function loadTools(){const {tools}=await req('/tools');toolCatalog=Object.entries(tools).sort(([a],[b])=>a.localeCompare(b));const modes=[...new Set(toolCatalog.map(([,tool])=>tool.execution))].sort(),select=el('tool-mode'),selected=select.value;select.innerHTML='<option value="all">All modes</option>'+modes.map(mode=>`<option value="${esc(mode)}">${esc(mode)}</option>`).join('');if(modes.includes(selected))select.value=selected;renderTools()}
 async function refreshAll(){await loadHealth();if(!controlPlaneToken){renderAuthState(false);return}renderAuthState(true);await Promise.allSettled([loadPlatformStatus(),loadCoverage(),loadProjects(el('projects').value),loadAdapters(),loadPlans(),loadTools()])}
 const navigateBefore={watchRun:['runs',watchRun],viewEvidence:['reports',viewEvidence],viewObservations:['findings',viewObservations],viewRetestResult:['findings',viewRetestResult]};
 Object.entries(navigateBefore).forEach(([name,[view,handler]])=>{window[name]=(...args)=>{showView(view);return handler(...args)}});
+el('project-context-slot').appendChild(el('projects'));
 showView(location.hash.slice(1)||sessionStorage.getItem('security-platform-view')||'overview',false);
 refreshAll();setInterval(()=>{loadHealth();if(controlPlaneToken){loadPlatformStatus();loadCoverage();if(el('projects').value&&!findingReviewDirty)projectChanged();if(watchedRunId&&!watchedRunTerminal)loadRunProgress()}},3000);
 </script></body></html>
