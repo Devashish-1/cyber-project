@@ -84,6 +84,7 @@ MAX_EVIDENCE_LINES = 200
 MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**3)))
 MAX_STORAGE_USED_PERCENT = float(os.getenv("MAX_STORAGE_USED_PERCENT", "90"))
 MAX_PENDING_RUNS = int(os.getenv("MAX_PENDING_RUNS", "100"))
+MAX_RUNNER_READINESS_AGE_SECONDS = int(os.getenv("MAX_RUNNER_READINESS_AGE_SECONDS", "180"))
 MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
 MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
 MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
@@ -298,7 +299,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.125.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.126.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -739,6 +740,79 @@ def queue_admission(*, requested_slots: int = 0, enforce: bool = False) -> dict:
         raise HTTPException(
             status_code=429,
             detail="Pending-run capacity is exhausted; wait for queued work to finish",
+        )
+    return result
+
+
+def evaluate_adapter_runtime_readiness(
+    readiness: object,
+    tool_ids: list[str],
+    configured: dict,
+    *,
+    now: float | None = None,
+) -> dict:
+    requested = sorted(set(tool_ids))
+    result = {
+        "allowed": False,
+        "fresh": False,
+        "age_seconds": None,
+        "requested": requested,
+        "unavailable": requested,
+    }
+    if not isinstance(readiness, dict):
+        return result
+    checked_at = readiness.get("checked_at")
+    inventory = readiness.get("adapters")
+    if not isinstance(checked_at, (int, float)) or not isinstance(inventory, list):
+        return result
+    current_time = time.time() if now is None else now
+    age = current_time - float(checked_at)
+    if age < -30 or age > MAX_RUNNER_READINESS_AGE_SECONDS:
+        result["age_seconds"] = round(max(0.0, age), 1)
+        return result
+    by_tool: dict[str, dict] = {}
+    duplicates: set[str] = set()
+    for item in inventory:
+        if not isinstance(item, dict) or not isinstance(item.get("tool_id"), str):
+            continue
+        tool_id = item["tool_id"]
+        if tool_id in by_tool:
+            duplicates.add(tool_id)
+        by_tool[tool_id] = item
+    unavailable = []
+    for tool_id in requested:
+        item = by_tool.get(tool_id)
+        adapter = configured.get(tool_id)
+        expected_image = adapter.get("image") if isinstance(adapter, dict) else None
+        if (
+            tool_id in duplicates
+            or item is None
+            or item.get("state") != "ready"
+            or not item.get("image_id")
+            or item.get("image") != expected_image
+        ):
+            unavailable.append(tool_id)
+    result.update({
+        "allowed": not unavailable,
+        "fresh": True,
+        "age_seconds": round(max(0.0, age), 1),
+        "unavailable": unavailable,
+    })
+    return result
+
+
+def adapter_runtime_admission(tool_ids: list[str], configured: dict, *, enforce: bool = False) -> dict:
+    raw = queue_client().get(RUNNER_READINESS)
+    try:
+        readiness = json.loads(raw) if raw else None
+    except (json.JSONDecodeError, TypeError):
+        readiness = None
+    result = evaluate_adapter_runtime_readiness(readiness, tool_ids, configured)
+    if enforce and not result["allowed"]:
+        unavailable = ", ".join(result["unavailable"]) or "readiness inventory"
+        raise HTTPException(
+            status_code=503,
+            detail=f"Adapter runtime is not ready for: {unavailable}; wait for runner inventory or install the pinned image",
         )
     return result
 
@@ -2226,6 +2300,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
         raise HTTPException(status_code=422, detail="Tool runner is not implemented yet")
     if adapter.get("profile") != payload.profile:
         raise HTTPException(status_code=422, detail="Tool is not approved for the selected profile")
+    adapter_runtime_admission([payload.tool_id], adapters, enforce=True)
     if payload.credential_profile_id is not None and payload.tool_id != "playwright":
         raise HTTPException(status_code=422, detail="Credential profiles are only supported by the Playwright adapter")
     input_type = adapter.get("input", "target")
@@ -2333,6 +2408,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     else:
         tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
     adapters = validate_workflow_tool_ids(tool_ids)
+    adapter_runtime_admission(tool_ids, adapters, enforce=True)
     plan_id = (
         payload.plan_id
         or (f"template-{payload.template_id}" if payload.template_id else None)
@@ -3611,6 +3687,9 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                 raise HTTPException(status_code=422, detail="Original adapter is no longer available")
             if registry_tool.get("execution") in {"disabled", "manual"} or adapter.get("profile") != profile:
                 raise HTTPException(status_code=422, detail="Original adapter policy no longer permits this retest")
+            adapter_runtime_admission(
+                [tool_id], load_adapters().get("adapters", {}), enforce=True
+            )
             cursor.execute(
                 """
                 INSERT INTO runs
