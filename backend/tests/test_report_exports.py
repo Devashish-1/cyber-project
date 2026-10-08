@@ -249,7 +249,7 @@ class CoverageGapSummaryTests(unittest.TestCase):
             {"unattempted_adapters": ["testssl"], "attempted_without_success": ["nuclei-reviewed"]},
             {"targets": [
                 {"id": "t1", "base_url": "https://a.test", "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["httpx"]},
-                {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": [], "unattempted_adapters": ["testssl"]},
+                {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": [], "unattempted_adapters": ["subfinder", "testssl"]},
             ]},
             {"artifacts": [
                 {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["semgrep"]},
@@ -265,10 +265,10 @@ class CoverageGapSummaryTests(unittest.TestCase):
         self.assertEqual(result["gaps"]["targets_without_success"][0]["id"], "t2")
         self.assertEqual(result["gaps"]["untested_sources"][0]["filename"], "app.zip")
         self.assertEqual(result["gaps"]["roles_without_success"][0]["role_name"], "admin")
-        self.assertEqual(result["gaps"]["target_adapter_gaps"][1]["unattempted_adapters"], ["testssl"])
+        self.assertEqual(result["gaps"]["target_adapter_gaps"][1]["unattempted_adapters"], ["subfinder", "testssl"])
         self.assertEqual(result["gaps"]["source_adapter_gaps"][0]["unattempted_adapters"], ["semgrep"])
-        self.assertEqual(result["external_approval_required"], ["testssl"])
-        self.assertEqual(result["external_approval_required_count"], 1)
+        self.assertEqual(result["external_approval_required"], ["subfinder", "testssl"])
+        self.assertEqual(result["external_approval_required_count"], 2)
 
     def test_no_recorded_gaps_does_not_claim_security(self):
         result = summarize_coverage_gaps(

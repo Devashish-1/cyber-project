@@ -304,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.140.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.141.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3551,6 +3551,8 @@ def summarize_coverage_gaps(
     }
     gap_count = sum(len(items) for items in gaps.values())
     unresolved_adapters = set(gaps["unattempted_adapters"]) | set(gaps["attempted_without_success"])
+    for asset_gap in gaps["target_adapter_gaps"] + gaps["source_adapter_gaps"]:
+        unresolved_adapters.update(asset_gap["unattempted_adapters"])
     external_approval_required = sorted(
         unresolved_adapters & set(approval_required_adapters or [])
     )
