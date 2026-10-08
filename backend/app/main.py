@@ -273,7 +273,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.105.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.106.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1118,6 +1118,80 @@ def image_audit_status() -> dict:
         "fixable_counts": fixable_counts,
         "total_vulnerabilities": len(vulnerabilities),
     }
+
+
+@app.get("/image-audit-history")
+def image_audit_history(limit: int = 10) -> dict:
+    if not 1 <= limit <= 10:
+        raise HTTPException(status_code=422, detail="Image audit history limit must be between 1 and 10")
+    reports = sorted(
+        (
+            path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json")
+            if path.is_file() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+    audits = []
+    for report_path in reports:
+        size = report_path.stat().st_size
+        if size > 32 * 1024 * 1024:
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        vulnerabilities = [
+            item
+            for result in report.get("Results", [])
+            if isinstance(result, dict)
+            for item in (result.get("Vulnerabilities") or [])
+            if isinstance(item, dict)
+        ]
+        prefix = report_path.name.removesuffix(".trivy.json")
+        sbom = IMAGE_AUDIT_ROOT / f"{prefix}.sbom.json"
+        checksums = IMAGE_AUDIT_ROOT / f"{prefix}.sha256"
+        integrity_verified = False
+        if (
+            sbom.is_file()
+            and not sbom.is_symlink()
+            and sbom.stat().st_size <= 64 * 1024 * 1024
+            and checksums.is_file()
+            and not checksums.is_symlink()
+            and checksums.stat().st_size <= 64 * 1024
+        ):
+            try:
+                expected = {
+                    PurePosixPath(match.group(2)).name: match.group(1).lower()
+                    for line in checksums.read_text(encoding="utf-8").splitlines()
+                    if (match := re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line))
+                }
+                integrity_verified = all(
+                    expected.get(path.name) == hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in (report_path, sbom)
+                )
+            except (OSError, UnicodeDecodeError):
+                integrity_verified = False
+        audited_at = datetime.fromtimestamp(report_path.stat().st_mtime, timezone.utc)
+        age_seconds = max(0, int((datetime.now(timezone.utc) - audited_at).total_seconds()))
+        audits.append({
+            "audited_at": audited_at,
+            "age_seconds": age_seconds,
+            "fresh": age_seconds <= MAX_IMAGE_AUDIT_AGE_HOURS * 3600,
+            "artifact_name": str(report.get("ArtifactName") or "local image"),
+            "image_id": str((report.get("Metadata") or {}).get("ImageID") or "")
+            if isinstance(report.get("Metadata"), dict) else "",
+            "report_filename": report_path.name,
+            "size_bytes": size,
+            "critical": sum(1 for item in vulnerabilities if item.get("Severity") == "CRITICAL"),
+            "high": sum(1 for item in vulnerabilities if item.get("Severity") == "HIGH"),
+            "fixable_high": sum(
+                1 for item in vulnerabilities
+                if item.get("Severity") == "HIGH" and item.get("FixedVersion")
+            ),
+            "integrity_verified": integrity_verified,
+        })
+    return {"audits": audits, "limit": limit}
 
 
 @app.get("/image-audit-artifacts/{artifact_kind}")

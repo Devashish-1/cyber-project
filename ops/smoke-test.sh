@@ -27,6 +27,7 @@ curl --config "$curl_config" "$base_url/openapi.json" > "$work_dir/openapi.json"
 jq -e '
   (.info.version | type == "string") and
   (.paths["/image-audit-status"] != null) and
+  (.paths["/image-audit-history"] != null) and
   (.paths["/image-audit-artifacts/{artifact_kind}"] != null) and
   (.paths["/projects/{project_id}/report.json"] != null) and
   (.paths["/projects/{project_id}/report.sarif"] != null) and
@@ -47,6 +48,8 @@ jq -e '
   (.checksums.available == true) and
   (.checksums.verified == true)
 ' "$work_dir/image-audit.json" >/dev/null
+curl --config "$curl_config" "$base_url/image-audit-history?limit=10" > "$work_dir/image-audit-history.json"
+jq -e '(.audits | type == "array") and (.audits | length >= 1) and (.audits[0].integrity_verified == true)' "$work_dir/image-audit-history.json" >/dev/null
 mkdir "$work_dir/image-audit"
 for kind in report sbom checksums; do
   filename="$(jq -r --arg kind "$kind" 'if $kind == "report" then .report.filename elif $kind == "sbom" then .sbom.filename else .checksums.filename end' "$work_dir/image-audit.json")"
