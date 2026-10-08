@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.146.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.147.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3223,7 +3223,7 @@ def get_project_findings(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 WITH ranked AS (
-                    SELECT o.id, o.run_id, r.tool_id, cp.role_name AS credential_role,
+                    SELECT o.id, o.run_id, r.tool_id, r.profile, cp.role_name AS credential_role,
                            o.observation_type, o.title, o.severity,
                            o.asset, o.details, o.fingerprint, o.created_at, o.review_status,
                            o.review_notes, o.reviewed_by, o.reviewed_at,
@@ -3238,7 +3238,7 @@ def get_project_findings(project_id: UUID) -> dict:
                     LEFT JOIN credential_profiles cp ON cp.id = r.credential_profile_id
                     WHERE r.project_id = %s
                 )
-                SELECT id, run_id, tool_id, credential_role, observation_type, title, severity, asset, details,
+                SELECT id, run_id, tool_id, profile, credential_role, observation_type, title, severity, asset, details,
                        fingerprint, review_status, review_notes, reviewed_by, reviewed_at,
                        occurrence_count, first_seen, last_seen
                 FROM ranked WHERE recency_rank = 1
@@ -3254,13 +3254,14 @@ def get_project_findings(project_id: UUID) -> dict:
         "unique_count": len(rows),
         "findings": [
             {
-                "id": row[0], "run_id": row[1], "tool_id": row[2],
-                "credential_role": row[3], "type": row[4],
-                "title": row[5], "severity": row[6], "asset": row[7],
-                "details": sanitize_evidence(row[8]), "fingerprint": row[9],
-                "review_status": row[10], "review_notes": row[11],
-                "reviewed_by": row[12], "reviewed_at": row[13],
-                "occurrence_count": row[14], "first_seen": row[15], "last_seen": row[16],
+                "id": row[0], "run_id": row[1], "tool_id": row[2], "profile": row[3],
+                "provenance": "manual-import" if row[3] == "manual-import" else "supervised-run",
+                "credential_role": row[4], "type": row[5],
+                "title": row[6], "severity": row[7], "asset": row[8],
+                "details": sanitize_evidence(row[9]), "fingerprint": row[10],
+                "review_status": row[11], "review_notes": row[12],
+                "reviewed_by": row[13], "reviewed_at": row[14],
+                "occurrence_count": row[15], "first_seen": row[16], "last_seen": row[17],
             }
             for row in rows
         ],
@@ -3294,6 +3295,8 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
                 "shortDescription": {"text": str(finding["title"])},
                 "properties": {
                     "toolId": str(finding["tool_id"]),
+                    "runProfile": str(finding.get("profile") or "unknown"),
+                    "provenance": str(finding.get("provenance") or "supervised-run"),
                     "observationType": str(finding["type"]),
                 },
             },
@@ -3378,6 +3381,7 @@ def build_defectdojo_report(findings: list[dict], include_info: bool = False) ->
             "title": (str(finding.get("title") or "Security observation")[:511]),
             "description": "\n".join([
                 f"Source tool: {finding.get('tool_id') or 'unknown'}",
+                f"Provenance: {finding.get('provenance') or 'supervised-run'}",
                 f"Authenticated role: {finding.get('credential_role') or 'anonymous'}",
                 f"Observation type: {finding.get('type') or 'unknown'}",
                 f"Asset: {asset or 'unknown'}",
@@ -4239,15 +4243,15 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
         "## Findings",
         "",
-        "| Severity | Finding | Asset | Tool | Authenticated role | Occurrences | Review status |",
-        "|---|---|---|---|---|---:|---|",
+        "| Severity | Finding | Asset | Tool | Provenance | Authenticated role | Occurrences | Review status |",
+        "|---|---|---|---|---|---|---:|---|",
     ])
     lines.extend(
-        f"| {md(item['severity'])} | {md(item['title'])} | {md(item['asset'])} | {md(item['tool_id'])} | {md(item.get('credential_role') or 'anonymous')} | {item['occurrence_count']} | {md(item['review_status'])} |"
+        f"| {md(item['severity'])} | {md(item['title'])} | {md(item['asset'])} | {md(item['tool_id'])} | {md(item.get('provenance') or 'supervised-run')} | {md(item.get('credential_role') or 'anonymous')} | {item['occurrence_count']} | {md(item['review_status'])} |"
         for item in reported
     )
     if not reported:
-        lines.append("| — | No reportable findings | — | — | — | 0 | — |")
+        lines.append("| — | No reportable findings | — | — | — | — | 0 | — |")
     else:
         lines.extend(["", "### Finding details", ""])
         for index, item in enumerate(reported, start=1):
@@ -4257,6 +4261,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 "",
                 f"- Asset: `{md(item['asset'])}`",
                 f"- Tool: `{md(item['tool_id'])}`",
+                f"- Provenance: {md(item.get('provenance') or 'supervised-run')}",
                 f"- Authenticated role: {md(item.get('credential_role') or 'anonymous')}",
                 f"- Evidence run: `{md(item['run_id'])}`",
                 f"- Type: `{md(item['type'])}`",
@@ -4274,7 +4279,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
         "## Limitations",
         "",
-        "- This report covers automated adapters that actually ran; it is not proof that untested vulnerabilities are absent.",
+        "- This report covers recorded supervised runs and explicitly imported manual findings; it is not proof that untested vulnerabilities are absent.",
+        "- Manual imports are operator-supplied metadata, not proof that the platform executed or reproduced the reported test.",
         "- Business logic, authorization design, multi-step abuse, and exploit chains still require human testing.",
         "- Findings remain unverified until a reviewer confirms them; false positives and contextual severity changes are possible.",
         "- Evidence returned by the dashboard is sanitized and size-limited; restricted raw artifacts remain on the server.",

@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.146' "$work_dir/dashboard.html"
+grep -q 'UI v0.147' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -45,6 +45,7 @@ grep -q 'Official project' "$work_dir/dashboard.html"
 grep -q 'Import sanitized findings' "$work_dir/dashboard.html"
 grep -q 'raw HTTP requests, responses, cookies, and credentials are discarded' "$work_dir/dashboard.html"
 grep -q 'manualImport' "$work_dir/dashboard.html"
+grep -q 'Manual retest required' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -227,6 +228,7 @@ if [ -n "$project_id" ]; then
     .schema == "security-platform-report/v1" and
     .project.id == $project_id and
     (.summary.unique_findings == (.findings | length)) and
+    all(.findings[]; (.profile | type) == "string" and (.provenance == "supervised-run" or .provenance == "manual-import")) and
     all(.findings[]; (.credential_role == null or (.credential_role | type) == "string")) and
     (.coverage.adapter_gaps.unattempted_adapters | type == "array") and
     (.coverage.adapter_gaps.attempted_coverage_percent | type == "number") and
@@ -333,7 +335,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.146.0" and
+    .platform_version == "0.147.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
@@ -373,6 +375,8 @@ if [ -n "$project_id" ]; then
   grep -q '^### Per-target adapter coverage' "$work_dir/report.md"
   grep -q '^### Per-source adapter coverage' "$work_dir/report.md"
   grep -q '^### Coverage gap rollup' "$work_dir/report.md"
+  grep -q 'explicitly imported manual findings' "$work_dir/report.md"
+  grep -q 'Manual imports are operator-supplied metadata' "$work_dir/report.md"
   grep -q '^- Limitation: .*does not prove' "$work_dir/report.md"
   grep -q '^- Unresolved adapters requiring separate third-party approval:' "$work_dir/report.md"
   grep -q '^- Targets with incomplete adapter coverage:' "$work_dir/report.md"

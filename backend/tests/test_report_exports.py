@@ -65,6 +65,8 @@ class BurpImportTests(unittest.TestCase):
 def finding(**overrides) -> dict:
     result = {
         "tool_id": "httpx",
+        "profile": "observe",
+        "provenance": "supervised-run",
         "credential_role": None,
         "type": "http-service",
         "title": "HTTP service observed",
@@ -129,6 +131,16 @@ class DefectDojoExportTests(unittest.TestCase):
         description = report["findings"][0]["description"]
         self.assertIn("Authenticated role: administrator", description)
         self.assertNotIn("password", description.lower())
+
+    def test_identifies_manual_import_provenance(self):
+        report = build_defectdojo_report([
+            finding(
+                tool_id="burp-suite-community", profile="manual-import",
+                provenance="manual-import",
+            )
+        ], include_info=True)
+        description = report["findings"][0]["description"]
+        self.assertIn("Provenance: manual-import", description)
 
 
 class AuditExportTests(unittest.TestCase):
