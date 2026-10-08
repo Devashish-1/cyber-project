@@ -43,7 +43,15 @@ jq -e '
 curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
 jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null
 curl --config "$curl_config" "$base_url/coverage" > "$work_dir/coverage.json"
-jq -e '.totals.implemented > 0 and (.totals.immutable_images == .totals.implemented) and (.totals.floating_images == 0)' "$work_dir/coverage.json" >/dev/null
+jq -e '
+  .totals.implemented > 0 and
+  (.totals.immutable_images == .totals.implemented) and
+  (.totals.floating_images == 0) and
+  (.totals.validated > 0) and
+  (.totals.validation_pending >= 0) and
+  ((.validation | length) == .totals.implemented) and
+  (([.validation[] | select(.validated == true)] | length) == .totals.validated)
+' "$work_dir/coverage.json" >/dev/null
 curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
 jq -e '
   (.available == true) and

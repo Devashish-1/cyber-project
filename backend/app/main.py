@@ -286,7 +286,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.112.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.113.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1028,6 +1028,37 @@ def coverage() -> dict:
         for name, metadata in sorted(registry.items())
         if metadata.get("execution") not in eligible_modes
     ]
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT tool_id,
+                       count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+                       count(*) FILTER (WHERE status = 'failed') AS failed,
+                       max(finished_at) FILTER (WHERE status = 'succeeded') AS last_succeeded_at
+                FROM runs
+                GROUP BY tool_id
+                """
+            )
+            run_history = {
+                row[0]: {
+                    "succeeded": int(row[1] or 0),
+                    "failed": int(row[2] or 0),
+                    "last_succeeded_at": row[3].isoformat() if row[3] else None,
+                }
+                for row in cursor.fetchall()
+            }
+    validation = []
+    for name in implemented_names:
+        history = run_history.get(name, {"succeeded": 0, "failed": 0, "last_succeeded_at": None})
+        validation.append({
+            "id": name,
+            "input": str(configured[name].get("input") or "target"),
+            "profile": str(configured[name].get("profile") or "unknown"),
+            "validated": history["succeeded"] > 0,
+            **history,
+        })
+    validated_count = sum(1 for item in validation if item["validated"])
     return {
         "totals": {
             "catalogued": len(registry),
@@ -1038,6 +1069,9 @@ def coverage() -> dict:
             "pending": len(pending_names),
             "non_adapter": len(non_adapter),
             "coverage_percent": round((implemented_count / eligible_count) * 100, 1) if eligible_count else 0,
+            "validated": validated_count,
+            "validation_pending": implemented_count - validated_count,
+            "validation_percent": round((validated_count / implemented_count) * 100, 1) if implemented_count else 0,
         },
         "by_profile": dict(sorted(by_profile.items())),
         "by_input": dict(sorted(by_input.items())),
@@ -1047,6 +1081,7 @@ def coverage() -> dict:
             {"id": name, **eligible[name]}
             for name in pending_names
         ],
+        "validation": validation,
         "non_adapter": non_adapter,
     }
 
