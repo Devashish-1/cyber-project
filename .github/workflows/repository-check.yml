@@ -1,0 +1,49 @@
+name: Repository safety checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Create ephemeral CI configuration
+        shell: bash
+        run: |
+          umask 077
+          cat > .env <<EOF
+          POSTGRES_DB=security_platform
+          POSTGRES_USER=security_platform
+          POSTGRES_PASSWORD=$(openssl rand -hex 32)
+          CONTROL_PLANE_TOKEN=$(openssl rand -hex 32)
+          CREDENTIAL_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')=
+          MIN_STORAGE_FREE_BYTES=1073741824
+          MAX_STORAGE_USED_PERCENT=95
+          MAX_PENDING_RUNS=20
+          MAX_TOOL_OUTPUT_BYTES=16777216
+          MAX_TOOL_LOG_BYTES=2097152
+          MAX_TOOL_LOG_LINES=20000
+          MAX_RUN_EVIDENCE_BYTES=67108864
+          MAX_RUN_EVIDENCE_FILES=32
+          LOCAL_UID=$(id -u)
+          LOCAL_GID=$(id -g)
+          DOCKER_GID=999
+          EOF
+
+      - name: Run offline repository checks
+        env:
+          SECURITY_PLATFORM_ROOT: ${{ github.workspace }}
+        run: ./ops/repository-check.sh
