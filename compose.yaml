@@ -33,7 +33,6 @@ services:
   api:
     build:
       context: ./backend
-      network: host
     restart: unless-stopped
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
@@ -79,7 +78,6 @@ services:
   runner:
     build:
       context: ./backend
-      network: host
     restart: unless-stopped
     command: ["python", "-m", "app.runner"]
     user: "${LOCAL_UID:-1000}:${DOCKER_GID:-999}"
