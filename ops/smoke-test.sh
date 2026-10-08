@@ -22,7 +22,8 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.128' "$work_dir/dashboard.html"
+grep -q 'UI v0.129' "$work_dir/dashboard.html"
+grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
@@ -184,6 +185,7 @@ if [ -n "$project_id" ]; then
     .schema == "security-platform-report/v1" and
     .project.id == $project_id and
     (.summary.unique_findings == (.findings | length)) and
+    all(.findings[]; (.credential_role == null or (.credential_role | type) == "string")) and
     (.coverage.adapter_gaps.unattempted_adapters | type == "array") and
     (.coverage.adapter_gaps.attempted_coverage_percent | type == "number")
   ' "$work_dir/report.json" >/dev/null
@@ -194,7 +196,13 @@ if [ -n "$project_id" ]; then
     (.successful_adapters | type == "array") and
     (.unattempted_adapters | type == "array")
   ' "$work_dir/adapter-coverage.json" >/dev/null
-  jq -e '.version == "2.1.0" and (.runs | type == "array")' \
+  jq -e '
+    .version == "2.1.0" and
+    (.runs | type == "array") and
+    all(.runs[].results[]?;
+      (.properties.authenticatedRole == null or (.properties.authenticatedRole | type) == "string")
+    )
+  ' \
     "$work_dir/report.sarif" >/dev/null
   jq -e '
     .type == "Security Testing Platform" and
@@ -221,6 +229,8 @@ if [ -n "$project_id" ]; then
   ' "$work_dir/audit-events.json" >/dev/null
   test "$(jq -r '.summary.unique_findings' "$work_dir/report.json")" = \
     "$(jq -r '.unique_count' "$work_dir/findings.json")"
+  jq -e 'all(.findings[]; (.credential_role == null or (.credential_role | type) == "string"))' \
+    "$work_dir/findings.json" >/dev/null
   mkdir "$work_dir/bundle"
   unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
   test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "6"

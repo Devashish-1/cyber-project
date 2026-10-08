@@ -12,6 +12,7 @@ NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
 def finding(**overrides) -> dict:
     result = {
         "tool_id": "httpx",
+        "credential_role": None,
         "type": "http-service",
         "title": "HTTP service observed",
         "severity": "medium",
@@ -67,6 +68,14 @@ class DefectDojoExportTests(unittest.TestCase):
         report = build_defectdojo_report(findings)
         self.assertEqual(len(report["findings"]), 1)
         self.assertNotIn("endpoints", report["findings"][0])
+
+    def test_includes_authenticated_role_without_credentials(self):
+        report = build_defectdojo_report([
+            finding(tool_id="playwright", credential_role="administrator")
+        ], include_info=True)
+        description = report["findings"][0]["description"]
+        self.assertIn("Authenticated role: administrator", description)
+        self.assertNotIn("password", description.lower())
 
 
 class AuditExportTests(unittest.TestCase):

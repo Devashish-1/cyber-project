@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.128.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.129.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2958,7 +2958,15 @@ def get_project_evidence_integrity(project_id: UUID) -> dict:
 def get_run_observations(run_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+            cursor.execute(
+                """
+                SELECT r.status, cp.role_name
+                FROM runs r
+                LEFT JOIN credential_profiles cp ON cp.id = r.credential_profile_id
+                WHERE r.id = %s
+                """,
+                (run_id,),
+            )
             run = cursor.fetchone()
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
@@ -2974,6 +2982,7 @@ def get_run_observations(run_id: UUID) -> dict:
     return {
         "run_id": run_id,
         "status": run[0],
+        "authenticated_role": run[1],
         "observations": [
             {
                 "id": row[0], "type": row[1], "title": row[2], "severity": row[3],
@@ -3021,7 +3030,8 @@ def get_project_findings(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 WITH ranked AS (
-                    SELECT o.id, o.run_id, r.tool_id, o.observation_type, o.title, o.severity,
+                    SELECT o.id, o.run_id, r.tool_id, cp.role_name AS credential_role,
+                           o.observation_type, o.title, o.severity,
                            o.asset, o.details, o.fingerprint, o.created_at, o.review_status,
                            o.review_notes, o.reviewed_by, o.reviewed_at,
                            COUNT(*) OVER (PARTITION BY o.fingerprint) AS occurrence_count,
@@ -3032,9 +3042,10 @@ def get_project_findings(project_id: UUID) -> dict:
                            ) AS recency_rank
                     FROM observations o
                     JOIN runs r ON r.id = o.run_id
+                    LEFT JOIN credential_profiles cp ON cp.id = r.credential_profile_id
                     WHERE r.project_id = %s
                 )
-                SELECT id, run_id, tool_id, observation_type, title, severity, asset, details,
+                SELECT id, run_id, tool_id, credential_role, observation_type, title, severity, asset, details,
                        fingerprint, review_status, review_notes, reviewed_by, reviewed_at,
                        occurrence_count, first_seen, last_seen
                 FROM ranked WHERE recency_rank = 1
@@ -3050,12 +3061,13 @@ def get_project_findings(project_id: UUID) -> dict:
         "unique_count": len(rows),
         "findings": [
             {
-                "id": row[0], "run_id": row[1], "tool_id": row[2], "type": row[3],
-                "title": row[4], "severity": row[5], "asset": row[6],
-                "details": sanitize_evidence(row[7]), "fingerprint": row[8],
-                "review_status": row[9], "review_notes": row[10],
-                "reviewed_by": row[11], "reviewed_at": row[12],
-                "occurrence_count": row[13], "first_seen": row[14], "last_seen": row[15],
+                "id": row[0], "run_id": row[1], "tool_id": row[2],
+                "credential_role": row[3], "type": row[4],
+                "title": row[5], "severity": row[6], "asset": row[7],
+                "details": sanitize_evidence(row[8]), "fingerprint": row[9],
+                "review_status": row[10], "review_notes": row[11],
+                "reviewed_by": row[12], "reviewed_at": row[13],
+                "occurrence_count": row[14], "first_seen": row[15], "last_seen": row[16],
             }
             for row in rows
         ],
@@ -3113,6 +3125,7 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
                     "occurrenceCount": int(finding["occurrence_count"]),
                     "toolId": str(finding["tool_id"]),
                     "runId": str(finding["run_id"]),
+                    "authenticatedRole": finding.get("credential_role"),
                     "firstSeen": str(finding["first_seen"]),
                     "lastSeen": str(finding["last_seen"]),
                     "details": finding["details"],
@@ -3172,6 +3185,7 @@ def build_defectdojo_report(findings: list[dict], include_info: bool = False) ->
             "title": (str(finding.get("title") or "Security observation")[:511]),
             "description": "\n".join([
                 f"Source tool: {finding.get('tool_id') or 'unknown'}",
+                f"Authenticated role: {finding.get('credential_role') or 'anonymous'}",
                 f"Observation type: {finding.get('type') or 'unknown'}",
                 f"Asset: {asset or 'unknown'}",
                 f"Occurrences: {int(finding.get('occurrence_count') or 1)}",
@@ -3608,15 +3622,15 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
         "## Findings",
         "",
-        "| Severity | Finding | Asset | Tool | Occurrences | Review status |",
-        "|---|---|---|---|---:|---|",
+        "| Severity | Finding | Asset | Tool | Authenticated role | Occurrences | Review status |",
+        "|---|---|---|---|---|---:|---|",
     ])
     lines.extend(
-        f"| {md(item['severity'])} | {md(item['title'])} | {md(item['asset'])} | {md(item['tool_id'])} | {item['occurrence_count']} | {md(item['review_status'])} |"
+        f"| {md(item['severity'])} | {md(item['title'])} | {md(item['asset'])} | {md(item['tool_id'])} | {md(item.get('credential_role') or 'anonymous')} | {item['occurrence_count']} | {md(item['review_status'])} |"
         for item in reported
     )
     if not reported:
-        lines.append("| — | No reportable findings | — | — | 0 | — |")
+        lines.append("| — | No reportable findings | — | — | — | 0 | — |")
     else:
         lines.extend(["", "### Finding details", ""])
         for index, item in enumerate(reported, start=1):
@@ -3626,6 +3640,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 "",
                 f"- Asset: `{md(item['asset'])}`",
                 f"- Tool: `{md(item['tool_id'])}`",
+                f"- Authenticated role: {md(item.get('credential_role') or 'anonymous')}",
                 f"- Evidence run: `{md(item['run_id'])}`",
                 f"- Type: `{md(item['type'])}`",
                 f"- Review status: {md(item['review_status'])}",
