@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.140' "$work_dir/dashboard.html"
+grep -q 'UI v0.142' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -37,6 +37,8 @@ grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
 grep -q 'Per-target coverage' "$work_dir/dashboard.html"
 grep -q 'Coverage gap rollup' "$work_dir/dashboard.html"
 grep -q 'project-coverage-gap-details' "$work_dir/dashboard.html"
+grep -q 'prepareCoverageGapRun' "$work_dir/dashboard.html"
+grep -q "el('run-approved').checked=false" "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
