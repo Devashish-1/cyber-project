@@ -271,7 +271,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.103.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.104.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1122,6 +1122,11 @@ def download_image_audit_artifact(artifact_kind: str) -> FileResponse:
     }
     if artifact_kind not in artifact_suffixes:
         raise HTTPException(status_code=404, detail="Unknown image audit artifact")
+    audit_status = image_audit_status()
+    if not audit_status.get("available"):
+        raise HTTPException(status_code=404, detail="No container image audit is available")
+    if not audit_status.get("checksums", {}).get("verified"):
+        raise HTTPException(status_code=409, detail="Image audit artifact integrity is unverified")
     reports = [
         path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json")
         if path.is_file() and not path.is_symlink()
