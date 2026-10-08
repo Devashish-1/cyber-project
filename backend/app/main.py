@@ -291,7 +291,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.118.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.119.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -821,29 +821,71 @@ def health() -> dict[str, str]:
     return {"status": "ok", "database": "ok", "queue": "ok"}
 
 
-@app.get("/deployment-security-status")
-def deployment_security_status() -> dict:
-    path = DEPLOYMENT_SECURITY_STATUS_PATH
+DEPLOYMENT_SECURITY_SERVICES = {"api", "runner", "dashboard"}
+DEPLOYMENT_SECURITY_FLAGS = (
+    "read_only",
+    "capabilities_dropped",
+    "no_new_privileges",
+    "non_root",
+    "running",
+)
+
+
+def read_deployment_security_status(path: Path, *, now: datetime | None = None) -> dict:
     unavailable = {"available": False, "enforced": False, "services": []}
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 32 * 1024:
             return unavailable
         payload = json.loads(path.read_text(encoding="utf-8"))
         checked_at = datetime.fromisoformat(str(payload["checked_at"]).replace("Z", "+00:00"))
-        services = payload.get("services")
-        if not isinstance(services, list):
+        if checked_at.tzinfo is None:
             return unavailable
-        age_seconds = max(0, int((datetime.now(timezone.utc) - checked_at).total_seconds()))
+        services = payload.get("services")
+        if not isinstance(services, list) or len(services) != len(DEPLOYMENT_SECURITY_SERVICES):
+            return unavailable
+        normalized_services = []
+        names = set()
+        for service in services:
+            if not isinstance(service, dict) or service.get("service") not in DEPLOYMENT_SECURITY_SERVICES:
+                return unavailable
+            name = service["service"]
+            if name in names or any(type(service.get(flag)) is not bool for flag in DEPLOYMENT_SECURITY_FLAGS):
+                return unavailable
+            restart_count = service.get("restart_count")
+            if type(restart_count) is not int or restart_count < 0:
+                return unavailable
+            names.add(name)
+            normalized_services.append({
+                "service": name,
+                **{flag: service[flag] for flag in DEPLOYMENT_SECURITY_FLAGS},
+                "restart_count": restart_count,
+            })
+        if names != DEPLOYMENT_SECURITY_SERVICES:
+            return unavailable
+        current_time = now or datetime.now(timezone.utc)
+        age = (current_time - checked_at.astimezone(timezone.utc)).total_seconds()
+        if age < -60:
+            return unavailable
+        age_seconds = max(0, int(age))
+        enforced = all(
+            all(service[flag] for flag in DEPLOYMENT_SECURITY_FLAGS)
+            for service in normalized_services
+        )
         return {
             "available": True,
-            "enforced": payload.get("enforced") is True,
+            "enforced": enforced,
             "checked_at": checked_at,
             "age_seconds": age_seconds,
             "fresh": age_seconds <= 600,
-            "services": services,
+            "services": sorted(normalized_services, key=lambda item: item["service"]),
         }
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return unavailable
+
+
+@app.get("/deployment-security-status")
+def deployment_security_status() -> dict:
+    return read_deployment_security_status(DEPLOYMENT_SECURITY_STATUS_PATH)
 
 
 @app.get("/platform-status")
