@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.127.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.128.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3221,6 +3221,58 @@ def get_project_defectdojo_report(project_id: UUID, include_info: bool = False) 
     )
 
 
+def summarize_adapter_coverage(run_coverage: list[tuple], available_adapters: list[str]) -> dict:
+    available = sorted(set(available_adapters))
+    available_set = set(available)
+    attempted = sorted({str(row[0]) for row in run_coverage if str(row[0]) in available_set})
+    successful = sorted({
+        str(row[0]) for row in run_coverage
+        if str(row[0]) in available_set and str(row[2]) == "succeeded" and int(row[3] or 0) > 0
+    })
+    unattempted = sorted(available_set - set(attempted))
+    unsuccessful = sorted(set(attempted) - set(successful))
+    total = len(available)
+    return {
+        "available_adapters": available,
+        "attempted_adapters": attempted,
+        "successful_adapters": successful,
+        "unattempted_adapters": unattempted,
+        "attempted_without_success": unsuccessful,
+        "attempted_coverage_percent": round((len(attempted) / total) * 100, 1) if total else 0,
+        "successful_coverage_percent": round((len(successful) / total) * 100, 1) if total else 0,
+    }
+
+
+def available_report_adapters() -> list[str]:
+    configured = load_adapters().get("adapters", {})
+    return sorted(name for name in configured if name in RUNNER_IMPLEMENTED_TOOLS)
+
+
+@app.get("/projects/{project_id}/adapter-coverage")
+def get_project_adapter_coverage(project_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT tool_id, profile, status, COUNT(*),
+                       COUNT(*) FILTER (WHERE evidence_manifest_sha256 IS NOT NULL),
+                       MAX(finished_at)
+                FROM runs WHERE project_id = %s
+                GROUP BY tool_id, profile, status
+                ORDER BY tool_id, profile, status
+                """,
+                (project_id,),
+            )
+            run_coverage = cursor.fetchall()
+    return {
+        "project_id": project_id,
+        **summarize_adapter_coverage(run_coverage, available_report_adapters()),
+    }
+
+
 @app.get("/projects/{project_id}/report.json")
 def get_project_json_report(project_id: UUID, include_info: bool = True) -> Response:
     with psycopg.connect(DATABASE_URL) as connection:
@@ -3296,6 +3348,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         status: sum(1 for item in findings if item["review_status"] == status)
         for status in ("new", "confirmed", "false_positive", "accepted_risk", "resolved")
     }
+    adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
     report = {
         "schema": "security-platform-report/v1",
         "generated_at": datetime.now(timezone.utc),
@@ -3342,6 +3395,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         },
         "coverage": {
             "tools_executed": sorted({row[0] for row in run_coverage}),
+            "adapter_gaps": adapter_coverage,
             "run_status_counts": {row[0]: row[1] for row in status_counts},
             "run_matrix": [
                 {
@@ -3461,6 +3515,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         for status in ("new", "confirmed", "false_positive", "accepted_risk", "resolved")
     }
 
+    adapter_coverage = summarize_adapter_coverage(run_coverage, available_report_adapters())
+
     def md(value: object) -> str:
         return (
             str(value or "")
@@ -3532,6 +3588,10 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Severity totals: critical={severity_counts['critical']}, high={severity_counts['high']}, medium={severity_counts['medium']}, low={severity_counts['low']}, info={severity_counts['info']}",
         f"- Review totals: new={review_counts['new']}, confirmed={review_counts['confirmed']}, false_positive={review_counts['false_positive']}, accepted_risk={review_counts['accepted_risk']}, resolved={review_counts['resolved']}",
         f"- Evidence sealed: {sealed_runs} of {completed_runs} completed runs",
+        f"- Adapter coverage attempted: {adapter_coverage['attempted_coverage_percent']}% ({len(adapter_coverage['attempted_adapters'])} of {len(adapter_coverage['available_adapters'])})",
+        f"- Adapter coverage successful: {adapter_coverage['successful_coverage_percent']}% ({len(adapter_coverage['successful_adapters'])} of {len(adapter_coverage['available_adapters'])})",
+        f"- Untested adapters: {md(', '.join(adapter_coverage['unattempted_adapters']) or 'None')}",
+        f"- Attempted without a successful run: {md(', '.join(adapter_coverage['attempted_without_success']) or 'None')}",
         "",
         "### Run coverage matrix",
         "",

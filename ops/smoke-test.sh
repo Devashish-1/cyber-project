@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.127' "$work_dir/dashboard.html"
+grep -q 'UI v0.128' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
@@ -31,6 +31,7 @@ grep -q 'new MutationObserver' "$work_dir/dashboard.html"
 grep -q 'id="tool-status"' "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
+grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -69,6 +70,7 @@ jq -e '
   (.paths["/projects/{project_id}/report.md"] != null) and
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
+  and (.paths["/projects/{project_id}/adapter-coverage"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -161,6 +163,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/findings" \
     > "$work_dir/findings.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/adapter-coverage" \
+    > "$work_dir/adapter-coverage.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
@@ -178,8 +183,17 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-report/v1" and
     .project.id == $project_id and
-    (.summary.unique_findings == (.findings | length))
+    (.summary.unique_findings == (.findings | length)) and
+    (.coverage.adapter_gaps.unattempted_adapters | type == "array") and
+    (.coverage.adapter_gaps.attempted_coverage_percent | type == "number")
   ' "$work_dir/report.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.available_adapters | type == "array") and
+    (.attempted_adapters | type == "array") and
+    (.successful_adapters | type == "array") and
+    (.unattempted_adapters | type == "array")
+  ' "$work_dir/adapter-coverage.json" >/dev/null
   jq -e '.version == "2.1.0" and (.runs | type == "array")' \
     "$work_dir/report.sarif" >/dev/null
   jq -e '

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from uuid import UUID
 
-from app.main import build_audit_export, build_defectdojo_report
+from app.main import build_audit_export, build_defectdojo_report, summarize_adapter_coverage
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
@@ -99,6 +99,31 @@ class AuditExportTests(unittest.TestCase):
         self.assertTrue(report["truncated"])
         self.assertEqual(report["events"][0]["event_type"], "run.approved")
         self.assertEqual(report["events"][0]["details"]["token"], "[REDACTED]")
+
+
+class AdapterCoverageSummaryTests(unittest.TestCase):
+    def test_separates_successful_failed_and_unattempted_adapters(self):
+        rows = [
+            ("httpx", "observe", "succeeded", 2, 2, NOW),
+            ("nuclei-reviewed", "controlled-active", "failed", 1, 1, NOW),
+            ("not-configured", "observe", "succeeded", 1, 1, NOW),
+        ]
+        summary = summarize_adapter_coverage(
+            rows, ["httpx", "nuclei-reviewed", "testssl", "httpx"]
+        )
+        self.assertEqual(summary["available_adapters"], ["httpx", "nuclei-reviewed", "testssl"])
+        self.assertEqual(summary["attempted_adapters"], ["httpx", "nuclei-reviewed"])
+        self.assertEqual(summary["successful_adapters"], ["httpx"])
+        self.assertEqual(summary["attempted_without_success"], ["nuclei-reviewed"])
+        self.assertEqual(summary["unattempted_adapters"], ["testssl"])
+        self.assertEqual(summary["attempted_coverage_percent"], 66.7)
+        self.assertEqual(summary["successful_coverage_percent"], 33.3)
+
+    def test_empty_adapter_inventory_is_explicit(self):
+        summary = summarize_adapter_coverage([], [])
+        self.assertEqual(summary["attempted_coverage_percent"], 0)
+        self.assertEqual(summary["successful_coverage_percent"], 0)
+        self.assertEqual(summary["unattempted_adapters"], [])
 
 
 if __name__ == "__main__":
