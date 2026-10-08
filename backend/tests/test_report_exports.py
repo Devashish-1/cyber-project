@@ -10,6 +10,7 @@ from app.main import (
     build_audit_export,
     build_defectdojo_report,
     parse_burp_issues,
+    serialize_burp_import_row,
     summarize_adapter_coverage,
     summarize_assessment_provenance,
     summarize_coverage_gaps,
@@ -49,6 +50,27 @@ class CoverageClassificationTests(unittest.TestCase):
 
 
 class BurpImportTests(unittest.TestCase):
+    def test_history_serialization_allowlists_sanitized_metadata(self):
+        run_id = UUID("11111111-1111-1111-1111-111111111111")
+        target_id = UUID("22222222-2222-2222-2222-222222222222")
+        row = (
+            run_id, target_id, "https://app.example.test", "succeeded", "operator", NOW,
+            {
+                "filename": "burp-export.xml", "sha256": "a" * 64,
+                "authorization_reference": "approved-session-7", "imported_count": 4,
+                "skipped_out_of_scope": 2, "skipped_excluded": 1, "duplicate_count": 3,
+                "raw_request": "Authorization: Bearer secret",
+                "password": "must-not-leak",
+            },
+        )
+        result = serialize_burp_import_row(row)
+        self.assertEqual(result["run_id"], run_id)
+        self.assertEqual(result["filename"], "burp-export.xml")
+        self.assertEqual(result["imported_count"], 4)
+        self.assertNotIn("raw_request", result)
+        self.assertNotIn("password", result)
+        self.assertNotIn("secret", str(result))
+
     def test_imports_only_unique_in_scope_non_excluded_metadata(self):
         document = b"""<issues>
           <issue><serialNumber>1</serialNumber><type>123</type><name>Reflected input</name><host>https://app.example.test</host><path>/search?q=secret</path><severity>High</severity><confidence>Certain</confidence><requestresponse><request>Cookie: secret</request></requestresponse></issue>

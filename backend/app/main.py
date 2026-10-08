@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.152.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.153.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2140,6 +2140,23 @@ async def import_burp_findings(
     }
 
 
+def serialize_burp_import_row(row: tuple) -> dict:
+    details = row[6] if isinstance(row[6], dict) else {}
+    return {
+        "run_id": row[0], "target_id": row[1], "target": row[2],
+        "status": row[3], "requested_by": row[4], "created_at": row[5],
+        "filename": str(details.get("filename") or "Burp XML export"),
+        "sha256": str(details.get("sha256") or ""),
+        "authorization_reference": str(
+            details.get("authorization_reference") or "Not recorded"
+        ),
+        "imported_count": int(details.get("imported_count") or 0),
+        "skipped_out_of_scope": int(details.get("skipped_out_of_scope") or 0),
+        "skipped_excluded": int(details.get("skipped_excluded") or 0),
+        "duplicate_count": int(details.get("duplicate_count") or 0),
+    }
+
+
 @app.get("/projects/{project_id}/imports/burp")
 def list_burp_imports(project_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
@@ -2171,22 +2188,7 @@ def list_burp_imports(project_id: UUID) -> dict:
             rows = cursor.fetchall()
     return {
         "project_id": project_id,
-        "imports": [
-            {
-                "run_id": row[0], "target_id": row[1], "target": row[2],
-                "status": row[3], "requested_by": row[4], "created_at": row[5],
-                "filename": str(row[6].get("filename") or "Burp XML export"),
-                "sha256": str(row[6].get("sha256") or ""),
-                "authorization_reference": str(
-                    row[6].get("authorization_reference") or "Not recorded"
-                ),
-                "imported_count": int(row[6].get("imported_count") or 0),
-                "skipped_out_of_scope": int(row[6].get("skipped_out_of_scope") or 0),
-                "skipped_excluded": int(row[6].get("skipped_excluded") or 0),
-                "duplicate_count": int(row[6].get("duplicate_count") or 0),
-            }
-            for row in rows
-        ],
+        "imports": [serialize_burp_import_row(row) for row in rows],
     }
 
 
