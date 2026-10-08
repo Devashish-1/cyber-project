@@ -2402,7 +2402,7 @@ def normalize_feroxbuster(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def write_dnsx_output(raw_output: bytes, output_file: Path) -> None:
+def write_dnsx_output(raw_output: bytes, output_file: Path, expected_host: str) -> None:
     results = []
     for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
         if not raw_line.strip():
@@ -2412,7 +2412,7 @@ def write_dnsx_output(raw_output: bytes, output_file: Path) -> None:
         except json.JSONDecodeError:
             continue
         host = str(item.get("host") or "").lower().rstrip(".")[:253]
-        if not host:
+        if not host or host != expected_host.lower().rstrip("."):
             continue
         addresses = []
         for raw_address in (item.get("a") or [])[:32]:
@@ -2479,7 +2479,7 @@ def normalize_dnsx(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def write_massdns_output(raw_output: bytes, output_file: Path) -> None:
+def write_massdns_output(raw_output: bytes, output_file: Path, expected_host: str) -> None:
     results = []
     for raw_line in raw_output.decode("utf-8", errors="replace").splitlines():
         try:
@@ -2487,7 +2487,11 @@ def write_massdns_output(raw_output: bytes, output_file: Path) -> None:
         except json.JSONDecodeError:
             continue
         host = str(item.get("name") or "").lower().rstrip(".")[:253]
-        if not host or str(item.get("type") or "").upper() != "A":
+        if (
+            not host
+            or host != expected_host.lower().rstrip(".")
+            or str(item.get("type") or "").upper() != "A"
+        ):
             continue
         addresses = []
         ttls = []
@@ -2555,7 +2559,7 @@ def normalize_massdns(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def write_dnsrecon_output(raw_file: Path, output_file: Path) -> None:
+def write_dnsrecon_output(raw_file: Path, output_file: Path, root_domain: str) -> None:
     results = []
     try:
         report = json.loads(raw_file.read_text(encoding="utf-8"))
@@ -2567,6 +2571,9 @@ def write_dnsrecon_output(raw_file: Path, output_file: Path) -> None:
         if not isinstance(item, dict) or str(item.get("type") or "").upper() != "A":
             continue
         host = str(item.get("name") or "").lower().rstrip(".")[:253]
+        root = root_domain.lower().rstrip(".")
+        if not host or not (host == root or host.endswith(f".{root}")):
+            continue
         try:
             address = str(ipaddress.ip_address(str(item.get("address") or "")))
         except ValueError:
@@ -5251,7 +5258,8 @@ def execute_run(run_id: UUID) -> None:
         elif run["tool_id"] == "dnsx":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
-                write_dnsx_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
+                host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+                write_dnsx_output(capture_container_logs(container, stdout=True, stderr=False), output_file, host)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "dnsx execution failed; raw output omitted"}) + "\n",
@@ -5263,7 +5271,8 @@ def execute_run(run_id: UUID) -> None:
                 encoding="utf-8",
             )
             if exit_code == 0:
-                write_massdns_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
+                host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+                write_massdns_output(capture_container_logs(container, stdout=True, stderr=False), output_file, host)
             else:
                 output_file.write_text(
                     json.dumps({"results": [], "error": "MassDNS execution failed; raw output omitted"}) + "\n",
@@ -5276,7 +5285,8 @@ def execute_run(run_id: UUID) -> None:
                     "DNSRecon raw resolver output and invocation metadata omitted; A records normalized.\n",
                     encoding="utf-8",
                 )
-                write_dnsrecon_output(raw_file, output_file)
+                host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
+                write_dnsrecon_output(raw_file, output_file, host)
             else:
                 diagnostic = capture_container_logs(container, stdout=True, stderr=True).decode("utf-8", errors="replace")[-4096:]
                 host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")

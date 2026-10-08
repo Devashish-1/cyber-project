@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 import yaml
 
@@ -9,6 +12,9 @@ from app.runner import (
     parse_amass_names,
     parse_spiderfoot_hosts,
     parse_theharvester_hosts,
+    write_dnsrecon_output,
+    write_dnsx_output,
+    write_massdns_output,
 )
 
 
@@ -156,6 +162,44 @@ class AdapterContractTests(unittest.TestCase):
             parse_spiderfoot_hosts(payload, "authorized.example.test"),
             ["api.authorized.example.test"],
         )
+
+    def test_dnsx_writer_rejects_unexpected_hosts(self):
+        raw = b'\n'.join([
+            json.dumps({"host": "authorized.example.test", "a": ["192.0.2.10"]}).encode(),
+            json.dumps({"host": "evil.invalid", "a": ["192.0.2.66"]}).encode(),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "dnsx.json"
+            write_dnsx_output(raw, output, "authorized.example.test")
+            results = json.loads(output.read_text())["results"]
+        self.assertEqual([item["host"] for item in results], ["authorized.example.test"])
+
+    def test_massdns_writer_rejects_unexpected_hosts(self):
+        def record(host, address):
+            return json.dumps({
+                "name": host,
+                "type": "A",
+                "data": {"answers": [{"type": "A", "data": address, "ttl": 60}]},
+            })
+        raw = (record("authorized.example.test", "192.0.2.10") + "\n" + record("evil.invalid", "192.0.2.66")).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "massdns.json"
+            write_massdns_output(raw, output, "authorized.example.test")
+            results = json.loads(output.read_text())["results"]
+        self.assertEqual([item["host"] for item in results], ["authorized.example.test"])
+
+    def test_dnsrecon_writer_rejects_out_of_scope_suffixes(self):
+        payload = [
+            {"type": "A", "name": "api.authorized.example.test", "address": "192.0.2.10"},
+            {"type": "A", "name": "api.authorized.example.test.evil.invalid", "address": "192.0.2.66"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "dnsrecon-raw.json"
+            output = Path(directory) / "dnsrecon.json"
+            raw.write_text(json.dumps(payload), encoding="utf-8")
+            write_dnsrecon_output(raw, output, "authorized.example.test")
+            results = json.loads(output.read_text())["results"]
+        self.assertEqual([item["host"] for item in results], ["api.authorized.example.test"])
 
 
 if __name__ == "__main__":
