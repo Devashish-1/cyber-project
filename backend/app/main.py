@@ -282,7 +282,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.109.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.110.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1058,13 +1058,20 @@ def local_validation_status() -> dict:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=503, detail="Local validation status is unreadable") from exc
     required = {"started_at", "finished_at", "mode", "status"}
-    if not required.issubset(payload) or payload["mode"] not in {"quick", "full"} or payload["status"] != "passed":
+    if (
+        not required.issubset(payload)
+        or payload["mode"] not in {"quick", "full"}
+        or payload["status"] not in {"running", "passed", "failed"}
+        or (payload["status"] == "running") != (payload["finished_at"] is None)
+    ):
         raise HTTPException(status_code=503, detail="Local validation status has an invalid schema")
     try:
-        finished_at = datetime.fromisoformat(str(payload["finished_at"]).replace("Z", "+00:00"))
+        reference_at = datetime.fromisoformat(
+            str(payload["finished_at"] or payload["started_at"]).replace("Z", "+00:00")
+        )
     except ValueError as exc:
         raise HTTPException(status_code=503, detail="Local validation timestamp is invalid") from exc
-    age_seconds = max(0, int((datetime.now(timezone.utc) - finished_at).total_seconds()))
+    age_seconds = max(0, int((datetime.now(timezone.utc) - reference_at).total_seconds()))
     return {
         "available": True,
         "started_at": payload["started_at"],

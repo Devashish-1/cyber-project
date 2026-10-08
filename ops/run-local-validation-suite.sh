@@ -16,6 +16,27 @@ if ! flock -n 9; then
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+status_file=data/tmp/local-validation-suite.json
+suite_passed=false
+write_status() {
+  local status="$1" finished_at="$2"
+  if [[ -n "$finished_at" ]]; then
+    printf '{"started_at":"%s","finished_at":"%s","mode":"%s","status":"%s"}\n' \
+      "$started_at" "$finished_at" "$mode" "$status" >"$status_file"
+  else
+    printf '{"started_at":"%s","finished_at":null,"mode":"%s","status":"%s"}\n' \
+      "$started_at" "$mode" "$status" >"$status_file"
+  fi
+  chmod 600 "$status_file"
+}
+finish_suite() {
+  local rc=$? status=failed
+  [[ "$suite_passed" == true ]] && status=passed
+  write_status "$status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  return "$rc"
+}
+trap finish_suite EXIT
+write_status running ''
 echo "Local validation suite started: $started_at (mode=$mode)"
 
 docker inspect -f '{{.State.Status}}' security-platform-local-lab | grep -Fxq running
@@ -33,8 +54,5 @@ if [[ "$mode" == full ]]; then
   ./ops/run-local-batch-validation.sh
 fi
 
-finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-printf '{"started_at":"%s","finished_at":"%s","mode":"%s","status":"passed"}\n' \
-  "$started_at" "$finished_at" "$mode" >data/tmp/local-validation-suite.json
-chmod 600 data/tmp/local-validation-suite.json
+suite_passed=true
 echo "LOCAL VALIDATION SUITE PASSED ($mode)"

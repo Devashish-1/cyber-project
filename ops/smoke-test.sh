@@ -46,7 +46,7 @@ jq -e '.totals.implemented > 0 and (.totals.immutable_images == .totals.implemen
 curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
 jq -e '
   (.available == true) and
-  (.status == "passed") and
+  (.status == "running" or .status == "passed" or .status == "failed") and
   (.mode == "quick" or .mode == "full") and
   (.age_seconds | type == "number")
 ' "$work_dir/local-validation.json" >/dev/null
