@@ -50,7 +50,9 @@ jq -e '
   (.totals.validated > 0) and
   (.totals.validation_pending >= 0) and
   ((.validation | length) == .totals.implemented) and
-  (([.validation[] | select(.validated == true)] | length) == .totals.validated)
+  (([.validation[] | select(.validated == true)] | length) == .totals.validated) and
+  ([.validation[] | has("current_image") and has("proven_image") and has("image_matches") and has("integrity_status")] | all) and
+  ([.validation[] | select(.validated == true) | (.image_matches == true and .integrity_status == "verified")] | all)
 ' "$work_dir/coverage.json" >/dev/null
 curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
 jq -e '

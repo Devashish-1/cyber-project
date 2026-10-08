@@ -286,7 +286,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.113.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.114.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1032,31 +1032,76 @@ def coverage() -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT tool_id,
-                       count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
-                       count(*) FILTER (WHERE status = 'failed') AS failed,
-                       max(finished_at) FILTER (WHERE status = 'succeeded') AS last_succeeded_at
-                FROM runs
-                GROUP BY tool_id
+                WITH counts AS (
+                    SELECT tool_id,
+                           count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+                           count(*) FILTER (WHERE status = 'failed') AS failed
+                    FROM runs
+                    GROUP BY tool_id
+                ), latest AS (
+                    SELECT DISTINCT ON (tool_id)
+                           tool_id, id, finished_at, evidence_manifest_sha256, evidence_sealed_at
+                    FROM runs
+                    WHERE status = 'succeeded'
+                    ORDER BY tool_id, finished_at DESC NULLS LAST, created_at DESC
+                )
+                SELECT counts.tool_id, counts.succeeded, counts.failed,
+                       latest.id, latest.finished_at,
+                       latest.evidence_manifest_sha256, latest.evidence_sealed_at
+                FROM counts
+                LEFT JOIN latest USING (tool_id)
                 """
             )
             run_history = {
                 row[0]: {
                     "succeeded": int(row[1] or 0),
                     "failed": int(row[2] or 0),
-                    "last_succeeded_at": row[3].isoformat() if row[3] else None,
+                    "last_run_id": row[3],
+                    "last_succeeded_at": row[4].isoformat() if row[4] else None,
+                    "manifest_sha256": row[5],
+                    "sealed_at": row[6],
                 }
                 for row in cursor.fetchall()
             }
     validation = []
     for name in implemented_names:
-        history = run_history.get(name, {"succeeded": 0, "failed": 0, "last_succeeded_at": None})
+        history = run_history.get(name, {
+            "succeeded": 0, "failed": 0, "last_run_id": None,
+            "last_succeeded_at": None, "manifest_sha256": None, "sealed_at": None,
+        })
+        current_image = str(configured[name].get("image") or "")
+        proven_image = None
+        integrity_status = "unsealed"
+        run_id = history["last_run_id"]
+        if run_id:
+            run_directory = EVIDENCE_ROOT / str(run_id)
+            metadata_path = run_directory / "metadata.json"
+            try:
+                if metadata_path.is_symlink() or not metadata_path.is_file():
+                    raise OSError("metadata is missing")
+                if metadata_path.stat().st_size > MAX_EVIDENCE_BYTES:
+                    raise OSError("metadata exceeds read limit")
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                proven_image = str(metadata.get("image") or "")
+                integrity_status = verify_evidence_integrity(
+                    run_id, run_directory, history["manifest_sha256"], history["sealed_at"]
+                )["status"]
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, HTTPException):
+                integrity_status = "failed"
+        image_matches = bool(proven_image and proven_image == current_image)
         validation.append({
             "id": name,
             "input": str(configured[name].get("input") or "target"),
             "profile": str(configured[name].get("profile") or "unknown"),
-            "validated": history["succeeded"] > 0,
-            **history,
+            "validated": image_matches and integrity_status == "verified",
+            "succeeded": history["succeeded"],
+            "failed": history["failed"],
+            "last_run_id": run_id,
+            "last_succeeded_at": history["last_succeeded_at"],
+            "current_image": current_image,
+            "proven_image": proven_image,
+            "image_matches": image_matches,
+            "integrity_status": integrity_status,
         })
     validated_count = sum(1 for item in validation if item["validated"])
     return {
