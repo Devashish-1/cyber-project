@@ -51,6 +51,7 @@ RUN_PLANS = {
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
+MAX_IMAGE_AUDIT_AGE_HOURS = int(os.getenv("MAX_IMAGE_AUDIT_AGE_HOURS", "168"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
 MAX_SOURCE_FILES = 5_000
@@ -73,8 +74,9 @@ if (
     or not 1 <= MAX_TOOL_LOG_LINES <= 100_000
     or not MAX_TOOL_OUTPUT_BYTES <= MAX_RUN_EVIDENCE_BYTES <= 1024 * 1024 * 1024
     or not 4 <= MAX_RUN_EVIDENCE_FILES <= 256
+    or not 1 <= MAX_IMAGE_AUDIT_AGE_HOURS <= 8760
 ):
-    raise RuntimeError("Storage admission thresholds are invalid")
+    raise RuntimeError("Platform safety thresholds are invalid")
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
 
 
@@ -271,7 +273,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.104.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.105.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1094,9 +1096,14 @@ def image_audit_status() -> dict:
         except (OSError, UnicodeDecodeError):
             checksum_verified = False
     metadata = report.get("Metadata") if isinstance(report.get("Metadata"), dict) else {}
+    audited_at = datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc)
+    age_seconds = max(0, int((datetime.now(timezone.utc) - audited_at).total_seconds()))
     return {
         "available": True,
-        "audited_at": datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc),
+        "audited_at": audited_at,
+        "age_seconds": age_seconds,
+        "fresh": age_seconds <= MAX_IMAGE_AUDIT_AGE_HOURS * 3600,
+        "max_age_hours": MAX_IMAGE_AUDIT_AGE_HOURS,
         "artifact_name": str(report.get("ArtifactName") or "local image"),
         "artifact_type": str(report.get("ArtifactType") or "container_image"),
         "image_id": str(metadata.get("ImageID") or ""),

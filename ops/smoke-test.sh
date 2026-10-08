@@ -39,6 +39,8 @@ jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null
 curl --config "$curl_config" "$base_url/image-audit-status" > "$work_dir/image-audit.json"
 jq -e '
   (.available == true) and
+  (.fresh | type == "boolean") and
+  (.age_seconds | type == "number") and
   (.severity_counts.critical | type == "number") and
   (.fixable_counts.high | type == "number") and
   (.sbom.available == true) and
