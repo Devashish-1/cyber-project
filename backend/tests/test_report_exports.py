@@ -8,6 +8,7 @@ from app.main import (
     build_defectdojo_report,
     summarize_adapter_coverage,
     summarize_role_coverage,
+    summarize_target_coverage,
 )
 
 
@@ -168,6 +169,34 @@ class RoleCoverageSummaryTests(unittest.TestCase):
         self.assertEqual(coverage["profiles"], [])
         self.assertEqual(coverage["summary"]["configured_profiles"], 0)
         self.assertEqual(coverage["summary"]["tested_coverage_percent"], 0)
+
+
+class TargetCoverageSummaryTests(unittest.TestCase):
+    def test_keeps_coverage_separate_for_each_target(self):
+        first = UUID("77777777-7777-7777-7777-777777777777")
+        second = UUID("88888888-8888-8888-8888-888888888888")
+        rows = [
+            (first, "https://a.example.test", "httpx", "succeeded", 2, NOW),
+            (first, "https://a.example.test", "nuclei-reviewed", "failed", 1, NOW),
+            (second, "https://b.example.test", None, None, 0, None),
+        ]
+        coverage = summarize_target_coverage(rows, ["httpx", "nuclei-reviewed"])
+        targets = {str(item["id"]): item for item in coverage["targets"]}
+        self.assertEqual(targets[str(first)]["attempted_adapters"], ["httpx", "nuclei-reviewed"])
+        self.assertEqual(targets[str(first)]["successful_adapters"], ["httpx"])
+        self.assertEqual(targets[str(first)]["successful_coverage_percent"], 50.0)
+        self.assertEqual(targets[str(second)]["attempted_adapters"], [])
+        self.assertEqual(targets[str(second)]["unattempted_adapters"], ["httpx", "nuclei-reviewed"])
+        self.assertEqual(targets[str(second)]["attempted_coverage_percent"], 0.0)
+
+    def test_ignores_source_only_or_unknown_adapters(self):
+        target_id = UUID("99999999-9999-9999-9999-999999999999")
+        coverage = summarize_target_coverage([
+            (target_id, "https://app.example.test", "semgrep", "succeeded", 1, NOW),
+        ], ["httpx"])
+        target = coverage["targets"][0]
+        self.assertEqual(target["attempted_adapters"], [])
+        self.assertEqual(target["run_count"], 0)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.131' "$work_dir/dashboard.html"
+grep -q 'UI v0.132' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -34,6 +34,7 @@ grep -q 'id="tool-status"' "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
+grep -q 'Per-target coverage' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -74,6 +75,7 @@ jq -e '
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
   and (.paths["/projects/{project_id}/role-coverage"] != null)
+  and (.paths["/projects/{project_id}/target-coverage"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -172,6 +174,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/role-coverage" \
     > "$work_dir/role-coverage.json"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/target-coverage" \
+    > "$work_dir/target-coverage.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
@@ -220,6 +225,19 @@ if [ -n "$project_id" ]; then
       (has("password") | not)
     )
   ' "$work_dir/role-coverage.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .project_id == $project_id and
+    (.available_adapters | type == "array") and
+    (.targets | type == "array") and
+    all(.targets[];
+      (.base_url | type == "string") and
+      (.attempted_adapters | type == "array") and
+      (.successful_adapters | type == "array") and
+      (.unattempted_adapters | type == "array") and
+      (.attempted_coverage_percent | type == "number") and
+      (.successful_coverage_percent | type == "number")
+    )
+  ' "$work_dir/target-coverage.json" >/dev/null
   jq -e '
     .version == "2.1.0" and
     (.runs | type == "array") and
