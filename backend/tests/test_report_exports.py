@@ -9,6 +9,7 @@ from app.main import (
     SUPERVISED_ADAPTER_EXECUTION_MODES,
     build_audit_export,
     build_defectdojo_report,
+    normalize_upload_filename,
     parse_burp_issues,
     serialize_burp_import_row,
     summarize_adapter_coverage,
@@ -21,6 +22,21 @@ from app.main import (
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
+
+
+class UploadFilenameTests(unittest.TestCase):
+    def test_normalizes_browser_and_posix_paths_to_a_basename(self):
+        self.assertEqual(
+            normalize_upload_filename(r"C:\fakepath\burp-export.xml"),
+            "burp-export.xml",
+        )
+        self.assertEqual(normalize_upload_filename("../../source.zip"), "source.zip")
+
+    def test_rejects_empty_oversized_or_control_character_names(self):
+        for filename in ("", "a" * 256 + ".xml", "report\n.xml", "\x7freport.xml"):
+            with self.subTest(filename=repr(filename)):
+                with self.assertRaisesRegex(ValueError, "filename"):
+                    normalize_upload_filename(filename)
 
 
 class ManualImportDeleteTests(unittest.TestCase):

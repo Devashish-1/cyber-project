@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.153.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.154.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -671,6 +671,18 @@ def sanitize_evidence(value):
     if isinstance(value, list):
         return [sanitize_evidence(item) for item in value]
     return value
+
+
+def normalize_upload_filename(value: str | None) -> str:
+    filename = PurePosixPath(str(value or "").replace("\\", "/")).name.strip()
+    if (
+        not filename
+        or filename in {".", ".."}
+        or len(filename) > 255
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+    ):
+        raise ValueError("Upload filename is invalid")
+    return filename
 
 
 def parse_burp_issues(
@@ -1913,7 +1925,10 @@ async def upload_source_artifact(
     if not authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit source authorization confirmation is required")
     storage_admission(enforce=True)
-    filename = Path(archive.filename or "").name
+    try:
+        filename = normalize_upload_filename(archive.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not filename.lower().endswith(".zip"):
         raise HTTPException(status_code=422, detail="Only ZIP source archives are accepted")
 
@@ -2056,7 +2071,10 @@ async def import_burp_findings(
 ) -> dict:
     if not authorization_confirmed:
         raise HTTPException(status_code=422, detail="Explicit Burp import authorization is required")
-    filename = Path(report.filename or "").name
+    try:
+        filename = normalize_upload_filename(report.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not filename.lower().endswith(".xml"):
         raise HTTPException(status_code=422, detail="Only Burp XML exports are accepted")
     document = bytearray()
