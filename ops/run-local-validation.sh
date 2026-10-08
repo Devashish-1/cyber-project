@@ -56,7 +56,10 @@ done
 run_json="$(api_get "/runs/$run_id")"
 obs_json="$(api_get "/runs/$run_id/observations")"
 count="$(jq '.observations | length' <<<"$obs_json")"
+integrity_json="$(api_get "/projects/$project_id/evidence-integrity")"
+integrity_status="$(jq -r --arg run "$run_id" '.runs[] | select(.run_id == $run) | .integrity_status' <<<"$integrity_json")"
 echo "Final status: $status; normalized observations: $count"
+echo "Evidence integrity: $integrity_status"
 jq '{id,status,tool_id,profile,error_message}' <<<"$run_json"
 jq '{types:(.observations | map(.type) | unique), severities:(.observations | group_by(.severity) | map({severity:.[0].severity,count:length}))}' <<<"$obs_json"
 
@@ -65,6 +68,7 @@ find "$evidence_dir" -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
 
 [[ "$status" == succeeded ]]
 [[ "$count" -ge 1 ]]
+[[ "$integrity_status" == verified ]]
 test -s "$evidence_dir/metadata.json"
 test -s "$evidence_dir/events.jsonl"
 echo 'LOCAL VALIDATION PASSED'
