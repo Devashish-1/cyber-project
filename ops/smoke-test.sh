@@ -59,7 +59,7 @@ curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/lo
 jq -e '
   (.available == true) and
   (.status == "running" or .status == "passed" or .status == "failed") and
-  (.mode == "quick" or .mode == "full") and
+  (.mode == "quick" or .mode == "full" or .mode == "exhaustive") and
   (.age_seconds | type == "number")
 ' "$work_dir/local-validation.json" >/dev/null
 curl --config "$curl_config" "$base_url/local-source-validation-status" > "$work_dir/local-source-validation.json"
@@ -94,6 +94,19 @@ for kind in report sbom checksums; do
 done
 (cd "$work_dir/image-audit" && sha256sum -c "$(jq -r '.checksums.filename' ../image-audit.json)" >/dev/null)
 project_id="$(jq -r '.projects[0].id // empty' "$work_dir/projects.json")"
+
+local_project_id="$(jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' "$work_dir/projects.json" | head -n1)"
+if [ -n "$local_project_id" ]; then
+  curl --config "$curl_config" "$base_url/projects/$local_project_id/targets" > "$work_dir/local-targets.json"
+  local_target_id="$(jq -r '.targets[] | select(.allow_third_party_services == false) | .id' "$work_dir/local-targets.json" | head -n1)"
+  if [ -n "$local_target_id" ]; then
+    third_party_status="$(curl --config "$curl_config" --no-fail -sS -o "$work_dir/third-party-denied.json" -w '%{http_code}' \
+      -H 'Content-Type: application/json' -X POST "$base_url/projects/$local_project_id/runs" \
+      -d "{\"target_id\":\"$local_target_id\",\"tool_id\":\"subfinder\",\"profile\":\"controlled-active\",\"requested_by\":\"smoke-policy-check\",\"approval_confirmed\":true}")"
+    test "$third_party_status" = 409
+    jq -e '.detail | contains("third-party")' "$work_dir/third-party-denied.json" >/dev/null
+  fi
+fi
 
 if [ -n "$project_id" ]; then
   curl --config "$curl_config" \
