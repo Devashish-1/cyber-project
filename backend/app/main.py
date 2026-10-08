@@ -4,6 +4,7 @@ import gzip
 import io
 import ipaddress
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -11,10 +12,11 @@ import stat
 import time
 import tarfile
 import zipfile
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import UUID, uuid4
 
 import psycopg
@@ -82,6 +84,8 @@ MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
 MAX_SOURCE_FILES = 5_000
+MAX_BURP_IMPORT_BYTES = 10 * 1024 * 1024
+MAX_BURP_IMPORT_ISSUES = 1_000
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_LINES = 200
 MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**3)))
@@ -304,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.145.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.146.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -662,6 +666,98 @@ def sanitize_evidence(value):
     if isinstance(value, list):
         return [sanitize_evidence(item) for item in value]
     return value
+
+
+def parse_burp_issues(
+    document: bytes, base_url: str, allowed_hosts: list[str], excluded_paths: list[str]
+) -> dict:
+    if not document:
+        raise ValueError("Burp XML export is empty")
+    if len(document) > MAX_BURP_IMPORT_BYTES:
+        raise ValueError("Burp XML export exceeds 10 MiB limit")
+    lowered = document.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise ValueError("DTD and entity declarations are not accepted")
+    try:
+        root = ET.fromstring(document)
+    except ET.ParseError as exc:
+        raise ValueError("Burp XML export is malformed") from exc
+
+    def local_name(element: ET.Element) -> str:
+        return str(element.tag).rsplit("}", 1)[-1].lower()
+
+    def child_text(children: dict[str, ET.Element], name: str, limit: int) -> str:
+        value = "".join(children.get(name, ET.Element(name)).itertext()).strip()
+        return re.sub(r"\s+", " ", value)[:limit]
+
+    base = urlsplit(base_url)
+    allowed = {str(host).strip().lower().rstrip(".") for host in allowed_hosts}
+    observations: list[dict] = []
+    seen: set[str] = set()
+    skipped_out_of_scope = 0
+    skipped_excluded = 0
+    duplicate_count = 0
+    issues = [element for element in root.iter() if local_name(element) == "issue"]
+    if len(issues) > MAX_BURP_IMPORT_ISSUES:
+        raise ValueError("Burp XML export exceeds 1,000-issue limit")
+
+    severity_map = {
+        "information": "info", "info": "info", "low": "low", "medium": "medium",
+        "high": "high", "critical": "critical",
+    }
+    for issue in issues:
+        children = {local_name(child): child for child in issue}
+        title = child_text(children, "name", 500) or "Burp finding"
+        host_text = child_text(children, "host", 2048)
+        candidate = host_text if "://" in host_text else f"{base.scheme or 'https'}://{host_text}"
+        parsed = urlsplit(candidate)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if not hostname or hostname not in allowed:
+            skipped_out_of_scope += 1
+            continue
+        raw_path = child_text(children, "path", 2048) or parsed.path or "/"
+        path = unquote(urlsplit(raw_path).path or "/")
+        path = "/" + posixpath.normpath("/" + path.lstrip("/")).lstrip("/")
+        if target_path_is_excluded(path, excluded_paths):
+            skipped_excluded += 1
+            continue
+        scheme = parsed.scheme.lower() if parsed.scheme.lower() in {"http", "https"} else (base.scheme or "https")
+        display_host = f"[{hostname}]" if ":" in hostname else hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            skipped_out_of_scope += 1
+            continue
+        default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+        origin = f"{scheme}://{display_host}{'' if port is None or default_port else f':{port}'}"
+        asset = f"{origin}{path}"[:2000]
+        issue_type = child_text(children, "type", 120)
+        severity = severity_map.get(child_text(children, "severity", 40).lower(), "info")
+        details = {
+            "source": "burp-xml",
+            "confidence": child_text(children, "confidence", 80),
+            "issue_type": issue_type,
+            "serial_number": child_text(children, "serialnumber", 120),
+            "path": path,
+            "raw_request_response_retained": False,
+        }
+        fingerprint = hashlib.sha256(
+            f"burp-suite-community|{issue_type}|{title}|{asset}".encode("utf-8")
+        ).hexdigest()
+        if fingerprint in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fingerprint)
+        observations.append({
+            "type": "burp-finding", "title": title, "severity": severity,
+            "asset": asset, "details": details, "fingerprint": fingerprint,
+        })
+    return {
+        "observations": observations,
+        "skipped_out_of_scope": skipped_out_of_scope,
+        "skipped_excluded": skipped_excluded,
+        "duplicate_count": duplicate_count,
+    }
 
 
 def sarif_review_metadata(finding: dict) -> tuple[dict, dict]:
@@ -1941,6 +2037,101 @@ def list_source_artifacts(project_id: UUID) -> dict:
             }
             for row in rows
         ]
+    }
+
+
+@app.post("/projects/{project_id}/imports/burp", status_code=201)
+async def import_burp_findings(
+    project_id: UUID,
+    report: UploadFile = File(...),
+    target_id: UUID = Form(...),
+    requested_by: str = Form(..., min_length=2, max_length=120),
+    authorization_reference: str = Form(..., min_length=3, max_length=500),
+    authorization_confirmed: bool = Form(...),
+) -> dict:
+    if not authorization_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit Burp import authorization is required")
+    filename = Path(report.filename or "").name
+    if not filename.lower().endswith(".xml"):
+        raise HTTPException(status_code=422, detail="Only Burp XML exports are accepted")
+    document = bytearray()
+    while chunk := await report.read(1024 * 1024):
+        document.extend(chunk)
+        if len(document) > MAX_BURP_IMPORT_BYTES:
+            raise HTTPException(status_code=413, detail="Burp XML export exceeds 10 MiB limit")
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT base_url, allowed_hosts, excluded_paths, authorization_confirmed
+                FROM targets WHERE id = %s AND project_id = %s
+                """,
+                (target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Authorized target not found in project")
+            if not target[3]:
+                raise HTTPException(status_code=409, detail="Target authorization is not confirmed")
+            try:
+                parsed = parse_burp_issues(bytes(document), target[0], target[1], target[2])
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            observations = parsed["observations"]
+            if not observations:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Burp export contains no unique findings within the saved target scope",
+                )
+            run_id = uuid4()
+            cursor.execute(
+                """
+                INSERT INTO runs
+                    (id, project_id, target_id, tool_id, profile, status, requested_by,
+                     started_at, finished_at)
+                VALUES (%s, %s, %s, 'burp-suite-community', 'manual-import', 'succeeded',
+                        %s, NOW(), NOW())
+                """,
+                (run_id, project_id, target_id, requested_by),
+            )
+            cursor.executemany(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                [
+                    (
+                        uuid4(), run_id, item["type"], item["title"], item["severity"],
+                        item["asset"], Jsonb(item["details"]), item["fingerprint"],
+                    )
+                    for item in observations
+                ],
+            )
+            digest = hashlib.sha256(document).hexdigest()
+            record_audit(
+                cursor, project_id, "burp.findings_imported", requested_by,
+                "run", run_id,
+                {
+                    "target_id": str(target_id), "filename": filename, "sha256": digest,
+                    "authorization_reference": authorization_reference,
+                    "imported_count": len(observations),
+                    "skipped_out_of_scope": parsed["skipped_out_of_scope"],
+                    "skipped_excluded": parsed["skipped_excluded"],
+                    "duplicate_count": parsed["duplicate_count"],
+                    "raw_request_response_retained": False,
+                },
+            )
+    return {
+        "run_id": run_id,
+        "tool_id": "burp-suite-community",
+        "status": "succeeded",
+        "imported_count": len(observations),
+        "skipped_out_of_scope": parsed["skipped_out_of_scope"],
+        "skipped_excluded": parsed["skipped_excluded"],
+        "duplicate_count": parsed["duplicate_count"],
+        "sha256": digest,
     }
 
 

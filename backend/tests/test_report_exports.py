@@ -7,6 +7,7 @@ from app.main import (
     SUPERVISED_ADAPTER_EXECUTION_MODES,
     build_audit_export,
     build_defectdojo_report,
+    parse_burp_issues,
     summarize_adapter_coverage,
     summarize_coverage_gaps,
     summarize_role_coverage,
@@ -30,6 +31,35 @@ class CoverageClassificationTests(unittest.TestCase):
                 SUPERVISED_ADAPTER_EXECUTION_MODES
             )
         )
+
+
+class BurpImportTests(unittest.TestCase):
+    def test_imports_only_unique_in_scope_non_excluded_metadata(self):
+        document = b"""<issues>
+          <issue><serialNumber>1</serialNumber><type>123</type><name>Reflected input</name><host>https://app.example.test</host><path>/search?q=secret</path><severity>High</severity><confidence>Certain</confidence><requestresponse><request>Cookie: secret</request></requestresponse></issue>
+          <issue><serialNumber>2</serialNumber><type>123</type><name>Reflected input</name><host>https://app.example.test</host><path>/search?q=other</path><severity>High</severity><confidence>Certain</confidence></issue>
+          <issue><name>Excluded</name><host>https://app.example.test</host><path>/public/../logout</path><severity>Low</severity></issue>
+          <issue><name>Foreign</name><host>https://outside.example.test</host><path>/</path><severity>Critical</severity></issue>
+        </issues>"""
+        result = parse_burp_issues(
+            document, "https://app.example.test", ["app.example.test"], ["/logout"]
+        )
+        self.assertEqual(len(result["observations"]), 1)
+        self.assertEqual(result["duplicate_count"], 1)
+        self.assertEqual(result["skipped_excluded"], 1)
+        self.assertEqual(result["skipped_out_of_scope"], 1)
+        finding = result["observations"][0]
+        self.assertEqual(finding["severity"], "high")
+        self.assertEqual(finding["asset"], "https://app.example.test/search")
+        self.assertFalse(finding["details"]["raw_request_response_retained"])
+        self.assertNotIn("secret", str(finding))
+
+    def test_rejects_xml_entity_declarations(self):
+        with self.assertRaisesRegex(ValueError, "entity"):
+            parse_burp_issues(
+                b'<!DOCTYPE issues [<!ENTITY x "unsafe">]><issues/>',
+                "https://app.example.test", ["app.example.test"], [],
+            )
 
 
 def finding(**overrides) -> dict:
