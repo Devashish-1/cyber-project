@@ -45,6 +45,7 @@ services:
       ADAPTERS_PATH: /app/config/adapters.yaml
       EVIDENCE_ROOT: /evidence/runs
       SOURCE_ROOT: /sources
+      IMAGE_AUDIT_ROOT: /image-audits
       MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-10737418240}
       MAX_STORAGE_USED_PERCENT: ${MAX_STORAGE_USED_PERCENT:-90}
       MAX_PENDING_RUNS: ${MAX_PENDING_RUNS:-100}
@@ -57,6 +58,7 @@ services:
       - ./config:/app/config:ro
       - ./evidence:/evidence:ro
       - ./data/sources:/sources
+      - ./data/exports/image-audits:/image-audits:ro
     depends_on:
       postgres:
         condition: service_healthy

@@ -50,6 +50,7 @@ RUN_PLANS = {
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
+IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
 MAX_SOURCE_FILES = 5_000
@@ -270,7 +271,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.100.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.101.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1026,6 +1027,65 @@ def coverage() -> dict:
             for name in pending_names
         ],
         "non_adapter": non_adapter,
+    }
+
+
+@app.get("/image-audit-status")
+def image_audit_status() -> dict:
+    reports = [
+        path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json")
+        if path.is_file()
+    ]
+    if not reports:
+        return {"available": False, "detail": "No container image audit is available"}
+    latest = max(reports, key=lambda path: path.stat().st_mtime)
+    size = latest.stat().st_size
+    if size > 32 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Latest image audit exceeds the read limit")
+    try:
+        report = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="Latest image audit is unreadable") from exc
+    vulnerabilities = [
+        vulnerability
+        for result in report.get("Results", [])
+        if isinstance(result, dict)
+        for vulnerability in (result.get("Vulnerabilities") or [])
+        if isinstance(vulnerability, dict)
+    ]
+    severity_counts = {
+        severity.lower(): sum(
+            1 for item in vulnerabilities if item.get("Severity") == severity
+        )
+        for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+    }
+    fixable_counts = {
+        severity.lower(): sum(
+            1
+            for item in vulnerabilities
+            if item.get("Severity") == severity and item.get("FixedVersion")
+        )
+        for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+    }
+    prefix = latest.name.removesuffix(".trivy.json")
+    sbom = IMAGE_AUDIT_ROOT / f"{prefix}.sbom.json"
+    checksums = IMAGE_AUDIT_ROOT / f"{prefix}.sha256"
+    metadata = report.get("Metadata") if isinstance(report.get("Metadata"), dict) else {}
+    return {
+        "available": True,
+        "audited_at": datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc),
+        "artifact_name": str(report.get("ArtifactName") or "local image"),
+        "artifact_type": str(report.get("ArtifactType") or "container_image"),
+        "image_id": str(metadata.get("ImageID") or ""),
+        "report": {"filename": latest.name, "size_bytes": size},
+        "sbom": {"available": sbom.is_file(), "filename": sbom.name if sbom.is_file() else None},
+        "checksums": {
+            "available": checksums.is_file(),
+            "filename": checksums.name if checksums.is_file() else None,
+        },
+        "severity_counts": severity_counts,
+        "fixable_counts": fixable_counts,
+        "total_vulnerabilities": len(vulnerabilities),
     }
 
 

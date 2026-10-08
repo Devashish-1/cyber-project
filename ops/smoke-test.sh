@@ -26,6 +26,7 @@ test "$unauthenticated_status" = "401"
 curl --config "$curl_config" "$base_url/openapi.json" > "$work_dir/openapi.json"
 jq -e '
   (.info.version | type == "string") and
+  (.paths["/image-audit-status"] != null) and
   (.paths["/projects/{project_id}/report.json"] != null) and
   (.paths["/projects/{project_id}/report.sarif"] != null) and
   (.paths["/projects/{project_id}/report.md"] != null) and
@@ -34,6 +35,14 @@ jq -e '
 
 curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
 jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null
+curl --config "$curl_config" "$base_url/image-audit-status" > "$work_dir/image-audit.json"
+jq -e '
+  (.available == true) and
+  (.severity_counts.critical | type == "number") and
+  (.fixable_counts.high | type == "number") and
+  (.sbom.available == true) and
+  (.checksums.available == true)
+' "$work_dir/image-audit.json" >/dev/null
 project_id="$(jq -r '.projects[0].id // empty' "$work_dir/projects.json")"
 
 if [ -n "$project_id" ]; then
