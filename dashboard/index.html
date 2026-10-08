@@ -15,12 +15,13 @@
     .context-project{display:grid;gap:.35rem;min-width:min(520px,60%)}.context-label{color:#8fa2c9;font-size:.72rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase}.project-context-select{margin:0;background:#081327;border-color:#3b5484}.context-actions{display:flex;gap:.55rem}.context-actions button{width:auto;margin:0;white-space:nowrap}
     .tool-filters{display:grid;grid-template-columns:minmax(260px,2fr) minmax(180px,1fr);gap:1rem;margin:1rem 0}.tool-card{min-height:190px;display:flex;flex-direction:column}.tool-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}.tool-card-head h3{margin:.1rem 0}.tool-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;margin:.9rem 0}.tool-meta span{padding:.55rem;border:1px solid #293b60;border-radius:9px;background:#0a1428;color:#8fa2c9;font-size:.72rem}.tool-meta strong{display:block;margin-top:.2rem;color:#e8eeff;font-size:.8rem}.tool-card p{margin-top:auto}
     details.registry-card>summary{font-size:1.15rem}.nav button{transition:background .15s,border-color .15s,transform .15s}.nav button:hover{transform:translateX(2px)}
+    .export-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.8rem;margin-top:1rem}.export-card{display:flex;min-height:190px;flex-direction:column;padding:1rem;border:1px solid #2a3d65;border-radius:12px;background:#0a1429}.export-card.recommended{border-color:#416cd1;background:linear-gradient(145deg,#12234a,#0b1830)}.export-card h3{margin:.2rem 0}.export-card p{margin:.45rem 0}.export-card button{margin-top:auto}.export-label{color:#7f9de8;font-size:.7rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
     @media(max-width:760px){.context-bar{align-items:stretch;flex-direction:column}.context-project{min-width:0;width:100%}.context-actions button{flex:1}.tool-filters{grid-template-columns:1fr}.tool-meta{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <div class="app-shell">
-<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="tools" onclick="showView('tools')">⌘ Tool Catalog</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.99<br>Private operator console</div></aside>
+<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="tools" onclick="showView('tools')">⌘ Tool Catalog</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.100<br>Private operator console</div></aside>
 <main class="workspace">
   <header class="topbar">
 <div>
@@ -406,6 +407,17 @@
 </div>
   </article>
   <article style="margin-top:1rem">
+<h2 data-section="reports">Report center</h2>
+<p class="muted">Export the active project's normalized findings, scope, coverage, review decisions, and limitations. Raw evidence and credentials are excluded.</p>
+<div class="export-grid">
+  <section class="export-card recommended"><span class="export-label">Recommended</span><h3>Verified bundle</h3><p>Markdown, JSON, and SARIF together with a SHA-256 manifest for integrity checking.</p><button onclick="downloadReportBundle()">Download ZIP bundle</button></section>
+  <section class="export-card"><span class="export-label">Human review</span><h3>Actionable report</h3><p>Readable Markdown containing non-informational findings, scope, coverage, and limitations.</p><button class="secondary" onclick="downloadReport(false)">Download Markdown</button></section>
+  <section class="export-card"><span class="export-label">Complete record</span><h3>Full report</h3><p>Readable Markdown including informational observations and review metadata.</p><button class="secondary" onclick="downloadReport(true)">Download full Markdown</button></section>
+  <section class="export-card"><span class="export-label">Integration-ready</span><h3>Structured JSON</h3><p>Versioned, sanitized project export for downstream processing and connector development.</p><button class="secondary" onclick="downloadJsonReport()">Download JSON</button></section>
+  <section class="export-card"><span class="export-label">Developer tooling</span><h3>SARIF 2.1.0</h3><p>Static-analysis interchange format with fingerprints, locations, severity, and review state.</p><button class="secondary" onclick="downloadSarif()">Download SARIF</button></section>
+</div>
+  </article>
+  <article style="margin-top:1rem">
 <h2 data-section="findings">Project findings</h2>
 <p class="muted" id="finding-summary">Select a project. Repeated fingerprints are merged across runs.</p>
 <div class="grid">
@@ -431,7 +443,6 @@
 </select>
 </label>
 </div>
-<button class="secondary" style="width:auto" onclick="downloadReport(false)">Download actionable report</button> <button class="secondary" style="width:auto" onclick="downloadReport(true)">Download full report</button> <button class="secondary" style="width:auto" onclick="downloadReportBundle()">Download verified bundle</button> <button class="secondary" style="width:auto" onclick="downloadJsonReport()">Download JSON</button> <button class="secondary" style="width:auto" onclick="downloadSarif()">Download SARIF</button>
 <p class="muted">A saved review applies to every matching fingerprint in this project. Confirmed, false-positive, and accepted-risk decisions carry forward when the same fingerprint reappears; resolved findings reopen as new. Reports include reviewer attribution and timestamps.</p>
     <div style="overflow-x:auto">
 <table>
