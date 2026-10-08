@@ -51,6 +51,9 @@ RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 PLATFORM_PAUSE = "security-platform:control:paused"
 RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
+SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
+    "adapter", "approval-gated", "external-service-gated",
+})
 RUN_PLANS = {
     "observe": ["httpx", "testssl", "zap-baseline"],
     "authenticated-browser": ["httpx", "playwright"],
@@ -301,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.137.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.138.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -1167,10 +1170,9 @@ def adapters() -> dict:
 def coverage() -> dict:
     registry = load_registry().get("tools", {})
     configured = load_adapters().get("adapters", {})
-    eligible_modes = {"adapter", "approval-gated"}
     eligible = {
         name: metadata for name, metadata in registry.items()
-        if metadata.get("execution") in eligible_modes
+        if metadata.get("execution") in SUPERVISED_ADAPTER_EXECUTION_MODES
     }
     implemented_names = sorted(
         name for name in eligible
@@ -1212,7 +1214,7 @@ def coverage() -> dict:
     non_adapter = [
         {"id": name, **metadata}
         for name, metadata in sorted(registry.items())
-        if metadata.get("execution") not in eligible_modes
+        if metadata.get("execution") not in SUPERVISED_ADAPTER_EXECUTION_MODES
     ]
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:

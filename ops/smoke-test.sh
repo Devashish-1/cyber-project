@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.136' "$work_dir/dashboard.html"
+grep -q 'UI v0.138' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -105,7 +105,10 @@ jq -e '
   (([.validation[] | select(.validated == true)] | length) == .totals.validated) and
   ([.validation[] | has("current_image") and has("proven_image") and has("image_matches") and has("integrity_status") and has("validation_state") and has("validation_note") and has("requires_external_approval")] | all) and
   ([.validation[] | select(.requires_external_approval == true) | (.validation_state == "proven" or .validation_state == "external-approval-required")] | all) and
-  ([.validation[] | select(.validated == true) | (.image_matches == true and .integrity_status == "verified")] | all)
+  ([.validation[] | select(.validated == true) | (.image_matches == true and .integrity_status == "verified")] | all) and
+  ([.validation[] | select(.id == "amass" or .id == "theharvester" or .id == "spiderfoot")] | length) == 3 and
+  ([.validation[] | select(.id == "amass" or .id == "theharvester" or .id == "spiderfoot") | .requires_external_approval] | all) and
+  ([.non_adapter[] | select(.id == "amass" or .id == "theharvester" or .id == "spiderfoot")] | length) == 0
 ' "$work_dir/coverage.json" >/dev/null
 jq -e '
   ([.non_adapter[] | select(.id == "defectdojo")][0].export_format == "generic-findings-json") and

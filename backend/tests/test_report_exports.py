@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from app.main import (
+    SUPERVISED_ADAPTER_EXECUTION_MODES,
     build_audit_export,
     build_defectdojo_report,
     summarize_adapter_coverage,
@@ -15,6 +16,20 @@ from app.main import (
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
+
+
+class CoverageClassificationTests(unittest.TestCase):
+    def test_external_service_gated_tools_are_supervised_adapters(self):
+        self.assertTrue(
+            {"adapter", "approval-gated", "external-service-gated"}.issubset(
+                SUPERVISED_ADAPTER_EXECUTION_MODES
+            )
+        )
+        self.assertTrue(
+            {"manual", "disabled", "standalone"}.isdisjoint(
+                SUPERVISED_ADAPTER_EXECUTION_MODES
+            )
+        )
 
 
 def finding(**overrides) -> dict:
