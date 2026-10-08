@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.147' "$work_dir/dashboard.html"
+grep -q 'UI v0.148' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -231,6 +231,14 @@ if [ -n "$project_id" ]; then
     all(.findings[]; (.profile | type) == "string" and (.provenance == "supervised-run" or .provenance == "manual-import")) and
     all(.findings[]; (.credential_role == null or (.credential_role | type) == "string")) and
     (.coverage.adapter_gaps.unattempted_adapters | type == "array") and
+    (.coverage.provenance.supervised_run_count | type == "number") and
+    (.coverage.provenance.manual_import_run_count | type == "number") and
+    (.coverage.provenance.supervised_tools | type == "array") and
+    (.coverage.provenance.manual_import_sources | type == "array") and
+    (.coverage.provenance.supervised_finding_count | type == "number") and
+    (.coverage.provenance.manual_import_finding_count | type == "number") and
+    (.coverage.supervised_completed_runs | type == "number") and
+    (.coverage.supervised_sealed_runs | type == "number") and
     (.coverage.adapter_gaps.attempted_coverage_percent | type == "number") and
     (.coverage.role_coverage.profiles | type == "array") and
     (.coverage.role_coverage.summary.configured_profiles == (.coverage.role_coverage.profiles | length)) and
@@ -335,7 +343,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.147.0" and
+    .platform_version == "0.148.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
@@ -375,6 +383,8 @@ if [ -n "$project_id" ]; then
   grep -q '^### Per-target adapter coverage' "$work_dir/report.md"
   grep -q '^### Per-source adapter coverage' "$work_dir/report.md"
   grep -q '^### Coverage gap rollup' "$work_dir/report.md"
+  grep -q '^## Assessment coverage' "$work_dir/report.md"
+  grep -q '^- Manual import runs:' "$work_dir/report.md"
   grep -q 'explicitly imported manual findings' "$work_dir/report.md"
   grep -q 'Manual imports are operator-supplied metadata' "$work_dir/report.md"
   grep -q '^- Limitation: .*does not prove' "$work_dir/report.md"

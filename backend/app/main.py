@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.147.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.148.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3454,6 +3454,23 @@ def summarize_adapter_coverage(run_coverage: list[tuple], available_adapters: li
     }
 
 
+def summarize_assessment_provenance(run_coverage: list[tuple], findings: list[dict]) -> dict:
+    supervised_rows = [row for row in run_coverage if str(row[1]) != "manual-import"]
+    manual_rows = [row for row in run_coverage if str(row[1]) == "manual-import"]
+    return {
+        "supervised_run_count": sum(int(row[3] or 0) for row in supervised_rows),
+        "manual_import_run_count": sum(int(row[3] or 0) for row in manual_rows),
+        "supervised_tools": sorted({str(row[0]) for row in supervised_rows}),
+        "manual_import_sources": sorted({str(row[0]) for row in manual_rows}),
+        "supervised_finding_count": sum(
+            1 for item in findings if item.get("provenance") != "manual-import"
+        ),
+        "manual_import_finding_count": sum(
+            1 for item in findings if item.get("provenance") == "manual-import"
+        ),
+    }
+
+
 def summarize_role_coverage(rows: list[tuple]) -> dict:
     profiles: dict[str, dict] = {}
     for profile_id, name, role_name, target_id, base_url, status, run_count, last_finished_at in rows:
@@ -3867,7 +3884,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
                            WHERE status IN ('succeeded','failed','cancelled')
                            AND evidence_manifest_sha256 IS NOT NULL
                        )
-                FROM runs WHERE project_id = %s
+                FROM runs WHERE project_id = %s AND profile <> 'manual-import'
                 """,
                 (project_id,),
             )
@@ -3899,6 +3916,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         adapter_coverage, target_coverage, source_coverage, role_coverage,
         external_approval_adapters(),
     )
+    provenance = summarize_assessment_provenance(run_coverage, findings)
     report = {
         "schema": "security-platform-report/v1",
         "generated_at": datetime.now(timezone.utc),
@@ -3945,6 +3963,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         },
         "coverage": {
             "tools_executed": sorted({row[0] for row in run_coverage}),
+            "provenance": provenance,
             "adapter_gaps": adapter_coverage,
             "role_coverage": role_coverage,
             "target_coverage": target_coverage,
@@ -3964,6 +3983,8 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             ],
             "completed_runs": completed_runs,
             "sealed_runs": sealed_runs,
+            "supervised_completed_runs": completed_runs,
+            "supervised_sealed_runs": sealed_runs,
         },
         "summary": {
             "unique_findings": len(findings),
@@ -3974,7 +3995,8 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         },
         "findings": [sanitize_evidence(item) for item in reported],
         "limitations": [
-            "Automated coverage does not prove the absence of vulnerabilities.",
+            "Supervised run coverage does not prove the absence of vulnerabilities.",
+            "Manual imports are operator-supplied metadata and do not prove platform reproduction.",
             "Business-logic, authorization, and exploit-chain risks may require human testing.",
             "Only saved scope, completed runs, and normalized findings are represented.",
             "Raw evidence and credentials are intentionally excluded from this export.",
@@ -4051,7 +4073,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                            WHERE status IN ('succeeded','failed','cancelled')
                            AND evidence_manifest_sha256 IS NOT NULL
                        )
-                FROM runs WHERE project_id = %s
+                FROM runs WHERE project_id = %s AND profile <> 'manual-import'
                 """,
                 (project_id,),
             )
@@ -4084,6 +4106,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         adapter_coverage, target_coverage, source_coverage, role_coverage,
         external_approval_adapters(),
     )
+    provenance = summarize_assessment_provenance(run_coverage, findings)
 
     def md(value: object) -> str:
         return (
@@ -4157,14 +4180,19 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         lines.append("No source archives recorded.")
     lines.extend([
         "",
-        "## Automated coverage",
+        "## Assessment coverage",
         "",
-        f"- Tools executed: {md(', '.join(tools) or 'None')}",
+        f"- Supervised tools executed: {md(', '.join(provenance['supervised_tools']) or 'None')}",
+        f"- Manual import sources: {md(', '.join(provenance['manual_import_sources']) or 'None')}",
+        f"- Supervised runs: {provenance['supervised_run_count']}",
+        f"- Manual import runs: {provenance['manual_import_run_count']}",
+        f"- Findings from supervised runs: {provenance['supervised_finding_count']}",
+        f"- Findings from manual imports: {provenance['manual_import_finding_count']}",
         f"- Run outcomes: {md(', '.join(f'{status}={count}' for status, count in status_counts) or 'None')}",
         f"- Unique observations: {len(findings)}",
         f"- Severity totals: critical={severity_counts['critical']}, high={severity_counts['high']}, medium={severity_counts['medium']}, low={severity_counts['low']}, info={severity_counts['info']}",
         f"- Review totals: new={review_counts['new']}, confirmed={review_counts['confirmed']}, false_positive={review_counts['false_positive']}, accepted_risk={review_counts['accepted_risk']}, resolved={review_counts['resolved']}",
-        f"- Evidence sealed: {sealed_runs} of {completed_runs} completed runs",
+        f"- Supervised evidence sealed: {sealed_runs} of {completed_runs} completed supervised runs",
         f"- Adapter coverage attempted: {adapter_coverage['attempted_coverage_percent']}% ({len(adapter_coverage['attempted_adapters'])} of {len(adapter_coverage['available_adapters'])})",
         f"- Adapter coverage successful: {adapter_coverage['successful_coverage_percent']}% ({len(adapter_coverage['successful_adapters'])} of {len(adapter_coverage['available_adapters'])})",
         f"- Untested adapters: {md(', '.join(adapter_coverage['unattempted_adapters']) or 'None')}",

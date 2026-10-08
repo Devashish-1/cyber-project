@@ -9,6 +9,7 @@ from app.main import (
     build_defectdojo_report,
     parse_burp_issues,
     summarize_adapter_coverage,
+    summarize_assessment_provenance,
     summarize_coverage_gaps,
     summarize_role_coverage,
     summarize_source_coverage,
@@ -198,6 +199,29 @@ class AdapterCoverageSummaryTests(unittest.TestCase):
         self.assertEqual(summary["attempted_coverage_percent"], 0)
         self.assertEqual(summary["successful_coverage_percent"], 0)
         self.assertEqual(summary["unattempted_adapters"], [])
+
+
+class AssessmentProvenanceSummaryTests(unittest.TestCase):
+    def test_keeps_manual_imports_separate_from_supervised_runs(self):
+        rows = [
+            ("httpx", "observe", "succeeded", 2, 2, NOW),
+            ("burp-suite-community", "manual-import", "succeeded", 1, 0, NOW),
+        ]
+        findings = [
+            finding(tool_id="httpx"),
+            finding(
+                tool_id="burp-suite-community",
+                profile="manual-import",
+                provenance="manual-import",
+            ),
+        ]
+        summary = summarize_assessment_provenance(rows, findings)
+        self.assertEqual(summary["supervised_run_count"], 2)
+        self.assertEqual(summary["manual_import_run_count"], 1)
+        self.assertEqual(summary["supervised_tools"], ["httpx"])
+        self.assertEqual(summary["manual_import_sources"], ["burp-suite-community"])
+        self.assertEqual(summary["supervised_finding_count"], 1)
+        self.assertEqual(summary["manual_import_finding_count"], 1)
 
 
 class RoleCoverageSummaryTests(unittest.TestCase):
