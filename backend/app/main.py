@@ -304,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.142.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.143.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3582,6 +3582,25 @@ def get_project_coverage_gaps(project_id: UUID) -> dict:
             external_approval_adapters(),
         ),
     }
+
+
+@app.get("/projects/{project_id}/coverage-gaps.json")
+def get_project_coverage_gaps_export(project_id: UUID) -> Response:
+    report = {
+        "schema": "security-platform-coverage-gaps/v1",
+        "generated_at": datetime.now(timezone.utc),
+        "platform_version": app.version,
+        **get_project_coverage_gaps(project_id),
+    }
+    return Response(
+        content=json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="security-platform-{project_id}-coverage-gaps.json"'
+            )
+        },
+    )
 
 
 @app.get("/projects/{project_id}/role-coverage")

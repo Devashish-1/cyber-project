@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.142' "$work_dir/dashboard.html"
+grep -q 'UI v0.143' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -39,6 +39,8 @@ grep -q 'Coverage gap rollup' "$work_dir/dashboard.html"
 grep -q 'project-coverage-gap-details' "$work_dir/dashboard.html"
 grep -q 'prepareCoverageGapRun' "$work_dir/dashboard.html"
 grep -q "el('run-approved').checked=false" "$work_dir/dashboard.html"
+grep -q 'Download coverage gaps' "$work_dir/dashboard.html"
+grep -q 'downloadCoverageGaps' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -82,6 +84,7 @@ jq -e '
   and (.paths["/projects/{project_id}/target-coverage"] != null)
   and (.paths["/projects/{project_id}/source-coverage"] != null)
   and (.paths["/projects/{project_id}/coverage-gaps"] != null)
+  and (.paths["/projects/{project_id}/coverage-gaps.json"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -191,6 +194,9 @@ if [ -n "$project_id" ]; then
   curl --config "$curl_config" \
     "$base_url/projects/$project_id/coverage-gaps" \
     > "$work_dir/coverage-gaps.json"
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/coverage-gaps.json" \
+    > "$work_dir/coverage-gaps-export.json"
   curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
@@ -313,6 +319,20 @@ if [ -n "$project_id" ]; then
     all(.external_approval_required[]; . == "amass" or . == "spiderfoot" or . == "subfinder" or . == "theharvester") and
     (.disclaimer | contains("does not prove"))
   ' "$work_dir/coverage-gaps.json" >/dev/null
+  jq -e --arg project_id "$project_id" '
+    .schema == "security-platform-coverage-gaps/v1" and
+    (.generated_at | type == "string") and
+    .platform_version == "0.143.0" and
+    .project_id == $project_id and
+    (.status == "gaps-present" or .status == "no-recorded-gaps") and
+    (.gap_count | type == "number") and
+    (.gaps | type == "object") and
+    (.external_approval_required | type == "array") and
+    (.external_approval_required_count == (.external_approval_required | length)) and
+    (tostring | contains("username") | not) and
+    (tostring | contains("password") | not) and
+    (tostring | contains("encrypted_secret") | not)
+  ' "$work_dir/coverage-gaps-export.json" >/dev/null
   jq -e '
     .version == "2.1.0" and
     (.runs | type == "array") and
