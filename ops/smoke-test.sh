@@ -33,12 +33,23 @@ jq -e '
   (.paths["/image-audit-status"] != null) and
   (.paths["/image-audit-history"] != null) and
   (.paths["/backup-status"] != null) and
+  (.paths["/deployment-security-status"] != null) and
   (.paths["/image-audit-artifacts/{artifact_kind}"] != null) and
   (.paths["/projects/{project_id}/report.json"] != null) and
   (.paths["/projects/{project_id}/report.sarif"] != null) and
   (.paths["/projects/{project_id}/report.md"] != null) and
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
 ' "$work_dir/openapi.json" >/dev/null
+
+curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
+jq -e '
+  (.available == true) and
+  (.enforced == true) and
+  (.fresh == true) and
+  (.age_seconds <= 600) and
+  ((.services | length) == 3) and
+  all(.services[]; .read_only and .capabilities_dropped and .no_new_privileges and .non_root and .running)
+' "$work_dir/deployment-security.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/projects" > "$work_dir/projects.json"
 jq -e '.projects | type == "array"' "$work_dir/projects.json" >/dev/null

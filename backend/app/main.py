@@ -64,6 +64,10 @@ SOURCE_VALIDATION_STATUS_PATH = Path(os.getenv(
     "SOURCE_VALIDATION_STATUS_PATH",
     "/validation/local-source-validation.json",
 ))
+DEPLOYMENT_SECURITY_STATUS_PATH = Path(os.getenv(
+    "DEPLOYMENT_SECURITY_STATUS_PATH",
+    "/validation/deployment-security-status.json",
+))
 MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
@@ -287,7 +291,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.117.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.118.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -817,6 +821,31 @@ def health() -> dict[str, str]:
     return {"status": "ok", "database": "ok", "queue": "ok"}
 
 
+@app.get("/deployment-security-status")
+def deployment_security_status() -> dict:
+    path = DEPLOYMENT_SECURITY_STATUS_PATH
+    unavailable = {"available": False, "enforced": False, "services": []}
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 32 * 1024:
+            return unavailable
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        checked_at = datetime.fromisoformat(str(payload["checked_at"]).replace("Z", "+00:00"))
+        services = payload.get("services")
+        if not isinstance(services, list):
+            return unavailable
+        age_seconds = max(0, int((datetime.now(timezone.utc) - checked_at).total_seconds()))
+        return {
+            "available": True,
+            "enforced": payload.get("enforced") is True,
+            "checked_at": checked_at,
+            "age_seconds": age_seconds,
+            "fresh": age_seconds <= 600,
+            "services": services,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return unavailable
+
+
 @app.get("/platform-status")
 def platform_status() -> dict:
     with psycopg.connect(DATABASE_URL, connect_timeout=3) as connection:
@@ -884,6 +913,7 @@ def platform_status() -> dict:
             "cipher": "fernet",
             "plaintext_returned": False,
         },
+        "deployment_security": deployment_security_status(),
     }
 
 
