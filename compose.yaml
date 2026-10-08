@@ -35,6 +35,7 @@ services:
       context: ./backend
     restart: unless-stopped
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    read_only: true
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
@@ -74,6 +75,12 @@ services:
       retries: 5
     mem_limit: 1g
     cpus: 1.0
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=${LOCAL_UID:-1000},gid=${LOCAL_GID:-1000},mode=1777
 
   runner:
     build:
@@ -81,6 +88,7 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "app.runner"]
     user: "${LOCAL_UID:-1000}:${DOCKER_GID:-999}"
+    read_only: true
     group_add:
       - "${DOCKER_GID:-999}"
     environment:
@@ -112,8 +120,12 @@ services:
         condition: service_healthy
     mem_limit: 512m
     cpus: 0.5
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=${LOCAL_UID:-1000},gid=${DOCKER_GID:-999},mode=1777
 
   dashboard:
     image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
