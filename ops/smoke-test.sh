@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.139' "$work_dir/dashboard.html"
+grep -q 'UI v0.140' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -221,7 +221,9 @@ if [ -n "$project_id" ]; then
     (.coverage.coverage_gaps.gap_count | type == "number") and
     (.coverage.coverage_gaps.gaps.unattempted_adapters | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_targets | type == "array") and
+    (.coverage.coverage_gaps.gaps.target_adapter_gaps | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_sources | type == "array") and
+    (.coverage.coverage_gaps.gaps.source_adapter_gaps | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_roles | type == "array") and
     (.coverage.coverage_gaps.external_approval_required | type == "array") and
     (.coverage.coverage_gaps.external_approval_required_count == (.coverage.coverage_gaps.external_approval_required | length)) and
@@ -296,8 +298,12 @@ if [ -n "$project_id" ]; then
     (.gaps.attempted_without_success | type == "array") and
     (.gaps.untested_targets | type == "array") and
     (.gaps.targets_without_success | type == "array") and
+    (.gaps.target_adapter_gaps | type == "array") and
+    all(.gaps.target_adapter_gaps[]; (.unattempted_adapters | type == "array")) and
     (.gaps.untested_sources | type == "array") and
     (.gaps.sources_without_success | type == "array") and
+    (.gaps.source_adapter_gaps | type == "array") and
+    all(.gaps.source_adapter_gaps[]; (.unattempted_adapters | type == "array")) and
     (.gaps.untested_roles | type == "array") and
     (.gaps.roles_without_success | type == "array") and
     (.external_approval_required | type == "array") and
@@ -336,6 +342,8 @@ if [ -n "$project_id" ]; then
   grep -q '^### Coverage gap rollup' "$work_dir/report.md"
   grep -q '^- Limitation: .*does not prove' "$work_dir/report.md"
   grep -q '^- Unresolved adapters requiring separate third-party approval:' "$work_dir/report.md"
+  grep -q '^- Targets with incomplete adapter coverage:' "$work_dir/report.md"
+  grep -q '^- Source archives with incomplete adapter coverage:' "$work_dir/report.md"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-audit/v1" and
     .project_id == $project_id and

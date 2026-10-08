@@ -304,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.139.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.140.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3511,6 +3511,15 @@ def summarize_coverage_gaps(
             for item in target_coverage.get("targets", [])
             if item.get("attempted_adapters") and not item.get("successful_adapters")
         ],
+        "target_adapter_gaps": [
+            {
+                "id": item["id"],
+                "base_url": item["base_url"],
+                "unattempted_adapters": list(item.get("unattempted_adapters", [])),
+            }
+            for item in target_coverage.get("targets", [])
+            if item.get("unattempted_adapters")
+        ],
         "untested_sources": [
             {"id": item["id"], "filename": item["filename"], "sha256": item["sha256"]}
             for item in source_coverage.get("artifacts", []) if not item.get("attempted_adapters")
@@ -3519,6 +3528,16 @@ def summarize_coverage_gaps(
             {"id": item["id"], "filename": item["filename"], "sha256": item["sha256"]}
             for item in source_coverage.get("artifacts", [])
             if item.get("attempted_adapters") and not item.get("successful_adapters")
+        ],
+        "source_adapter_gaps": [
+            {
+                "id": item["id"],
+                "filename": item["filename"],
+                "sha256": item["sha256"],
+                "unattempted_adapters": list(item.get("unattempted_adapters", [])),
+            }
+            for item in source_coverage.get("artifacts", [])
+            if item.get("unattempted_adapters")
         ],
         "untested_roles": [
             {"id": item["id"], "name": item["name"], "role_name": item["role_name"], "target": item["target"]}
@@ -3862,6 +3881,15 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             .replace("\n", " ")
         )
 
+    target_adapter_gap_summary = "; ".join(
+        "{} ({})".format(item["base_url"], ", ".join(item["unattempted_adapters"]))
+        for item in coverage_gaps["gaps"]["target_adapter_gaps"]
+    )
+    source_adapter_gap_summary = "; ".join(
+        "{} ({})".format(item["filename"], ", ".join(item["unattempted_adapters"]))
+        for item in coverage_gaps["gaps"]["source_adapter_gaps"]
+    )
+
     lines = [
         f"# Security assessment report — {md(project[0])}",
         "",
@@ -3937,8 +3965,10 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Adapters attempted without success: {md(', '.join(coverage_gaps['gaps']['attempted_without_success']) or 'None')}",
         f"- Untested targets: {md(', '.join(item['base_url'] for item in coverage_gaps['gaps']['untested_targets']) or 'None')}",
         f"- Targets attempted without success: {md(', '.join(item['base_url'] for item in coverage_gaps['gaps']['targets_without_success']) or 'None')}",
+        f"- Targets with incomplete adapter coverage: {md(target_adapter_gap_summary or 'None')}",
         f"- Untested source archives: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['untested_sources']) or 'None')}",
         f"- Source archives attempted without success: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['sources_without_success']) or 'None')}",
+        f"- Source archives with incomplete adapter coverage: {md(source_adapter_gap_summary or 'None')}",
         f"- Untested authenticated roles: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['untested_roles']) or 'None')}",
         f"- Authenticated roles attempted without success: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['roles_without_success']) or 'None')}",
         f"- Limitation: {md(coverage_gaps['disclaimer'])}",

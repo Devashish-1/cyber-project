@@ -248,11 +248,11 @@ class CoverageGapSummaryTests(unittest.TestCase):
         result = summarize_coverage_gaps(
             {"unattempted_adapters": ["testssl"], "attempted_without_success": ["nuclei-reviewed"]},
             {"targets": [
-                {"id": "t1", "base_url": "https://a.test", "attempted_adapters": [], "successful_adapters": []},
-                {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": []},
+                {"id": "t1", "base_url": "https://a.test", "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["httpx"]},
+                {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": [], "unattempted_adapters": ["testssl"]},
             ]},
             {"artifacts": [
-                {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "attempted_adapters": [], "successful_adapters": []},
+                {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["semgrep"]},
             ]},
             {"profiles": [
                 {"id": "r1", "name": "Admin", "role_name": "admin", "target": "https://a.test", "attempted_runs": 1, "successful_runs": 0},
@@ -260,11 +260,13 @@ class CoverageGapSummaryTests(unittest.TestCase):
             ["testssl", "subfinder"],
         )
         self.assertEqual(result["status"], "gaps-present")
-        self.assertEqual(result["gap_count"], 6)
+        self.assertEqual(result["gap_count"], 9)
         self.assertEqual(result["gaps"]["untested_targets"][0]["id"], "t1")
         self.assertEqual(result["gaps"]["targets_without_success"][0]["id"], "t2")
         self.assertEqual(result["gaps"]["untested_sources"][0]["filename"], "app.zip")
         self.assertEqual(result["gaps"]["roles_without_success"][0]["role_name"], "admin")
+        self.assertEqual(result["gaps"]["target_adapter_gaps"][1]["unattempted_adapters"], ["testssl"])
+        self.assertEqual(result["gaps"]["source_adapter_gaps"][0]["unattempted_adapters"], ["semgrep"])
         self.assertEqual(result["external_approval_required"], ["testssl"])
         self.assertEqual(result["external_approval_required_count"], 1)
 
