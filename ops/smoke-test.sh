@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.164' "$work_dir/dashboard.html"
+grep -q 'UI v0.165' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -90,6 +90,9 @@ grep -q "extendedTools.length&&!targetMap\[target\]?.allow_state_changing" "$wor
 grep -q 'by server UTC' "$work_dir/dashboard.html"
 grep -q 'Selected target testing window is currently closed' "$work_dir/dashboard.html"
 grep -q "targetMap\[target\]?.testing_window_open===false" "$work_dir/dashboard.html"
+grep -q 'function effectiveTimeoutSeconds' "$work_dir/dashboard.html"
+grep -q 'Effective duration:' "$work_dir/dashboard.html"
+grep -q 'bounded maximum' "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
