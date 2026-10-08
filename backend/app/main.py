@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.136.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.137.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3641,6 +3641,9 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
     source_coverage = summarize_source_coverage(
         source_coverage_rows, available_report_adapters("source")
     )
+    coverage_gaps = summarize_coverage_gaps(
+        adapter_coverage, target_coverage, source_coverage, role_coverage
+    )
     report = {
         "schema": "security-platform-report/v1",
         "generated_at": datetime.now(timezone.utc),
@@ -3691,6 +3694,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             "role_coverage": role_coverage,
             "target_coverage": target_coverage,
             "source_coverage": source_coverage,
+            "coverage_gaps": coverage_gaps,
             "run_status_counts": {row[0]: row[1] for row in status_counts},
             "run_matrix": [
                 {
@@ -3821,6 +3825,9 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     source_coverage = summarize_source_coverage(
         source_coverage_rows, available_report_adapters("source")
     )
+    coverage_gaps = summarize_coverage_gaps(
+        adapter_coverage, target_coverage, source_coverage, role_coverage
+    )
 
     def md(value: object) -> str:
         return (
@@ -3899,6 +3906,20 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Attempted without a successful run: {md(', '.join(adapter_coverage['attempted_without_success']) or 'None')}",
         f"- Authenticated roles tested: {role_coverage['summary']['tested_coverage_percent']}% ({role_coverage['summary']['tested_profiles']} of {role_coverage['summary']['configured_profiles']})",
         f"- Authenticated roles with a successful run: {role_coverage['summary']['successful_coverage_percent']}% ({role_coverage['summary']['successful_profiles']} of {role_coverage['summary']['configured_profiles']})",
+        "",
+        "### Coverage gap rollup",
+        "",
+        f"- Status: {md(coverage_gaps['status'])}",
+        f"- Recorded gap count: {coverage_gaps['gap_count']}",
+        f"- Untested adapters: {md(', '.join(coverage_gaps['gaps']['unattempted_adapters']) or 'None')}",
+        f"- Adapters attempted without success: {md(', '.join(coverage_gaps['gaps']['attempted_without_success']) or 'None')}",
+        f"- Untested targets: {md(', '.join(item['base_url'] for item in coverage_gaps['gaps']['untested_targets']) or 'None')}",
+        f"- Targets attempted without success: {md(', '.join(item['base_url'] for item in coverage_gaps['gaps']['targets_without_success']) or 'None')}",
+        f"- Untested source archives: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['untested_sources']) or 'None')}",
+        f"- Source archives attempted without success: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['sources_without_success']) or 'None')}",
+        f"- Untested authenticated roles: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['untested_roles']) or 'None')}",
+        f"- Authenticated roles attempted without success: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['roles_without_success']) or 'None')}",
+        f"- Limitation: {md(coverage_gaps['disclaimer'])}",
         "",
         "### Authenticated role coverage",
         "",

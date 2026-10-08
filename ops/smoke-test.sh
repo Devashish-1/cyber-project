@@ -214,6 +214,13 @@ if [ -n "$project_id" ]; then
     (.coverage.target_coverage.available_adapters | type == "array") and
     (.coverage.source_coverage.artifacts | type == "array") and
     (.coverage.source_coverage.available_adapters | type == "array") and
+    (.coverage.coverage_gaps.status == "gaps-present" or .coverage.coverage_gaps.status == "no-recorded-gaps") and
+    (.coverage.coverage_gaps.gap_count | type == "number") and
+    (.coverage.coverage_gaps.gaps.unattempted_adapters | type == "array") and
+    (.coverage.coverage_gaps.gaps.untested_targets | type == "array") and
+    (.coverage.coverage_gaps.gaps.untested_sources | type == "array") and
+    (.coverage.coverage_gaps.gaps.untested_roles | type == "array") and
+    (.coverage.coverage_gaps.disclaimer | contains("does not prove")) and
     all(.coverage.source_coverage.artifacts[];
       (.filename | type == "string") and
       (.sha256 | type == "string") and
@@ -318,6 +325,8 @@ if [ -n "$project_id" ]; then
   grep -q '^### Authenticated role coverage' "$work_dir/report.md"
   grep -q '^### Per-target adapter coverage' "$work_dir/report.md"
   grep -q '^### Per-source adapter coverage' "$work_dir/report.md"
+  grep -q '^### Coverage gap rollup' "$work_dir/report.md"
+  grep -q '^- Limitation: .*does not prove' "$work_dir/report.md"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-audit/v1" and
     .project_id == $project_id and
@@ -332,6 +341,8 @@ if [ -n "$project_id" ]; then
   unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
   test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "6"
   jq -e '.schema == "security-platform-audit/v1"' "$work_dir/bundle/audit-events.json" >/dev/null
+  jq -e '(.coverage.coverage_gaps.gap_count | type == "number")' "$work_dir/bundle/report.json" >/dev/null
+  grep -q '^### Coverage gap rollup' "$work_dir/bundle/report.md"
   (cd "$work_dir/bundle" && sha256sum -c manifest.sha256 >/dev/null)
 fi
 
