@@ -3,7 +3,8 @@ set -euo pipefail
 
 cd /home/killswitch/security-platform
 mode="${1:-quick}"
-[[ "$mode" == quick || "$mode" == full ]] || { echo 'Usage: run-local-source-validation.sh [quick|full]' >&2; exit 2; }
+tool_filter="${2:-}"
+[[ "$mode" == quick || "$mode" == full ]] || { echo 'Usage: run-local-source-validation.sh [quick|full] [tool,tool...]' >&2; exit 2; }
 
 set -a
 # shellcheck disable=SC1091
@@ -46,7 +47,12 @@ USER root
 DOCKER
 cat >"$fixture/main.tf" <<'TF'
 resource "aws_security_group" "fixture" {
-  ingress { from_port = 22; to_port = 22; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 TF
 cat >"$fixture/pod.yaml" <<'YAML'
@@ -62,6 +68,7 @@ YAML
 cat >"$fixture/package.json" <<'JSON'
 {"name":"local-validation-fixture","version":"1.0.0","dependencies":{"lodash":"4.17.20"}}
 JSON
+printf '%s\n' 'django==2.2.0' >"$fixture/requirements.txt"
 printf '%s\n' 'fixture_aws_access_key = "AKIAIOSFODNN7EXAMPLE"' >"$fixture/example.txt"
 chmod 700 "$fixture/check.sh"
 (cd "$fixture" && python3 -m zipfile -c ../source-validation.zip .)
@@ -78,6 +85,9 @@ echo "Uploaded authorized local source fixture: $artifact_id"
 tools=(semgrep bandit shellcheck hadolint njsscan checkov)
 if [[ "$mode" == full ]]; then
   tools+=(gitleaks trufflehog trivy osv-scanner syft grype kics kubescape)
+fi
+if [[ -n "$tool_filter" ]]; then
+  IFS=',' read -r -a tools <<<"$tool_filter"
 fi
 
 total_observations=0

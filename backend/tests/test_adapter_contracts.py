@@ -12,6 +12,7 @@ from app.runner import (
     parse_amass_names,
     parse_spiderfoot_hosts,
     parse_theharvester_hosts,
+    write_osv_output,
     write_dnsrecon_output,
     write_dnsx_output,
     write_massdns_output,
@@ -85,6 +86,47 @@ class AdapterContractTests(unittest.TestCase):
                 command = self.command_for(tool_id)
                 self.assertEqual(command[command.index("-T") + 1], minutes)
                 self.assertIn("-s", command)
+
+    def test_trivy_flushes_reports_before_readiness_marker(self):
+        command = self.command_for("trivy")
+        self.assertEqual(command[0], "-c")
+        shell = command[1]
+        self.assertIn("sync; touch /tmp/.reports-ready", shell)
+        self.assertLess(shell.index("/tmp/trivy.json"), shell.index("sync; touch"))
+        self.assertLess(shell.index("/tmp/sbom.cdx.json"), shell.index("sync; touch"))
+
+    def test_kics_flushes_report_before_readiness_marker(self):
+        command = self.command_for("kics")
+        self.assertEqual(command[0], "-c")
+        shell = command[1]
+        self.assertIn("sync; touch /tmp/.reports-ready", shell)
+        self.assertLess(shell.index("results"), shell.index("sync; touch"))
+
+    def test_osv_report_is_sanitized_without_advisory_bodies(self):
+        payload = {
+            "results": [{
+                "source": {"path": "/src/requirements.txt", "type": "lockfile"},
+                "packages": [{
+                    "package": {"name": "django", "version": "2.2.0", "ecosystem": "PyPI"},
+                    "groups": [{
+                        "ids": ["GHSA-example"],
+                        "aliases": ["CVE-2000-0001"],
+                        "max_severity": 9.8,
+                        "details": "must not be retained",
+                    }],
+                }],
+            }],
+            "experimental_config": {"large": "must not be retained"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output.jsonl"
+            write_osv_output(json.dumps(payload).encode(), output)
+            sanitized = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(sanitized["results"][0]["source"]["path"], "requirements.txt")
+        group = sanitized["results"][0]["packages"][0]["groups"][0]
+        self.assertEqual(group["ids"], ["GHSA-example"])
+        self.assertNotIn("details", group)
+        self.assertNotIn("experimental_config", sanitized)
 
     def test_dns_adapters_require_an_approved_resolver(self):
         for tool_id in ("dnsx", "dnsrecon"):

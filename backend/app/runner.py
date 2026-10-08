@@ -958,7 +958,7 @@ def build_command(
             "--max-file-size 2 --timeout 20 --disable-full-descriptions "
             "--disable-secrets --ignore-on-exit results; code=$?; "
             "printf '%s' \"$code\" > /tmp/.kics-exit; "
-            "touch /tmp/.reports-ready; while :; do sleep 1; done",
+            "sync; touch /tmp/.reports-ready; while :; do sleep 1; done",
         ]
     if tool_id == "gitleaks":
         return [
@@ -1001,7 +1001,7 @@ def build_command(
             "trivy fs --cache-dir /cache --skip-db-update --skip-java-db-update "
             "--skip-check-update --offline-scan --scanners vuln --format cyclonedx "
             "--output /tmp/sbom.cdx.json --parallel 1 --timeout 5m /src; "
-            "touch /tmp/.reports-ready; sleep 600",
+            "sync; touch /tmp/.reports-ready; sleep 600",
         ]
     if tool_id == "httpx":
         return [
@@ -1333,6 +1333,14 @@ def capture_container_logs(container, *, stdout: bool = True, stderr: bool = Tru
     return bounded_bytes(raw, MAX_TOOL_OUTPUT_BYTES)
 
 
+def capture_json_report(container, *, maximum: int = 8 * 1024 * 1024) -> bytes:
+    """Capture a complete JSON stdout report without log-tail truncation."""
+    raw = container.logs(stdout=True, stderr=False)
+    if len(raw) > maximum:
+        raise RuntimeError(f"JSON report exceeds {maximum} bytes")
+    return raw
+
+
 def write_tool_log(path: Path, data: bytes) -> None:
     path.write_bytes(bounded_bytes(data, MAX_TOOL_LOG_BYTES))
 
@@ -1344,7 +1352,18 @@ def write_bounded_report(path: Path, data: bytes) -> None:
 
 
 def read_container_file(container, container_path: str) -> bytes:
-    stream, stat = container.get_archive(container_path)
+    last_error = None
+    for attempt in range(5):
+        try:
+            stream, stat = container.get_archive(container_path)
+            break
+        except docker.errors.NotFound as exc:
+            last_error = exc
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
+    else:
+        raise last_error or RuntimeError(f"Container report was not found: {container_path}")
     declared_size = stat.get("size") if isinstance(stat, dict) else None
     if isinstance(declared_size, int) and declared_size > MAX_TOOL_OUTPUT_BYTES:
         raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
@@ -1365,6 +1384,16 @@ def read_container_file(container, container_path: str) -> bytes:
         if extracted is None:
             raise RuntimeError(f"Container report could not be read: {container_path}")
         data = extracted.read(MAX_TOOL_OUTPUT_BYTES + 1)
+    if len(data) > MAX_TOOL_OUTPUT_BYTES:
+        raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
+    return data
+
+
+def read_running_container_file(container, container_path: str) -> bytes:
+    result = container.exec_run(["cat", container_path])
+    if result.exit_code != 0:
+        raise RuntimeError(f"Running container report was not found: {container_path}")
+    data = bytes(result.output)
     if len(data) > MAX_TOOL_OUTPUT_BYTES:
         raise RuntimeError(f"Container report exceeds {MAX_TOOL_OUTPUT_BYTES} bytes: {container_path}")
     return data
@@ -3076,7 +3105,7 @@ def capture_json_output(container, container_path: str, output_file: Path) -> No
 
 
 def capture_kics_output(container, output_file: Path) -> None:
-    payload = json.loads(read_container_file(container, "/tmp/kics-output/results.json").decode("utf-8"))
+    payload = json.loads(read_running_container_file(container, "/tmp/kics-output/results.json").decode("utf-8"))
     for query in payload.get("queries", []) if isinstance(payload, dict) else []:
         for finding in query.get("files", []) if isinstance(query, dict) else []:
             if not isinstance(finding, dict):
@@ -4097,7 +4126,7 @@ def normalize_brakeman(run_id: UUID, output_file: Path) -> int:
 
 def capture_trivy_outputs(container, output_file: Path, sbom_file: Path) -> None:
     def read_container_json(container_path: str) -> dict:
-        payload = json.loads(read_container_file(container, container_path).decode("utf-8"))
+        payload = json.loads(read_running_container_file(container, container_path).decode("utf-8"))
         if not isinstance(payload, dict):
             raise RuntimeError(f"Trivy output is not a JSON object: {container_path}")
         return payload
@@ -5487,7 +5516,7 @@ def execute_run(run_id: UUID) -> None:
         elif run["tool_id"] == "osv-scanner":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code in {0, 1}:
-                write_osv_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
+                write_osv_output(capture_json_report(container), output_file)
             else:
                 output_file.write_bytes(logs)
         elif run["tool_id"] == "njsscan":
