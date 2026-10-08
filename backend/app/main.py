@@ -85,6 +85,7 @@ MIN_STORAGE_FREE_BYTES = int(os.getenv("MIN_STORAGE_FREE_BYTES", str(10 * 1024**
 MAX_STORAGE_USED_PERCENT = float(os.getenv("MAX_STORAGE_USED_PERCENT", "90"))
 MAX_PENDING_RUNS = int(os.getenv("MAX_PENDING_RUNS", "100"))
 MAX_RUNNER_READINESS_AGE_SECONDS = int(os.getenv("MAX_RUNNER_READINESS_AGE_SECONDS", "180"))
+MAX_AUDIT_EXPORT_EVENTS = int(os.getenv("MAX_AUDIT_EXPORT_EVENTS", "10000"))
 MAX_TOOL_OUTPUT_BYTES = int(os.getenv("MAX_TOOL_OUTPUT_BYTES", str(16 * 1024 * 1024)))
 MAX_TOOL_LOG_BYTES = int(os.getenv("MAX_TOOL_LOG_BYTES", str(2 * 1024 * 1024)))
 MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
@@ -94,6 +95,7 @@ if (
     MIN_STORAGE_FREE_BYTES < 0
     or not 1 <= MAX_STORAGE_USED_PERCENT <= 100
     or MAX_PENDING_RUNS < 1
+    or not 100 <= MAX_AUDIT_EXPORT_EVENTS <= 100_000
     or not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024
     or not 1 <= MAX_TOOL_LOG_BYTES <= MAX_TOOL_OUTPUT_BYTES
     or not 1 <= MAX_TOOL_LOG_LINES <= 100_000
@@ -299,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.126.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.127.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3592,12 +3594,67 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     return "\n".join(lines)
 
 
+def build_audit_export(project_id: UUID, rows: list[tuple], limit: int) -> dict:
+    selected = rows[:limit]
+    return {
+        "schema": "security-platform-audit/v1",
+        "generated_at": datetime.now(timezone.utc),
+        "platform_version": app.version,
+        "project_id": project_id,
+        "event_count": len(selected),
+        "export_limit": limit,
+        "truncated": len(rows) > limit,
+        "events": [
+            {
+                "id": row[0],
+                "event_type": row[1],
+                "actor": row[2],
+                "object_type": row[3],
+                "object_id": row[4],
+                "details": sanitize_evidence(row[5]),
+                "created_at": row[6],
+            }
+            for row in selected
+        ],
+    }
+
+
+@app.get("/projects/{project_id}/audit-events.json")
+def get_project_audit_export(project_id: UUID) -> Response:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            cursor.execute(
+                """
+                SELECT id, event_type, actor, object_type, object_id, details, created_at
+                FROM audit_events WHERE project_id = %s
+                ORDER BY created_at, id LIMIT %s
+                """,
+                (project_id, MAX_AUDIT_EXPORT_EVENTS + 1),
+            )
+            rows = cursor.fetchall()
+    report = build_audit_export(project_id, rows, MAX_AUDIT_EXPORT_EVENTS)
+    return Response(
+        content=json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="security-platform-{project_id}-audit-events.json"'
+            )
+        },
+    )
+
+
 @app.get("/projects/{project_id}/report-bundle.zip")
 def get_project_report_bundle(project_id: UUID, include_info: bool = True) -> Response:
     json_response = get_project_json_report(project_id, include_info)
     sarif_response = get_project_sarif_report(project_id, include_info)
     defectdojo_response = get_project_defectdojo_report(project_id, include_info)
+    audit_response = get_project_audit_export(project_id)
     files = {
+        "audit-events.json": bytes(audit_response.body),
         "report.json": bytes(json_response.body),
         "report.sarif": bytes(sarif_response.body),
         "report.defectdojo.json": bytes(defectdojo_response.body),

@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.126' "$work_dir/dashboard.html"
+grep -q 'UI v0.127' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
 grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
@@ -30,6 +30,7 @@ grep -q "const mutatingActions=new Set" "$work_dir/dashboard.html"
 grep -q 'new MutationObserver' "$work_dir/dashboard.html"
 grep -q 'id="tool-status"' "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
+grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -67,6 +68,7 @@ jq -e '
   (.paths["/projects/{project_id}/report.defectdojo.json"] != null) and
   (.paths["/projects/{project_id}/report.md"] != null) and
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
+  and (.paths["/projects/{project_id}/audit-events.json"] != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -168,6 +170,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/report.md?include_info=true" \
     > "$work_dir/report.md"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/audit-events.json" \
+    > "$work_dir/audit-events.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report-bundle.zip?include_info=true" \
     > "$work_dir/report-bundle.zip"
   jq -e --arg project_id "$project_id" '
@@ -194,11 +199,18 @@ if [ -n "$project_id" ]; then
     )
   ' "$work_dir/report.defectdojo.json" >/dev/null
   grep -q '^# Security assessment report' "$work_dir/report.md"
+  jq -e --arg project_id "$project_id" '
+    .schema == "security-platform-audit/v1" and
+    .project_id == $project_id and
+    (.event_count == (.events | length)) and
+    (.truncated | type == "boolean")
+  ' "$work_dir/audit-events.json" >/dev/null
   test "$(jq -r '.summary.unique_findings' "$work_dir/report.json")" = \
     "$(jq -r '.unique_count' "$work_dir/findings.json")"
   mkdir "$work_dir/bundle"
   unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
-  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "5"
+  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "6"
+  jq -e '.schema == "security-platform-audit/v1"' "$work_dir/bundle/audit-events.json" >/dev/null
   (cd "$work_dir/bundle" && sha256sum -c manifest.sha256 >/dev/null)
 fi
 

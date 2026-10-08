@@ -1,7 +1,9 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.main import build_defectdojo_report
+from uuid import UUID
+
+from app.main import build_audit_export, build_defectdojo_report
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
@@ -65,6 +67,38 @@ class DefectDojoExportTests(unittest.TestCase):
         report = build_defectdojo_report(findings)
         self.assertEqual(len(report["findings"]), 1)
         self.assertNotIn("endpoints", report["findings"][0])
+
+
+class AuditExportTests(unittest.TestCase):
+    def test_is_chronological_bounded_and_sanitized(self):
+        project_id = UUID("11111111-1111-1111-1111-111111111111")
+        rows = [
+            (
+                UUID("22222222-2222-2222-2222-222222222222"),
+                "run.approved",
+                "operator",
+                "run",
+                "run-1",
+                {"tool_id": "httpx", "token": "must-not-export"},
+                NOW,
+            ),
+            (
+                UUID("33333333-3333-3333-3333-333333333333"),
+                "run.cancel_requested",
+                "operator",
+                "run",
+                "run-1",
+                {"reason": "operator request"},
+                NOW,
+            ),
+        ]
+        report = build_audit_export(project_id, rows, 1)
+        self.assertEqual(report["schema"], "security-platform-audit/v1")
+        self.assertEqual(report["project_id"], project_id)
+        self.assertEqual(report["event_count"], 1)
+        self.assertTrue(report["truncated"])
+        self.assertEqual(report["events"][0]["event_type"], "run.approved")
+        self.assertEqual(report["events"][0]["details"]["token"], "[REDACTED]")
 
 
 if __name__ == "__main__":
