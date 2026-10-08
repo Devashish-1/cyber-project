@@ -470,6 +470,20 @@ adapters:
     controls: [single-authorized-base-url, aggression-level-1, redirects-disabled, cookies-disabled, one-thread, one-second-wait, five-second-connect-timeout, ten-second-read-timeout, title-ip-country-and-request-headers-omitted, non-root-read-only-container, pinned-local-image]
     state: verified-local-image
 
+  wpscan-passive:
+    version: 4.1.0
+    image: wpscanteam/wpscan@sha256:07d1f5a2e64e575fe4ce1b7d9d4f8d2df33471c0254323b600fb61f770d8924e
+    input: target
+    profile: controlled-active
+    approval: explicit-target-and-run-approval-required
+    timeout_seconds: 120
+    user: "1000:1000"
+    resources: {cpus: 0.5, memory: 512m, pids: 96}
+    output: sanitized-jsonl
+    capabilities: [wordpress-detection, passive-core-version, passive-theme-plugin-fingerprinting]
+    controls: [single-authorized-base-url, force-disabled, enumeration-disabled, password-attacks-disabled, api-token-disabled, updates-disabled, passive-detection-only, one-thread, half-second-throttle, five-second-connect-timeout, ten-second-request-timeout, no-retries, raw-findings-traces-users-and-urls-omitted, bundled-database-read-only, non-root-read-only-container, ephemeral-runtime-cache, pinned-upstream-image]
+    state: verified-upstream-image
+
   naabu:
     version: v2.6.1
     image: projectdiscovery/naabu@sha256:0b7efcd6eb4bf7be2c5cfb2bbfe091a132df0e442e549267bca818a4cef15ea4

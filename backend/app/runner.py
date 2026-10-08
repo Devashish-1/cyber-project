@@ -976,6 +976,22 @@ def build_command(
             "--log-json=/dev/stdout",
             base_url,
         ]
+    if tool_id == "wpscan-passive":
+        return [
+            "--url", base_url,
+            "--format", "json",
+            "--no-banner",
+            "--no-update",
+            "--detection-mode", "passive",
+            "--plugins-detection", "passive",
+            "--plugins-version-detection", "passive",
+            "--max-threads", "1",
+            "--throttle", "500",
+            "--request-timeout", "10",
+            "--connect-timeout", "5",
+            "--max-retries", "0",
+            "--cookie-jar", "/tmp/cookies",
+        ]
     if tool_id == "naabu":
         hostname = urlsplit(base_url).hostname
         if not hostname:
@@ -1400,6 +1416,99 @@ def normalize_whatweb(run_id: UUID, output_file: Path) -> int:
         return 0
     fingerprint = hashlib.sha256(f"whatweb|fingerprint|{asset}".encode()).hexdigest()
     record = (uuid4(), run_id, "web-technology", "Web technology fingerprint", "info", asset, json.dumps(details), fingerprint)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity, asset = EXCLUDED.asset,
+                    details = EXCLUDED.details
+                """,
+                record,
+            )
+    return 1
+
+
+def write_wpscan_output(raw_bytes: bytes, output_file: Path, target_url: str) -> str:
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    aborted = str(payload.get("scan_aborted") or "")
+    not_detected = "does not seem to be running WordPress" in aborted
+    if aborted and not not_detected:
+        output_file.write_text(
+            json.dumps({"url": target_url[:2000], "result": "error"}, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return "error"
+    version = payload.get("version") if isinstance(payload.get("version"), dict) else {}
+    version_number = str(version.get("number") or "").strip()
+    if not re.fullmatch(r"[0-9][0-9A-Za-z._+-]{0,31}", version_number):
+        version_number = ""
+    confidence = version.get("confidence")
+    confidence_value = int(confidence) if isinstance(confidence, int) and 0 <= confidence <= 100 else None
+    main_theme = payload.get("main_theme") if isinstance(payload.get("main_theme"), dict) else {}
+    theme_slug = str(main_theme.get("slug") or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", theme_slug):
+        theme_slug = ""
+    def safe_names(value: object) -> list[str]:
+        if not isinstance(value, dict):
+            return []
+        return sorted(
+            name for name in value
+            if isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", name)
+        )[:100]
+    finding_types = []
+    for finding in payload.get("interesting_findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        finding_type = str(finding.get("type") or "").strip().lower()
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", finding_type):
+            finding_types.append(finding_type)
+    record = {
+        "url": target_url[:2000],
+        "result": "not-detected" if not_detected else "detected",
+        "version": version_number or None,
+        "version_confidence": confidence_value,
+        "main_theme": theme_slug or None,
+        "plugins": safe_names(payload.get("plugins")),
+        "themes": safe_names(payload.get("themes")),
+        "finding_types": sorted(set(finding_types))[:100],
+    }
+    output_file.write_text(json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8")
+    return record["result"]
+
+
+def normalize_wpscan(run_id: UUID, output_file: Path) -> int:
+    try:
+        item = json.loads(output_file.read_text(encoding="utf-8").strip())
+        asset = str(item.get("url") or "")[:2000]
+        result = str(item.get("result") or "")
+        if not asset or result not in {"detected", "not-detected"}:
+            return 0
+        details = {
+            "wordpress_detected": result == "detected",
+            "version": item.get("version"),
+            "version_confidence": item.get("version_confidence"),
+            "main_theme": item.get("main_theme"),
+            "plugins": item.get("plugins") or [],
+            "themes": item.get("themes") or [],
+            "finding_types": item.get("finding_types") or [],
+            "mode": "passive",
+            "enumeration": False,
+            "password_testing": False,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return 0
+    title = "WordPress installation fingerprint" if result == "detected" else "WordPress not detected"
+    fingerprint = hashlib.sha256(f"wpscan-passive|{asset}".encode()).hexdigest()
+    record = (uuid4(), run_id, "wordpress-fingerprint", title, "info", asset, json.dumps(details), fingerprint)
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -4939,6 +5048,11 @@ def execute_run(run_id: UUID) -> None:
                         if run["tool_id"] == "spiderfoot"
                         else {}
                     ),
+                    **(
+                        {"/wpscan/.cache/wpscan/cache": "rw,nosuid,nodev,noexec,size=32m,uid=1000,gid=1000,mode=0700"}
+                        if run["tool_id"] == "wpscan-passive"
+                        else {}
+                    ),
                 }
             ),
             labels={
@@ -5013,7 +5127,13 @@ def execute_run(run_id: UUID) -> None:
             int(result.get("StatusCode", 1))
         )
         append_event(event_file, {"event": "tool_finished", "exit_code": exit_code, "time": time.time()})
-        if run["tool_id"] == "whatweb":
+        if run["tool_id"] == "wpscan-passive":
+            stdout = capture_container_logs(container, stdout=True, stderr=False)
+            write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
+            result_kind = write_wpscan_output(stdout, output_file, run["base_url"])
+            if result_kind == "error":
+                exit_code = 1
+        elif run["tool_id"] == "whatweb":
             write_tool_log(run_dir / "tool.log", capture_container_logs(container, stdout=False, stderr=True))
             if exit_code == 0:
                 write_whatweb_output(
@@ -5295,9 +5415,9 @@ def execute_run(run_id: UUID) -> None:
                 output_file.write_bytes(logs)
         else:
             output_file.write_bytes(logs)
-        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
+        successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 4} if run["tool_id"] == "wpscan-passive" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             observation_count = normalizers[run["tool_id"]](run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")

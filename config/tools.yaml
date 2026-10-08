@@ -17,6 +17,7 @@ tools:
   massdns: {category: dns, risk: high, availability: optional, execution: adapter}
   httpx: {category: http-discovery, risk: low, availability: core, execution: adapter}
   whatweb: {category: web-fingerprinting, risk: low, availability: optional, execution: adapter, automation_note: "One low-aggression request to the authorized base URL; redirects and cookies are disabled and only sanitized technology metadata is retained."}
+  wpscan-passive: {category: cms-security, risk: medium, availability: optional, execution: adapter, automation_note: "Passive WordPress detection only; no force, enumeration, API token, password testing, or database updates."}
   nmap: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
   naabu: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
   masscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}
