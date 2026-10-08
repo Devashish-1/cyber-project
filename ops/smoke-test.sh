@@ -22,7 +22,9 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.149' "$work_dir/dashboard.html"
+grep -q 'UI v0.150' "$work_dir/dashboard.html"
+grep -q 'id="finding-provenance"' "$work_dir/dashboard.html"
+grep -q "provenance==='all'||f.provenance===provenance" "$work_dir/dashboard.html"
 grep -q 'Assessment provenance' "$work_dir/dashboard.html"
 grep -q 'assessment-provenance' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
@@ -357,7 +359,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.149.0" and
+    .platform_version == "0.150.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
