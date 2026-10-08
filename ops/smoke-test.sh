@@ -21,6 +21,10 @@ printf 'silent\nshow-error\nfail\nheader = "x-control-plane-token: %s"\n' \
 curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
+curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
+grep -q 'UI v0.121' "$work_dir/dashboard.html"
+grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
+grep -q 'Download Faraday SARIF' "$work_dir/dashboard.html"
 
 unauthenticated_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/projects")"
 test "$unauthenticated_status" = "401"
@@ -66,6 +70,10 @@ jq -e '
   ([.validation[] | has("current_image") and has("proven_image") and has("image_matches") and has("integrity_status") and has("validation_state") and has("validation_note") and has("requires_external_approval")] | all) and
   ([.validation[] | select(.requires_external_approval == true) | (.validation_state == "proven" or .validation_state == "external-approval-required")] | all) and
   ([.validation[] | select(.validated == true) | (.image_matches == true and .integrity_status == "verified")] | all)
+' "$work_dir/coverage.json" >/dev/null
+jq -e '
+  ([.non_adapter[] | select(.id == "defectdojo")][0].export_format == "generic-findings-json") and
+  ([.non_adapter[] | select(.id == "faraday")][0].export_format == "sarif-2.1.0")
 ' "$work_dir/coverage.json" >/dev/null
 curl --config "$curl_config" "$base_url/local-validation-status" > "$work_dir/local-validation.json"
 jq -e '
