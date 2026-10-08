@@ -22,9 +22,11 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.151' "$work_dir/dashboard.html"
+grep -q 'UI v0.152' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
+grep -q 'Manual import history' "$work_dir/dashboard.html"
+grep -q 'loadBurpImports' "$work_dir/dashboard.html"
 grep -q 'id="finding-provenance"' "$work_dir/dashboard.html"
 grep -q "provenance==='all'||f.provenance===provenance" "$work_dir/dashboard.html"
 grep -q 'Assessment provenance' "$work_dir/dashboard.html"
@@ -97,7 +99,8 @@ jq -e '
   and (.paths["/projects/{project_id}/source-coverage"] != null)
   and (.paths["/projects/{project_id}/coverage-gaps"] != null)
   and (.paths["/projects/{project_id}/coverage-gaps.json"] != null)
-  and (.paths["/projects/{project_id}/imports/burp"] != null)
+  and (.paths["/projects/{project_id}/imports/burp"].get != null)
+  and (.paths["/projects/{project_id}/imports/burp"].post != null)
 ' "$work_dir/openapi.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
@@ -362,7 +365,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.151.0" and
+    .platform_version == "0.152.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
