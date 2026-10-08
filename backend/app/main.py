@@ -304,7 +304,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.138.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.139.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3430,6 +3430,15 @@ def available_report_adapters(input_type: str | None = None) -> list[str]:
     )
 
 
+def external_approval_adapters() -> list[str]:
+    configured = load_adapters().get("adapters", {})
+    return sorted(
+        name for name, adapter in configured.items()
+        if name in RUNNER_IMPLEMENTED_TOOLS
+        and bool(adapter.get("uses_third_party_services"))
+    )
+
+
 @app.get("/projects/{project_id}/adapter-coverage")
 def get_project_adapter_coverage(project_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
@@ -3488,6 +3497,7 @@ def summarize_coverage_gaps(
     target_coverage: dict,
     source_coverage: dict,
     role_coverage: dict,
+    approval_required_adapters: list[str] | None = None,
 ) -> dict:
     gaps = {
         "unattempted_adapters": list(adapter_coverage.get("unattempted_adapters", [])),
@@ -3521,10 +3531,16 @@ def summarize_coverage_gaps(
         ],
     }
     gap_count = sum(len(items) for items in gaps.values())
+    unresolved_adapters = set(gaps["unattempted_adapters"]) | set(gaps["attempted_without_success"])
+    external_approval_required = sorted(
+        unresolved_adapters & set(approval_required_adapters or [])
+    )
     return {
         "status": "gaps-present" if gap_count else "no-recorded-gaps",
         "gap_count": gap_count,
         "gaps": gaps,
+        "external_approval_required": external_approval_required,
+        "external_approval_required_count": len(external_approval_required),
         "disclaimer": (
             "No recorded gaps means only that every configured coverage item has qualifying run history; "
             "it does not prove the assessed system is secure."
@@ -3541,7 +3557,8 @@ def get_project_coverage_gaps(project_id: UUID) -> dict:
     return {
         "project_id": project_id,
         **summarize_coverage_gaps(
-            adapter_coverage, target_coverage, source_coverage, role_coverage
+            adapter_coverage, target_coverage, source_coverage, role_coverage,
+            external_approval_adapters(),
         ),
     }
 
@@ -3644,7 +3661,8 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
         source_coverage_rows, available_report_adapters("source")
     )
     coverage_gaps = summarize_coverage_gaps(
-        adapter_coverage, target_coverage, source_coverage, role_coverage
+        adapter_coverage, target_coverage, source_coverage, role_coverage,
+        external_approval_adapters(),
     )
     report = {
         "schema": "security-platform-report/v1",
@@ -3828,7 +3846,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         source_coverage_rows, available_report_adapters("source")
     )
     coverage_gaps = summarize_coverage_gaps(
-        adapter_coverage, target_coverage, source_coverage, role_coverage
+        adapter_coverage, target_coverage, source_coverage, role_coverage,
+        external_approval_adapters(),
     )
 
     def md(value: object) -> str:
@@ -3913,6 +3932,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
         f"- Status: {md(coverage_gaps['status'])}",
         f"- Recorded gap count: {coverage_gaps['gap_count']}",
+        f"- Unresolved adapters requiring separate third-party approval: {md(', '.join(coverage_gaps['external_approval_required']) or 'None')}",
         f"- Untested adapters: {md(', '.join(coverage_gaps['gaps']['unattempted_adapters']) or 'None')}",
         f"- Adapters attempted without success: {md(', '.join(coverage_gaps['gaps']['attempted_without_success']) or 'None')}",
         f"- Untested targets: {md(', '.join(item['base_url'] for item in coverage_gaps['gaps']['untested_targets']) or 'None')}",

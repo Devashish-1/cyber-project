@@ -257,6 +257,7 @@ class CoverageGapSummaryTests(unittest.TestCase):
             {"profiles": [
                 {"id": "r1", "name": "Admin", "role_name": "admin", "target": "https://a.test", "attempted_runs": 1, "successful_runs": 0},
             ]},
+            ["testssl", "subfinder"],
         )
         self.assertEqual(result["status"], "gaps-present")
         self.assertEqual(result["gap_count"], 6)
@@ -264,6 +265,8 @@ class CoverageGapSummaryTests(unittest.TestCase):
         self.assertEqual(result["gaps"]["targets_without_success"][0]["id"], "t2")
         self.assertEqual(result["gaps"]["untested_sources"][0]["filename"], "app.zip")
         self.assertEqual(result["gaps"]["roles_without_success"][0]["role_name"], "admin")
+        self.assertEqual(result["external_approval_required"], ["testssl"])
+        self.assertEqual(result["external_approval_required_count"], 1)
 
     def test_no_recorded_gaps_does_not_claim_security(self):
         result = summarize_coverage_gaps(
@@ -272,6 +275,7 @@ class CoverageGapSummaryTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "no-recorded-gaps")
         self.assertEqual(result["gap_count"], 0)
+        self.assertEqual(result["external_approval_required"], [])
         self.assertIn("does not prove", result["disclaimer"])
 
 

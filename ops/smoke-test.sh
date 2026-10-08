@@ -22,7 +22,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.138' "$work_dir/dashboard.html"
+grep -q 'UI v0.139' "$work_dir/dashboard.html"
 grep -q 'authenticated_role' "$work_dir/dashboard.html"
 grep -q 'roleCoverageMap' "$work_dir/dashboard.html"
 grep -q 'Download DefectDojo JSON' "$work_dir/dashboard.html"
@@ -223,6 +223,8 @@ if [ -n "$project_id" ]; then
     (.coverage.coverage_gaps.gaps.untested_targets | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_sources | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_roles | type == "array") and
+    (.coverage.coverage_gaps.external_approval_required | type == "array") and
+    (.coverage.coverage_gaps.external_approval_required_count == (.coverage.coverage_gaps.external_approval_required | length)) and
     (.coverage.coverage_gaps.disclaimer | contains("does not prove")) and
     all(.coverage.source_coverage.artifacts[];
       (.filename | type == "string") and
@@ -298,6 +300,9 @@ if [ -n "$project_id" ]; then
     (.gaps.sources_without_success | type == "array") and
     (.gaps.untested_roles | type == "array") and
     (.gaps.roles_without_success | type == "array") and
+    (.external_approval_required | type == "array") and
+    (.external_approval_required_count == (.external_approval_required | length)) and
+    all(.external_approval_required[]; . == "amass" or . == "spiderfoot" or . == "subfinder" or . == "theharvester") and
     (.disclaimer | contains("does not prove"))
   ' "$work_dir/coverage-gaps.json" >/dev/null
   jq -e '
@@ -330,6 +335,7 @@ if [ -n "$project_id" ]; then
   grep -q '^### Per-source adapter coverage' "$work_dir/report.md"
   grep -q '^### Coverage gap rollup' "$work_dir/report.md"
   grep -q '^- Limitation: .*does not prove' "$work_dir/report.md"
+  grep -q '^- Unresolved adapters requiring separate third-party approval:' "$work_dir/report.md"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-audit/v1" and
     .project_id == $project_id and
