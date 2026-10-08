@@ -291,7 +291,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.119.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.120.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -3033,6 +3033,79 @@ def get_project_sarif_report(project_id: UUID, include_info: bool = False) -> Re
     )
 
 
+def build_defectdojo_report(findings: list[dict], include_info: bool = False) -> dict:
+    reported = findings if include_info else [item for item in findings if item["severity"] != "info"]
+    severity_names = {
+        "critical": "Critical",
+        "high": "High",
+        "medium": "Medium",
+        "low": "Low",
+        "info": "Info",
+    }
+    exported = []
+    for finding in reported:
+        review_status = str(finding.get("review_status") or "new")
+        asset = str(finding.get("asset") or "")
+        details = json.dumps(
+            sanitize_evidence(finding.get("details")),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        item = {
+            "title": (str(finding.get("title") or "Security observation")[:511]),
+            "description": "\n".join([
+                f"Source tool: {finding.get('tool_id') or 'unknown'}",
+                f"Observation type: {finding.get('type') or 'unknown'}",
+                f"Asset: {asset or 'unknown'}",
+                f"Occurrences: {int(finding.get('occurrence_count') or 1)}",
+                f"Normalized details: {details}",
+            ]),
+            "severity": severity_names.get(str(finding.get("severity")), "Info"),
+            "date": str(finding.get("first_seen") or finding.get("last_seen")),
+            "active": review_status not in {"false_positive", "resolved"},
+            "verified": review_status == "confirmed",
+            "false_p": review_status == "false_positive",
+            "risk_accepted": review_status == "accepted_risk",
+            "is_mitigated": review_status == "resolved",
+            "unique_id_from_tool": str(finding.get("fingerprint") or "")[:500],
+            "vuln_id_from_tool": (
+                f"{finding.get('tool_id') or 'unknown'}:{finding.get('type') or 'finding'}"[:500]
+            ),
+            "nb_occurences": max(1, int(finding.get("occurrence_count") or 1)),
+            "tags": ["security-platform", str(finding.get("tool_id") or "unknown")[:100]],
+        }
+        target = urlsplit(asset)
+        if target.scheme in {"http", "https"} and target.hostname and len(asset) <= 4096:
+            item["endpoints"] = [asset]
+        if review_status == "resolved" and finding.get("reviewed_at"):
+            item["mitigated"] = str(finding["reviewed_at"])
+        exported.append(item)
+    return {
+        "type": "Security Testing Platform",
+        "name": "Security Testing Platform normalized findings",
+        "version": app.version,
+        "description": "Sanitized findings exported for DefectDojo Generic Findings Import.",
+        "findings": exported,
+    }
+
+
+@app.get("/projects/{project_id}/report.defectdojo.json")
+def get_project_defectdojo_report(project_id: UUID, include_info: bool = False) -> Response:
+    finding_data = get_project_findings(project_id)
+    report = build_defectdojo_report(finding_data["findings"], include_info)
+    return Response(
+        content=json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="security-platform-{project_id}-defectdojo.json"'
+            )
+        },
+    )
+
+
 @app.get("/projects/{project_id}/report.json")
 def get_project_json_report(project_id: UUID, include_info: bool = True) -> Response:
     with psycopg.connect(DATABASE_URL) as connection:
@@ -3410,9 +3483,11 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
 def get_project_report_bundle(project_id: UUID, include_info: bool = True) -> Response:
     json_response = get_project_json_report(project_id, include_info)
     sarif_response = get_project_sarif_report(project_id, include_info)
+    defectdojo_response = get_project_defectdojo_report(project_id, include_info)
     files = {
         "report.json": bytes(json_response.body),
         "report.sarif": bytes(sarif_response.body),
+        "report.defectdojo.json": bytes(defectdojo_response.body),
         "report.md": get_project_report(project_id, include_info).encode("utf-8"),
     }
     manifest = "".join(

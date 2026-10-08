@@ -37,6 +37,7 @@ jq -e '
   (.paths["/image-audit-artifacts/{artifact_kind}"] != null) and
   (.paths["/projects/{project_id}/report.json"] != null) and
   (.paths["/projects/{project_id}/report.sarif"] != null) and
+  (.paths["/projects/{project_id}/report.defectdojo.json"] != null) and
   (.paths["/projects/{project_id}/report.md"] != null) and
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
 ' "$work_dir/openapi.json" >/dev/null
@@ -130,6 +131,9 @@ if [ -n "$project_id" ]; then
     "$base_url/projects/$project_id/report.sarif?include_info=true" \
     > "$work_dir/report.sarif"
   curl --config "$curl_config" \
+    "$base_url/projects/$project_id/report.defectdojo.json?include_info=true" \
+    > "$work_dir/report.defectdojo.json"
+  curl --config "$curl_config" \
     "$base_url/projects/$project_id/report.md?include_info=true" \
     > "$work_dir/report.md"
   curl --config "$curl_config" \
@@ -142,12 +146,28 @@ if [ -n "$project_id" ]; then
   ' "$work_dir/report.json" >/dev/null
   jq -e '.version == "2.1.0" and (.runs | type == "array")' \
     "$work_dir/report.sarif" >/dev/null
+  jq -e '
+    .type == "Security Testing Platform" and
+    (.version | type == "string") and
+    (.findings | type == "array") and
+    all(.findings[];
+      (.title | type == "string") and
+      (.description | type == "string") and
+      (.severity == "Critical" or .severity == "High" or .severity == "Medium" or .severity == "Low" or .severity == "Info") and
+      (.active | type == "boolean") and
+      (.verified | type == "boolean") and
+      (.false_p | type == "boolean") and
+      (.risk_accepted | type == "boolean") and
+      (.is_mitigated | type == "boolean") and
+      (.unique_id_from_tool | type == "string")
+    )
+  ' "$work_dir/report.defectdojo.json" >/dev/null
   grep -q '^# Security assessment report' "$work_dir/report.md"
   test "$(jq -r '.summary.unique_findings' "$work_dir/report.json")" = \
     "$(jq -r '.unique_count' "$work_dir/findings.json")"
   mkdir "$work_dir/bundle"
   unzip -q "$work_dir/report-bundle.zip" -d "$work_dir/bundle"
-  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "4"
+  test "$(find "$work_dir/bundle" -maxdepth 1 -type f | wc -l)" = "5"
   (cd "$work_dir/bundle" && sha256sum -c manifest.sha256 >/dev/null)
 fi
 
