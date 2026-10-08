@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.159' "$work_dir/dashboard.html"
+grep -q 'UI v0.160' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -73,6 +73,9 @@ grep -q 'blocked until the selected target explicitly opts in' "$work_dir/dashbo
 grep -q 'Selected target policy does not allow third-party provider access' "$work_dir/dashboard.html"
 grep -q "adapterMap\[tool\].uses_third_party_services&&!targetMap\[target\]?.allow_third_party_services" "$work_dir/dashboard.html"
 grep -q "externalTools.length&&!targetMap\[target\]?.allow_third_party_services" "$work_dir/dashboard.html"
+grep -q 'function validationEvidenceAction' "$work_dir/dashboard.html"
+grep -q "validationEvidenceAction(item)" "$work_dir/dashboard.html"
+grep -q "validationEvidenceAction(toolCoverageMap\[name\],'Review proof')" "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
