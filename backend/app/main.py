@@ -301,7 +301,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.134.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.135.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3557,6 +3557,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             completed_runs, sealed_runs = cursor.fetchone()
             role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
             target_coverage_rows = fetch_target_coverage_rows(cursor, project_id)
+            source_coverage_rows = fetch_source_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3573,6 +3574,9 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
     role_coverage = summarize_role_coverage(role_coverage_rows)
     target_coverage = summarize_target_coverage(
         target_coverage_rows, available_report_adapters("target")
+    )
+    source_coverage = summarize_source_coverage(
+        source_coverage_rows, available_report_adapters("source")
     )
     report = {
         "schema": "security-platform-report/v1",
@@ -3623,6 +3627,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             "adapter_gaps": adapter_coverage,
             "role_coverage": role_coverage,
             "target_coverage": target_coverage,
+            "source_coverage": source_coverage,
             "run_status_counts": {row[0]: row[1] for row in status_counts},
             "run_matrix": [
                 {
@@ -3731,6 +3736,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             completed_runs, sealed_runs = cursor.fetchone()
             role_coverage_rows = fetch_role_coverage_rows(cursor, project_id)
             target_coverage_rows = fetch_target_coverage_rows(cursor, project_id)
+            source_coverage_rows = fetch_source_coverage_rows(cursor, project_id)
 
     finding_data = get_project_findings(project_id)
     findings = finding_data["findings"]
@@ -3748,6 +3754,9 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     role_coverage = summarize_role_coverage(role_coverage_rows)
     target_coverage = summarize_target_coverage(
         target_coverage_rows, available_report_adapters("target")
+    )
+    source_coverage = summarize_source_coverage(
+        source_coverage_rows, available_report_adapters("source")
     )
 
     def md(value: object) -> str:
@@ -3852,6 +3861,19 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
     )
     if not target_coverage["targets"]:
         lines.append("| — | 0 | 0 | 0 | 0 | No authorized targets configured |")
+    lines.extend([
+        "",
+        "### Per-source adapter coverage",
+        "",
+        "| Source archive | SHA-256 | Attempted | Successful | Untested | Runs | Latest completion |",
+        "|---|---|---:|---:|---:|---:|---|",
+    ])
+    lines.extend(
+        f"| {md(item['filename'])} | `{md(item['sha256'])}` | {len(item['attempted_adapters'])}/{item['available_adapter_count']} ({item['attempted_coverage_percent']}%) | {len(item['successful_adapters'])}/{item['available_adapter_count']} ({item['successful_coverage_percent']}%) | {len(item['unattempted_adapters'])} | {item['run_count']} | {item['last_finished_at'].isoformat() if item['last_finished_at'] else '—'} |"
+        for item in source_coverage["artifacts"]
+    )
+    if not source_coverage["artifacts"]:
+        lines.append("| — | — | 0 | 0 | 0 | 0 | No authorized source archives configured |")
     lines.extend([
         "",
         "### Run coverage matrix",
