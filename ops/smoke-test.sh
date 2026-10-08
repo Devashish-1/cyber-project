@@ -42,7 +42,8 @@ jq -e '
   (.severity_counts.critical | type == "number") and
   (.fixable_counts.high | type == "number") and
   (.sbom.available == true) and
-  (.checksums.available == true)
+  (.checksums.available == true) and
+  (.checksums.verified == true)
 ' "$work_dir/image-audit.json" >/dev/null
 mkdir "$work_dir/image-audit"
 for kind in report sbom checksums; do

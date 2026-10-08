@@ -271,7 +271,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.102.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.103.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1034,7 +1034,7 @@ def coverage() -> dict:
 def image_audit_status() -> dict:
     reports = [
         path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json")
-        if path.is_file()
+        if path.is_file() and not path.is_symlink()
     ]
     if not reports:
         return {"available": False, "detail": "No container image audit is available"}
@@ -1070,6 +1070,29 @@ def image_audit_status() -> dict:
     prefix = latest.name.removesuffix(".trivy.json")
     sbom = IMAGE_AUDIT_ROOT / f"{prefix}.sbom.json"
     checksums = IMAGE_AUDIT_ROOT / f"{prefix}.sha256"
+    checksum_verified = False
+    if (
+        sbom.is_file()
+        and not sbom.is_symlink()
+        and sbom.stat().st_size <= 64 * 1024 * 1024
+        and checksums.is_file()
+        and not checksums.is_symlink()
+        and checksums.stat().st_size <= 64 * 1024
+    ):
+        try:
+            expected = {}
+            for line in checksums.read_text(encoding="utf-8").splitlines():
+                match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+                if match:
+                    name = PurePosixPath(match.group(2)).name
+                    if name in {latest.name, sbom.name}:
+                        expected[name] = match.group(1).lower()
+            checksum_verified = all(
+                expected.get(path.name) == hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (latest, sbom)
+            )
+        except (OSError, UnicodeDecodeError):
+            checksum_verified = False
     metadata = report.get("Metadata") if isinstance(report.get("Metadata"), dict) else {}
     return {
         "available": True,
@@ -1082,6 +1105,7 @@ def image_audit_status() -> dict:
         "checksums": {
             "available": checksums.is_file(),
             "filename": checksums.name if checksums.is_file() else None,
+            "verified": checksum_verified,
         },
         "severity_counts": severity_counts,
         "fixable_counts": fixable_counts,
@@ -1099,7 +1123,8 @@ def download_image_audit_artifact(artifact_kind: str) -> FileResponse:
     if artifact_kind not in artifact_suffixes:
         raise HTTPException(status_code=404, detail="Unknown image audit artifact")
     reports = [
-        path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json") if path.is_file()
+        path for path in IMAGE_AUDIT_ROOT.glob("*.trivy.json")
+        if path.is_file() and not path.is_symlink()
     ]
     if not reports:
         raise HTTPException(status_code=404, detail="No container image audit is available")
