@@ -15,6 +15,7 @@ from app.runner import (
     write_dnsrecon_output,
     write_dnsx_output,
     write_massdns_output,
+    url_is_in_target_scope,
 )
 
 
@@ -200,6 +201,22 @@ class AdapterContractTests(unittest.TestCase):
             write_dnsrecon_output(raw, output, "authorized.example.test")
             results = json.loads(output.read_text())["results"]
         self.assertEqual([item["host"] for item in results], ["api.authorized.example.test"])
+
+    def test_web_output_scope_requires_exact_origin(self):
+        base = "https://authorized.example.test:8443/app"
+        self.assertTrue(url_is_in_target_scope("https://authorized.example.test:8443/health", base, []))
+        self.assertFalse(url_is_in_target_scope("https://authorized.example.test.evil.invalid:8443/", base, []))
+        self.assertFalse(url_is_in_target_scope("https://authorized.example.test/", base, []))
+        self.assertFalse(url_is_in_target_scope("http://authorized.example.test:8443/", base, []))
+        self.assertFalse(url_is_in_target_scope("https://user@authorized.example.test:8443/", base, []))
+
+    def test_web_output_scope_enforces_encoded_and_normalized_exclusions(self):
+        base = "https://authorized.example.test/"
+        excluded = ["/logout", "/admin"]
+        self.assertFalse(url_is_in_target_scope("https://authorized.example.test/logout/session", base, excluded))
+        self.assertFalse(url_is_in_target_scope("https://authorized.example.test/%6cogout", base, excluded))
+        self.assertFalse(url_is_in_target_scope("https://authorized.example.test/public/../admin/users", base, excluded))
+        self.assertTrue(url_is_in_target_scope("https://authorized.example.test/public", base, excluded))
 
 
 if __name__ == "__main__":

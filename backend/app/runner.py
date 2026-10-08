@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import docker
 import psycopg
@@ -605,6 +605,47 @@ def testing_window_allows(
     if start_minute_utc < end_minute_utc:
         return start_minute_utc <= current_minute < end_minute_utc
     return current_minute >= start_minute_utc or current_minute < end_minute_utc
+
+
+def url_is_in_target_scope(
+    candidate: str,
+    base_url: str,
+    excluded_paths: list[str] | None = None,
+) -> bool:
+    try:
+        parsed = urlsplit(candidate)
+        base = urlsplit(base_url)
+        candidate_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        base_port = base.port or (443 if base.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.scheme != base.scheme
+        or not parsed.hostname
+        or parsed.hostname.lower().rstrip(".") != (base.hostname or "").lower().rstrip(".")
+        or candidate_port != base_port
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    decoded_path = unquote(parsed.path or "/").replace("\\", "/")
+    normalized_parts = []
+    for part in decoded_path.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if normalized_parts:
+                normalized_parts.pop()
+            continue
+        normalized_parts.append(part)
+    candidate_path = "/" + "/".join(normalized_parts)
+    for raw_path in excluded_paths or []:
+        blocked = "/" + unquote(str(raw_path)).lstrip("/")
+        blocked = blocked.rstrip("/") or "/"
+        if blocked == "/" or candidate_path == blocked or candidate_path.startswith(blocked + "/"):
+            return False
+    return True
 
 
 def build_command(
@@ -1625,7 +1666,12 @@ def normalize_nmap(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def normalize_nuclei(run_id: UUID, output_file: Path) -> int:
+def normalize_nuclei(
+    run_id: UUID,
+    output_file: Path,
+    base_url: str,
+    excluded_paths: list[str] | None,
+) -> int:
     allowed_severities = {"info", "low", "medium", "high", "critical"}
     records = []
     try:
@@ -1637,6 +1683,8 @@ def normalize_nuclei(run_id: UUID, output_file: Path) -> int:
             template_id = str(item.get("template-id") or "nuclei-template")[:200]
             matcher = str(item.get("matcher-name") or item.get("type") or "match")[:200]
             asset = str(item.get("matched-at") or item.get("host") or "HTTP target")[:2000]
+            if not url_is_in_target_scope(asset, base_url, excluded_paths):
+                continue
             severity = str(info.get("severity") or "info").lower()
             if severity not in allowed_severities:
                 severity = "info"
@@ -1992,7 +2040,12 @@ def normalize_nikto(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def normalize_katana(run_id: UUID, output_file: Path) -> int:
+def normalize_katana(
+    run_id: UUID,
+    output_file: Path,
+    base_url: str,
+    excluded_paths: list[str] | None,
+) -> int:
     records = []
     try:
         for raw_line in output_file.read_text(encoding="utf-8").splitlines():
@@ -2002,7 +2055,7 @@ def normalize_katana(run_id: UUID, output_file: Path) -> int:
             request = item.get("request") or {}
             response = item.get("response") or {}
             endpoint = str(request.get("endpoint") or "")[:2000]
-            if not endpoint:
+            if not endpoint or not url_is_in_target_scope(endpoint, base_url, excluded_paths):
                 continue
             method = str(request.get("method") or "GET")[:20]
             details = {
@@ -2230,7 +2283,12 @@ def normalize_sqlmap(run_id: UUID, output_file: Path) -> int:
     return len(records)
 
 
-def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
+def normalize_ffuf(
+    run_id: UUID,
+    output_file: Path,
+    base_url: str,
+    excluded_paths: list[str] | None,
+) -> int:
     records = []
     try:
         for raw_line in output_file.read_text(encoding="utf-8").splitlines():
@@ -2238,7 +2296,7 @@ def normalize_ffuf(run_id: UUID, output_file: Path) -> int:
                 continue
             item = json.loads(raw_line)
             url = str(item.get("url") or "")[:2000]
-            if not url:
+            if not url or not url_is_in_target_scope(url, base_url, excluded_paths):
                 continue
             status = int(item.get("status") or 0)
             details = {
@@ -5429,7 +5487,16 @@ def execute_run(run_id: UUID) -> None:
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 4} if run["tool_id"] == "wpscan-passive" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
             normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
-            observation_count = normalizers[run["tool_id"]](run_id, output_file)
+            normalizer = normalizers[run["tool_id"]]
+            if run["tool_id"] in {"ffuf", "katana", "nuclei-reviewed"}:
+                observation_count = normalizer(
+                    run_id,
+                    output_file,
+                    run["base_url"],
+                    run["excluded_paths"],
+                )
+            else:
+                observation_count = normalizer(run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
             set_status(run_id, "succeeded")
             append_event(event_file, {
