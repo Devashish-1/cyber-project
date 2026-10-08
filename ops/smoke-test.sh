@@ -5,6 +5,8 @@ platform_root="${SECURITY_PLATFORM_ROOT:-/home/killswitch/security-platform}"
 base_url="${SECURITY_PLATFORM_URL:-http://127.0.0.1:8080/api}"
 cd "$platform_root"
 
+./ops/test-adapter-contracts.sh >/dev/null
+
 set -a
 . ./.env
 set +a
