@@ -1,9 +1,11 @@
 import unittest
 from datetime import datetime, timezone
 
+from pydantic import ValidationError
 from uuid import UUID
 
 from app.main import (
+    ManualImportDelete,
     SUPERVISED_ADAPTER_EXECUTION_MODES,
     build_audit_export,
     build_defectdojo_report,
@@ -18,6 +20,18 @@ from app.main import (
 
 
 NOW = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
+
+
+class ManualImportDeleteTests(unittest.TestCase):
+    def test_requires_exact_destructive_confirmation(self):
+        request = ManualImportDelete(
+            requested_by="operator", confirmation="DELETE MANUAL IMPORT"
+        )
+        self.assertEqual(request.confirmation, "DELETE MANUAL IMPORT")
+
+    def test_rejects_ambiguous_confirmation(self):
+        with self.assertRaises(ValidationError):
+            ManualImportDelete(requested_by="operator", confirmation="delete import")
 
 
 class CoverageClassificationTests(unittest.TestCase):

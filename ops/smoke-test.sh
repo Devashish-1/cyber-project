@@ -22,7 +22,9 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.150' "$work_dir/dashboard.html"
+grep -q 'UI v0.151' "$work_dir/dashboard.html"
+grep -q 'Delete import' "$work_dir/dashboard.html"
+grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q 'id="finding-provenance"' "$work_dir/dashboard.html"
 grep -q "provenance==='all'||f.provenance===provenance" "$work_dir/dashboard.html"
 grep -q 'Assessment provenance' "$work_dir/dashboard.html"
@@ -87,6 +89,7 @@ jq -e '
   (.paths["/projects/{project_id}/report.defectdojo.json"] != null) and
   (.paths["/projects/{project_id}/report.md"] != null) and
   (.paths["/projects/{project_id}/report-bundle.zip"] != null)
+  and (.paths["/projects/{project_id}/imports/burp/{run_id}"].delete != null)
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
   and (.paths["/projects/{project_id}/role-coverage"] != null)
@@ -359,7 +362,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.150.0" and
+    .platform_version == "0.151.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and

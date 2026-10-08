@@ -308,7 +308,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.150.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.151.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -484,6 +484,11 @@ class CredentialProfileCreate(BaseModel):
 class CredentialProfileDelete(BaseModel):
     requested_by: str = Field(min_length=2, max_length=120)
     confirmation: str = Field(pattern="^DELETE CREDENTIAL PROFILE$")
+
+
+class ManualImportDelete(BaseModel):
+    requested_by: str = Field(min_length=2, max_length=120)
+    confirmation: str = Field(pattern="^DELETE MANUAL IMPORT$")
 
 
 class BatchCreate(BaseModel):
@@ -2132,6 +2137,45 @@ async def import_burp_findings(
         "skipped_excluded": parsed["skipped_excluded"],
         "duplicate_count": parsed["duplicate_count"],
         "sha256": digest,
+    }
+
+
+@app.delete("/projects/{project_id}/imports/burp/{run_id}")
+def delete_burp_import(project_id: UUID, run_id: UUID, payload: ManualImportDelete) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT target_id, requested_by, created_at
+                FROM runs
+                WHERE id = %s AND project_id = %s
+                  AND tool_id = 'burp-suite-community' AND profile = 'manual-import'
+                  AND status = 'succeeded'
+                FOR UPDATE
+                """,
+                (run_id, project_id),
+            )
+            imported_run = cursor.fetchone()
+            if imported_run is None:
+                raise HTTPException(status_code=404, detail="Manual Burp import not found")
+            cursor.execute("SELECT COUNT(*) FROM observations WHERE run_id = %s", (run_id,))
+            observation_count = int(cursor.fetchone()[0])
+            cursor.execute("DELETE FROM observations WHERE run_id = %s", (run_id,))
+            cursor.execute("DELETE FROM runs WHERE id = %s", (run_id,))
+            record_audit(
+                cursor, project_id, "burp.import_deleted", payload.requested_by,
+                "manual-import", run_id,
+                {
+                    "target_id": str(imported_run[0]),
+                    "original_requested_by": imported_run[1],
+                    "original_created_at": imported_run[2].isoformat(),
+                    "deleted_observation_count": observation_count,
+                },
+            )
+    return {
+        "run_id": run_id,
+        "status": "deleted",
+        "deleted_observation_count": observation_count,
     }
 
 
