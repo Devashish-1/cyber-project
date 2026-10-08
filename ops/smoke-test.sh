@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.163' "$work_dir/dashboard.html"
+grep -q 'UI v0.164' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -87,6 +87,9 @@ grep -q 'State-changing access:' "$work_dir/dashboard.html"
 grep -q 'does not allow state-changing extended-active tests' "$work_dir/dashboard.html"
 grep -q "adapterMap\[tool\].profile==='extended-active'&&!targetMap\[target\]?.allow_state_changing" "$work_dir/dashboard.html"
 grep -q "extendedTools.length&&!targetMap\[target\]?.allow_state_changing" "$work_dir/dashboard.html"
+grep -q 'by server UTC' "$work_dir/dashboard.html"
+grep -q 'Selected target testing window is currently closed' "$work_dir/dashboard.html"
+grep -q "targetMap\[target\]?.testing_window_open===false" "$work_dir/dashboard.html"
 grep -q 'runtime is not ready' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
@@ -376,6 +379,7 @@ fi
 local_project_id="$(jq -r '.projects[] | select(.name == "Local Runner Validation") | .id' "$work_dir/projects.json" | head -n1)"
 if [ -n "$local_project_id" ]; then
   curl --config "$curl_config" "$base_url/projects/$local_project_id/targets" > "$work_dir/local-targets.json"
+  jq -e '([.targets[] | has("testing_window_open") and has("testing_window_label")] | all)' "$work_dir/local-targets.json" >/dev/null
   local_target_id="$(jq -r '.targets[] | select(.allow_third_party_services == false) | .id' "$work_dir/local-targets.json" | head -n1)"
   if [ -n "$local_target_id" ]; then
     third_party_status="$(curl --config "$curl_config" --no-fail -sS -o "$work_dir/third-party-denied.json" -w '%{http_code}' \
@@ -580,7 +584,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.157.0" and
+    .platform_version == "0.158.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and

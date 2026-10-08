@@ -310,7 +310,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.157.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.158.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2539,6 +2539,8 @@ def list_targets(project_id: UUID) -> dict:
                 "max_run_seconds": row[5],
                 "testing_window_start_minute_utc": row[6],
                 "testing_window_end_minute_utc": row[7],
+                "testing_window_open": testing_window_allows(row[6], row[7]),
+                "testing_window_label": format_testing_window(row[6], row[7]),
                 "allow_state_changing": row[8],
                 "allow_third_party_services": row[9],
                 "authorization_reference": row[10],

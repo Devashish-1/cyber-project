@@ -1,10 +1,13 @@
 import unittest
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
 from app.main import (
+    require_open_testing_window,
     require_state_changing_permission,
     require_third_party_service_permission,
+    testing_window_allows,
 )
 
 
@@ -45,6 +48,37 @@ class ThirdPartyServicePermissionTests(unittest.TestCase):
             require_third_party_service_permission(True, False, workflow=True)
 
         self.assertIn("workflow steps", raised.exception.detail)
+
+
+class TestingWindowTests(unittest.TestCase):
+    def test_unrestricted_and_same_day_windows(self):
+        noon = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(testing_window_allows(None, None, now=noon))
+        self.assertTrue(testing_window_allows(11 * 60, 13 * 60, now=noon))
+        self.assertFalse(testing_window_allows(13 * 60, 14 * 60, now=noon))
+
+    def test_overnight_window_wraps_midnight(self):
+        late = datetime(2026, 1, 1, 23, 30, tzinfo=timezone.utc)
+        early = datetime(2026, 1, 2, 1, 30, tzinfo=timezone.utc)
+        noon = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(testing_window_allows(23 * 60, 2 * 60, now=late))
+        self.assertTrue(testing_window_allows(23 * 60, 2 * 60, now=early))
+        self.assertFalse(testing_window_allows(23 * 60, 2 * 60, now=noon))
+
+    def test_invalid_or_closed_window_is_rejected(self):
+        self.assertFalse(testing_window_allows(None, 60))
+        self.assertFalse(testing_window_allows(60, 60))
+        current = datetime.now(timezone.utc)
+        current_minute = current.hour * 60 + current.minute
+        closed_start = (current_minute + 60) % 1440
+        closed_end = (current_minute + 120) % 1440
+        with self.assertRaises(HTTPException) as raised:
+            require_open_testing_window(closed_start, closed_end)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("testing window", raised.exception.detail)
 
 
 if __name__ == "__main__":
