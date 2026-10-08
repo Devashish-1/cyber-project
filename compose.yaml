@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
@@ -17,7 +17,7 @@ services:
     cpus: 1.0
 
   redis:
-    image: redis:8-alpine
+    image: redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
