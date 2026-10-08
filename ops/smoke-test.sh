@@ -22,9 +22,10 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.152' "$work_dir/dashboard.html"
+grep -q 'UI v0.155' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
+grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
 grep -q 'Manual import history' "$work_dir/dashboard.html"
 grep -q 'loadBurpImports' "$work_dir/dashboard.html"
 grep -q 'id="finding-provenance"' "$work_dir/dashboard.html"
