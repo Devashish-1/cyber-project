@@ -1,5 +1,6 @@
 import json
 import hashlib
+import gzip
 import io
 import ipaddress
 import os
@@ -8,6 +9,7 @@ import secrets
 import shutil
 import stat
 import time
+import tarfile
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -52,6 +54,8 @@ EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
 MAX_IMAGE_AUDIT_AGE_HOURS = int(os.getenv("MAX_IMAGE_AUDIT_AGE_HOURS", "168"))
+BACKUP_ROOT = Path(os.getenv("BACKUP_ROOT", "/backups"))
+MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
 MAX_SOURCE_FILES = 5_000
@@ -75,6 +79,7 @@ if (
     or not MAX_TOOL_OUTPUT_BYTES <= MAX_RUN_EVIDENCE_BYTES <= 1024 * 1024 * 1024
     or not 4 <= MAX_RUN_EVIDENCE_FILES <= 256
     or not 1 <= MAX_IMAGE_AUDIT_AGE_HOURS <= 8760
+    or not 1 <= MAX_BACKUP_AGE_HOURS <= 8760
 ):
     raise RuntimeError("Platform safety thresholds are invalid")
 SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "token", "password", "secret", "api_key", "apikey"}
@@ -273,7 +278,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.106.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.107.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1224,6 +1229,73 @@ def download_image_audit_artifact(artifact_kind: str) -> FileResponse:
     if artifact.stat().st_size > 64 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image audit artifact exceeds the download limit")
     return FileResponse(artifact, media_type=media_type, filename=artifact.name)
+
+
+@app.get("/backup-status")
+def backup_status() -> dict:
+    database_backups = sorted(
+        (
+            path for path in BACKUP_ROOT.glob("postgres-*.sql.gz")
+            if path.is_file() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not database_backups:
+        return {"available": False, "detail": "No database backup is available"}
+    database_backup = database_backups[0]
+    match = re.fullmatch(r"postgres-(\d{8}T\d{6}Z)\.sql\.gz", database_backup.name)
+    if not match:
+        raise HTTPException(status_code=503, detail="Latest database backup name is invalid")
+    timestamp = match.group(1)
+    config_backup = BACKUP_ROOT / f"config-{timestamp}.tar.gz"
+    paired = config_backup.is_file() and not config_backup.is_symlink()
+    database_valid = False
+    config_valid = False
+    if database_backup.stat().st_size <= 512 * 1024 * 1024:
+        try:
+            expanded = 0
+            with gzip.open(database_backup, "rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    expanded += len(chunk)
+                    if expanded > 1024 * 1024 * 1024:
+                        raise ValueError("Database backup expands beyond the validation limit")
+            database_valid = expanded > 0
+        except (OSError, EOFError, ValueError):
+            database_valid = False
+    if paired and config_backup.stat().st_size <= 512 * 1024 * 1024:
+        try:
+            with tarfile.open(config_backup, "r:gz") as archive:
+                members = archive.getmembers()
+                config_valid = 0 < len(members) <= 10_000 and all(
+                    not PurePosixPath(member.name).is_absolute()
+                    and ".." not in PurePosixPath(member.name).parts
+                    for member in members
+                )
+        except (OSError, EOFError, tarfile.TarError):
+            config_valid = False
+    created_at = datetime.fromtimestamp(database_backup.stat().st_mtime, timezone.utc)
+    age_seconds = max(0, int((datetime.now(timezone.utc) - created_at).total_seconds()))
+    return {
+        "available": True,
+        "timestamp": timestamp,
+        "created_at": created_at,
+        "age_seconds": age_seconds,
+        "fresh": age_seconds <= MAX_BACKUP_AGE_HOURS * 3600,
+        "max_age_hours": MAX_BACKUP_AGE_HOURS,
+        "paired": paired,
+        "verified": paired and database_valid and config_valid,
+        "database": {
+            "filename": database_backup.name,
+            "size_bytes": database_backup.stat().st_size,
+            "valid": database_valid,
+        },
+        "configuration": {
+            "filename": config_backup.name if paired else None,
+            "size_bytes": config_backup.stat().st_size if paired else None,
+            "valid": config_valid,
+        },
+    }
 
 
 @app.get("/run-plans")
