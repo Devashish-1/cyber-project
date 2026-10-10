@@ -330,7 +330,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.172.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.173.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -4280,6 +4280,8 @@ def summarize_target_coverage(rows: list[tuple], available_adapters: list[str] |
             **target,
             "available_adapter_count": total,
             "available_adapters": target_available,
+            "policy_gated_adapter_count": len(available_set - target_available_set),
+            "policy_gated_adapters": sorted(available_set - target_available_set),
             "attempted_adapters": attempted,
             "successful_adapters": successful,
             "unattempted_adapters": sorted(target_available_set - set(attempted)),

@@ -390,6 +390,8 @@ class TargetCoverageSummaryTests(unittest.TestCase):
         target = summarize_target_coverage(rows, adapters)["targets"][0]
         self.assertEqual(target["available_adapters"], ["httpx"])
         self.assertEqual(target["available_adapter_count"], 1)
+        self.assertEqual(target["policy_gated_adapter_count"], 4)
+        self.assertEqual(target["policy_gated_adapters"], ["dnsrecon", "k6", "subfinder", "zap-full"])
         self.assertEqual(target["unattempted_adapters"], ["httpx"])
 
     def test_includes_adapters_enabled_by_target_policy(self):
@@ -403,6 +405,7 @@ class TargetCoverageSummaryTests(unittest.TestCase):
         rows = [(target_id, "https://app.example.test", None, None, 0, None, True, True, True, "1.1.1.1:53")]
         target = summarize_target_coverage(rows, adapters)["targets"][0]
         self.assertEqual(target["available_adapter_count"], 4)
+        self.assertEqual(target["policy_gated_adapter_count"], 0)
         self.assertEqual(target["unattempted_adapters"], ["dnsrecon", "k6", "subfinder", "zap-full"])
 
 
