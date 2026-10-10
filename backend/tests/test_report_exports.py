@@ -377,6 +377,34 @@ class TargetCoverageSummaryTests(unittest.TestCase):
         self.assertEqual(target["attempted_adapters"], [])
         self.assertEqual(target["run_count"], 0)
 
+    def test_excludes_adapters_blocked_by_target_policy(self):
+        target_id = UUID("99999999-9999-9999-9999-999999999998")
+        adapters = {
+            "httpx": {"profile": "observe"},
+            "dnsrecon": {"profile": "observe"},
+            "subfinder": {"profile": "controlled-active", "uses_third_party_services": True},
+            "zap-full": {"profile": "extended-active"},
+            "k6": {"profile": "load-resilience"},
+        }
+        rows = [(target_id, "https://app.example.test", None, None, 0, None, False, False, False, None)]
+        target = summarize_target_coverage(rows, adapters)["targets"][0]
+        self.assertEqual(target["available_adapters"], ["httpx"])
+        self.assertEqual(target["available_adapter_count"], 1)
+        self.assertEqual(target["unattempted_adapters"], ["httpx"])
+
+    def test_includes_adapters_enabled_by_target_policy(self):
+        target_id = UUID("99999999-9999-9999-9999-999999999997")
+        adapters = {
+            "dnsrecon": {"profile": "observe"},
+            "subfinder": {"profile": "controlled-active", "uses_third_party_services": True},
+            "zap-full": {"profile": "extended-active"},
+            "k6": {"profile": "load-resilience"},
+        }
+        rows = [(target_id, "https://app.example.test", None, None, 0, None, True, True, True, "1.1.1.1:53")]
+        target = summarize_target_coverage(rows, adapters)["targets"][0]
+        self.assertEqual(target["available_adapter_count"], 4)
+        self.assertEqual(target["unattempted_adapters"], ["dnsrecon", "k6", "subfinder", "zap-full"])
+
 
 class SourceCoverageSummaryTests(unittest.TestCase):
     def test_keeps_coverage_separate_for_each_source_archive(self):

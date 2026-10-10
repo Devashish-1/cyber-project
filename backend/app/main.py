@@ -330,7 +330,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.171.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.172.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -4233,16 +4233,26 @@ def fetch_role_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
     return cursor.fetchall()
 
 
-def summarize_target_coverage(rows: list[tuple], available_adapters: list[str]) -> dict:
-    available = sorted(set(available_adapters))
+def summarize_target_coverage(rows: list[tuple], available_adapters: list[str] | dict[str, dict]) -> dict:
+    adapter_metadata = available_adapters if isinstance(available_adapters, dict) else {
+        name: {} for name in available_adapters
+    }
+    available = sorted(set(adapter_metadata))
     available_set = set(available)
     targets: dict[str, dict] = {}
-    for target_id, base_url, tool_id, status, run_count, last_finished_at in rows:
+    for row in rows:
+        target_id, base_url, tool_id, status, run_count, last_finished_at = row[:6]
+        policy = row[6:] if len(row) >= 10 else (True, True, True, "legacy")
+        allow_state_changing, allow_third_party_services, allow_load_testing, dns_resolver = policy
         key = str(target_id)
         target = targets.setdefault(key, {
             "id": target_id, "base_url": base_url,
             "attempted_adapters": set(), "successful_adapters": set(),
             "run_count": 0, "last_finished_at": None,
+            "allow_state_changing": bool(allow_state_changing),
+            "allow_third_party_services": bool(allow_third_party_services),
+            "allow_load_testing": bool(allow_load_testing),
+            "dns_resolver_configured": bool(dns_resolver),
         })
         if tool_id in available_set:
             target["attempted_adapters"].add(tool_id)
@@ -4253,17 +4263,26 @@ def summarize_target_coverage(rows: list[tuple], available_adapters: list[str]) 
             target["last_finished_at"] is None or last_finished_at > target["last_finished_at"]
         ):
             target["last_finished_at"] = last_finished_at
-    total = len(available)
     ordered = []
     for target in sorted(targets.values(), key=lambda item: item["base_url"]):
-        attempted = sorted(target.pop("attempted_adapters"))
-        successful = sorted(target.pop("successful_adapters"))
+        target_available = sorted(
+            name for name, adapter in adapter_metadata.items()
+            if not (adapter.get("uses_third_party_services") and not target["allow_third_party_services"])
+            and not (adapter.get("profile") == "extended-active" and not target["allow_state_changing"])
+            and not (adapter.get("profile") == "load-resilience" and not target["allow_load_testing"])
+            and not (name in {"dnsrecon", "dnsx", "massdns"} and not target["dns_resolver_configured"])
+        )
+        target_available_set = set(target_available)
+        attempted = sorted(target.pop("attempted_adapters") & target_available_set)
+        successful = sorted(target.pop("successful_adapters") & target_available_set)
+        total = len(target_available)
         ordered.append({
             **target,
             "available_adapter_count": total,
+            "available_adapters": target_available,
             "attempted_adapters": attempted,
             "successful_adapters": successful,
-            "unattempted_adapters": sorted(available_set - set(attempted)),
+            "unattempted_adapters": sorted(target_available_set - set(attempted)),
             "attempted_coverage_percent": round((len(attempted) / total) * 100, 1) if total else 0,
             "successful_coverage_percent": round((len(successful) / total) * 100, 1) if total else 0,
         })
@@ -4273,11 +4292,15 @@ def summarize_target_coverage(rows: list[tuple], available_adapters: list[str]) 
 def fetch_target_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
     cursor.execute(
         """
-        SELECT t.id, t.base_url, r.tool_id, r.status, COUNT(r.id), MAX(r.finished_at)
+        SELECT t.id, t.base_url, r.tool_id, r.status, COUNT(r.id), MAX(r.finished_at),
+               t.allow_state_changing, t.allow_third_party_services,
+               t.allow_load_testing, t.dns_resolver
         FROM targets t
         LEFT JOIN runs r ON r.target_id = t.id
         WHERE t.project_id = %s
-        GROUP BY t.id, t.base_url, r.tool_id, r.status
+        GROUP BY t.id, t.base_url, t.allow_state_changing,
+                 t.allow_third_party_services, t.allow_load_testing,
+                 t.dns_resolver, r.tool_id, r.status
         ORDER BY t.base_url, r.tool_id, r.status
         """,
         (project_id,),
@@ -4347,6 +4370,15 @@ def available_report_adapters(input_type: str | None = None) -> list[str]:
         if name in RUNNER_IMPLEMENTED_TOOLS
         and (input_type is None or adapter.get("input", "target") == input_type)
     )
+
+
+def available_report_adapter_metadata(input_type: str | None = None) -> dict[str, dict]:
+    configured = load_adapters().get("adapters", {})
+    return {
+        name: adapter for name, adapter in configured.items()
+        if name in RUNNER_IMPLEMENTED_TOOLS
+        and (input_type is None or adapter.get("input", "target") == input_type)
+    }
 
 
 def external_approval_adapters() -> list[str]:
@@ -4419,7 +4451,7 @@ def get_project_target_coverage(project_id: UUID) -> dict:
             rows = fetch_target_coverage_rows(cursor, project_id)
     return {
         "project_id": project_id,
-        **summarize_target_coverage(rows, available_report_adapters("target")),
+        **summarize_target_coverage(rows, available_report_adapter_metadata("target")),
     }
 
 
