@@ -48,10 +48,12 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.176' "$work_dir/dashboard.html"
+grep -q 'UI v0.177' "$work_dir/dashboard.html"
 grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
 grep -q 'function workflowInputType' "$work_dir/dashboard.html"
 grep -q 'source_artifact_id:input' "$work_dir/dashboard.html"
+grep -q 'function downloadBatchEvidenceBundle' "$work_dir/dashboard.html"
+grep -q '>Workflow bundle</button>' "$work_dir/dashboard.html"
 grep -q 'baseline ready' "$work_dir/dashboard.html"
 grep -q 're-upload required' "$work_dir/dashboard.html"
 grep -q 'integrity_baseline_ready' "$work_dir/dashboard.html"
@@ -198,6 +200,7 @@ jq -e '
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}/integrity"].get != null)
+  and (.paths["/batches/{batch_id}/evidence-bundle"].get != null)
   and (.paths["/projects/{project_id}/targets/{target_id}"].delete != null)
   and (.paths["/projects/{project_id}/archive"].post != null)
   and (.paths["/projects/{project_id}/restore"].post != null)

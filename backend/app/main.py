@@ -329,7 +329,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.166.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.167.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -3624,6 +3624,101 @@ def download_run_evidence_bundle(run_id: UUID) -> Response:
         content=archive.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="security-platform-{run_id}-evidence.zip"'},
+    )
+
+
+@app.get("/batches/{batch_id}/evidence-bundle")
+def download_batch_evidence_bundle(batch_id: UUID) -> Response:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT project_id, target_id, source_artifact_id, plan_id, requested_by,
+                       created_at, credential_profile_id, template_id
+                FROM run_batches WHERE id = %s
+                """,
+                (batch_id,),
+            )
+            batch = cursor.fetchone()
+            if batch is None:
+                raise HTTPException(status_code=404, detail="Workflow batch not found")
+            cursor.execute(
+                """
+                SELECT id, tool_id, profile, status, created_at, started_at, finished_at,
+                       error_message, batch_step
+                FROM runs WHERE batch_id = %s ORDER BY batch_step, created_at
+                """,
+                (batch_id,),
+            )
+            runs = cursor.fetchall()
+    if not runs:
+        raise HTTPException(status_code=409, detail="Workflow batch contains no runs")
+    if any(row[3] not in {"succeeded", "failed", "cancelled"} for row in runs):
+        raise HTTPException(status_code=409, detail="Workflow evidence can be exported only after every step is terminal")
+
+    batch_payload = {
+        "schema": "security-platform-workflow-evidence/v1",
+        "batch_id": batch_id,
+        "project_id": batch[0],
+        "target_id": batch[1],
+        "source_artifact_id": batch[2],
+        "plan_id": batch[3],
+        "requested_by": batch[4],
+        "created_at": batch[5],
+        "credential_profile_id": batch[6],
+        "template_id": batch[7],
+        "status": derive_batch_status([row[3] for row in runs]),
+        "runs": [
+            {
+                "run_id": row[0], "tool_id": row[1], "profile": row[2], "status": row[3],
+                "created_at": row[4], "started_at": row[5], "finished_at": row[6],
+                "error_message": row[7], "step": row[8],
+            }
+            for row in runs
+        ],
+    }
+    members = {
+        "workflow.json": json.dumps(
+            batch_payload, indent=2, sort_keys=True, default=str
+        ).encode("utf-8") + b"\n"
+    }
+    for row in runs:
+        run_response = download_run_evidence_bundle(row[0])
+        members[f"runs/{int(row[8]):02d}-{row[1]}-{row[0]}.zip"] = bytes(run_response.body)
+    total_size = sum(len(content) for content in members.values())
+    max_batch_bytes = min(MAX_RUN_EVIDENCE_BYTES * 4, 256 * 1024 * 1024)
+    if total_size > max_batch_bytes:
+        raise HTTPException(status_code=413, detail="Sanitized workflow evidence bundle exceeds the export limit")
+    manifest = {
+        "version": 1,
+        "algorithm": "sha256",
+        "batch_id": str(batch_id),
+        "files": [
+            {"name": name, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+            for name, content in sorted(members.items())
+        ],
+        "sanitization": "Only verified per-run sanitized evidence bundles are included",
+    }
+    members["bundle-manifest.json"] = (
+        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    )
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+        for name, content in sorted(members.items()):
+            member = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = 0o600 << 16
+            bundle.writestr(member, content)
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            record_audit(
+                cursor, batch[0], "workflow.evidence_exported", "control-plane-operator",
+                "batch", batch_id, {"format": "verified-sanitized-zip", "runs": len(runs)},
+            )
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="security-platform-{batch_id}-workflow-evidence.zip"'},
     )
 
 
