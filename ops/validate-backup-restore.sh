@@ -16,12 +16,15 @@ backup_name=''
 config_name=''
 artifacts_name=''
 manifest_name=''
+evidence_seals_file="$(mktemp data/tmp/backup-evidence-seals.XXXXXX)"
+source_hashes_file="$(mktemp data/tmp/backup-source-hashes.XXXXXX)"
 cleanup() {
   rc=$?
   if [[ "$passed" != true ]] && docker inspect "$container" >/dev/null 2>&1; then
     docker logs --tail 100 "$container" 2>&1 || true
   fi
   docker rm -f "$container" >/dev/null 2>&1 || true
+  rm -f "$evidence_seals_file" "$source_hashes_file"
   if [[ "$passed" != true ]]; then
     jq -nc --arg started "$started_at" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg backup "$backup_name" \
       --arg configuration "$config_name" --arg artifacts "$artifacts_name" --arg manifest "$manifest_name" \
@@ -99,6 +102,16 @@ gzip -dc "$backup_file" | docker exec -i "$container" \
   psql -v ON_ERROR_STOP=1 -U postgres -d restore_test >/dev/null
 echo "Database backup restored"
 
+docker exec "$container" psql -At -F $'\t' -v ON_ERROR_STOP=1 -U postgres -d restore_test -c \
+  "SELECT id::text, evidence_manifest_sha256 FROM runs WHERE evidence_manifest_sha256 IS NOT NULL ORDER BY id" \
+  > "$evidence_seals_file"
+docker exec "$container" psql -At -F $'\t' -v ON_ERROR_STOP=1 -U postgres -d restore_test -c \
+  "SELECT id::text, content_sha256 FROM source_artifacts WHERE content_sha256 IS NOT NULL ORDER BY id" \
+  > "$source_hashes_file"
+artifact_validation="$(python3 ops/verify_artifact_backup.py \
+  "backups/$artifacts_name" "$evidence_seals_file" "$source_hashes_file")"
+echo "Evidence and source artifact baselines verified"
+
 restore_counts="$(docker exec "$container" psql -At -v ON_ERROR_STOP=1 -U postgres -d restore_test -c \
   "SELECT (SELECT count(*) FROM projects)||','||(SELECT count(*) FROM targets)||','||(SELECT count(*) FROM runs)||','||(SELECT count(*) FROM observations);")"
 [[ "$restore_counts" == "$source_counts" ]]
@@ -106,7 +119,8 @@ restore_counts="$(docker exec "$container" psql -At -v ON_ERROR_STOP=1 -U postgr
 jq -nc --arg started "$started_at" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg backup "$backup_name" --arg configuration "$config_name" --arg artifacts "$artifacts_name" \
   --arg manifest "$manifest_name" --arg counts "$restore_counts" --arg artifact_members "$artifact_members" \
-  '{status:"passed",started_at:$started,finished_at:$finished,backup:$backup,configuration:$configuration,artifacts:$artifacts,manifest:$manifest,checksums_verified:true,artifact_members:($artifact_members|tonumber),tables:["projects","targets","runs","observations"],row_counts:($counts|split(",")|map(tonumber))}' \
+  --argjson artifact_validation "$artifact_validation" \
+  '{status:"passed",started_at:$started,finished_at:$finished,backup:$backup,configuration:$configuration,artifacts:$artifacts,manifest:$manifest,checksums_verified:true,artifact_members:($artifact_members|tonumber),artifact_validation:$artifact_validation,tables:["projects","targets","runs","observations"],row_counts:($counts|split(",")|map(tonumber))}' \
   > "$status_file"
 chmod 600 "$status_file"
 passed=true

@@ -329,7 +329,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.168.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.169.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -1937,6 +1937,7 @@ def backup_status() -> dict:
             "row_counts": restore_payload.get("row_counts") or [],
             "checksums_verified": bool(restore_payload.get("checksums_verified")),
             "artifact_members": restore_payload.get("artifact_members"),
+            "artifact_validation": restore_payload.get("artifact_validation") or {},
             "matches_latest": (
                 restore_payload.get("backup") == database_backup.name
                 and restore_payload.get("configuration") == config_backup.name

@@ -20,6 +20,7 @@ docker compose run --rm --no-deps \
 
 docker compose run --rm --no-deps \
   -v "$platform_root/backend/tests:/app/tests:ro" \
+  -v "$platform_root/ops:/app/ops:ro" \
   api python -m unittest discover -s /app/tests -v
 
 echo "Repository checks passed"

@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.178' "$work_dir/dashboard.html"
+grep -q 'UI v0.179' "$work_dir/dashboard.html"
 grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
 grep -q 'function workflowInputType' "$work_dir/dashboard.html"
 grep -q 'source_artifact_id:input' "$work_dir/dashboard.html"
@@ -287,7 +287,7 @@ jq -e '
 curl --config "$curl_config" "$base_url/image-audit-history?limit=10" > "$work_dir/image-audit-history.json"
 jq -e '(.audits | type == "array") and (.audits | length >= 1) and (.audits[0].integrity_verified == true)' "$work_dir/image-audit-history.json" >/dev/null
 curl --config "$curl_config" "$base_url/backup-status" > "$work_dir/backup-status.json"
-jq -e '(.available == true) and (.paired == true) and (.verified == true) and (.fresh | type == "boolean") and (.artifacts.valid == true) and (.manifest.valid == true) and (.restore_validation.status == "passed") and (.restore_validation.matches_latest == true) and (.restore_validation.checksums_verified == true)' "$work_dir/backup-status.json" >/dev/null
+jq -e '(.available == true) and (.paired == true) and (.verified == true) and (.fresh | type == "boolean") and (.artifacts.valid == true) and (.manifest.valid == true) and (.restore_validation.status == "passed") and (.restore_validation.matches_latest == true) and (.restore_validation.checksums_verified == true) and (.restore_validation.artifact_validation.sealed_runs_verified | type == "number") and (.restore_validation.artifact_validation.source_artifacts_verified | type == "number")' "$work_dir/backup-status.json" >/dev/null
 mkdir "$work_dir/image-audit"
 for kind in report sbom checksums; do
   filename="$(jq -r --arg kind "$kind" 'if $kind == "report" then .report.filename elif $kind == "sbom" then .sbom.filename else .checksums.filename end' "$work_dir/image-audit.json")"

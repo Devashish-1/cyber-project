@@ -83,7 +83,7 @@ Local validation scripts under `ops/` use disposable fixtures. They are the appr
 
 - `ops/health-check.sh` writes the platform health snapshot used by the dashboard.
 - `ops/backup.sh` creates one checksum-pinned recovery set containing PostgreSQL, configuration and operating scripts, sealed evidence, and imported source artifacts.
-- `ops/validate-backup-restore.sh` verifies the set checksums, rejects unsafe archive members, and restores the database into an isolated container for count comparison.
+- `ops/validate-backup-restore.sh` verifies set checksums, rejects unsafe archive members, restores the database in isolation, and checks archived evidence/source content against the restored database seals.
 - `ops/audit-image.sh` records image inventory, vulnerability audit output, SBOMs, and checksums.
 - systemd units in `ops/systemd/` schedule health and backup jobs.
 
