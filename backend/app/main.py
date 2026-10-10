@@ -311,7 +311,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.162.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.163.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2228,7 +2228,7 @@ def list_source_artifacts(project_id: UUID) -> dict:
             cursor.execute(
                 """
                 SELECT id, filename, sha256, compressed_size, extracted_size,
-                       file_count, authorization_reference, created_at
+                       file_count, authorization_reference, created_at, content_sha256
                 FROM source_artifacts
                 WHERE project_id = %s
                 ORDER BY created_at DESC
@@ -2242,7 +2242,8 @@ def list_source_artifacts(project_id: UUID) -> dict:
                 "id": row[0], "filename": row[1], "sha256": row[2],
                 "compressed_size": row[3], "extracted_size": row[4],
                 "file_count": row[5], "authorization_reference": row[6],
-                "created_at": row[7],
+                "created_at": row[7], "content_sha256": row[8],
+                "integrity_baseline_ready": bool(row[8]),
             }
             for row in rows
         ]

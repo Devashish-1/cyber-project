@@ -48,7 +48,10 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.172' "$work_dir/dashboard.html"
+grep -q 'UI v0.173' "$work_dir/dashboard.html"
+grep -q 'verified baseline' "$work_dir/dashboard.html"
+grep -q 're-upload required' "$work_dir/dashboard.html"
+grep -q 'integrity_baseline_ready' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -337,7 +340,20 @@ PY
     -F 'authorization_confirmed=true' \
     > "$work_dir/source-upload.json"
   smoke_source_artifact_id="$(jq -er '.id' "$work_dir/source-upload.json")"
+  jq -e '
+    (.content_sha256 | type == "string" and length == 64)
+  ' "$work_dir/source-upload.json" >/dev/null
   test -d "$platform_root/data/sources/$smoke_source_artifact_id"
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/source-artifacts" \
+    > "$work_dir/source-artifacts-before-delete.json"
+  jq -e --arg artifact_id "$smoke_source_artifact_id" '
+    any(.artifacts[];
+      (.id | tostring) == $artifact_id and
+      .integrity_baseline_ready == true and
+      (.content_sha256 | type == "string" and length == 64)
+    )
+  ' "$work_dir/source-artifacts-before-delete.json" >/dev/null
   curl --config "$curl_config" \
     -H 'Content-Type: application/json' -X DELETE \
     "$base_url/projects/$project_id/source-artifacts/$smoke_source_artifact_id" \
@@ -410,7 +426,7 @@ local_project_id="$(jq -r '.projects[] | select(.name == "Local Runner Validatio
 if [ -n "$local_project_id" ]; then
   curl --config "$curl_config" "$base_url/projects/$local_project_id/targets" > "$work_dir/local-targets.json"
   jq -e '([.targets[] | has("testing_window_open") and has("testing_window_label")] | all)' "$work_dir/local-targets.json" >/dev/null
-  local_target_id="$(jq -r '.targets[] | select(.allow_third_party_services == false) | .id' "$work_dir/local-targets.json" | head -n1)"
+  local_target_id="$(jq -r '.targets[] | select(.allow_third_party_services == false and .testing_window_open == true) | .id' "$work_dir/local-targets.json" | head -n1)"
   if [ -n "$local_target_id" ]; then
     third_party_status="$(curl --config "$curl_config" --no-fail -sS -o "$work_dir/third-party-denied.json" -w '%{http_code}' \
       -H 'Content-Type: application/json' -X POST "$base_url/projects/$local_project_id/runs" \
@@ -614,7 +630,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.160.0" and
+    .platform_version == "0.163.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
