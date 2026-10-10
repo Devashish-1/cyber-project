@@ -273,6 +273,7 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS source_artifacts_project_created_idx
                     ON source_artifacts(project_id, created_at DESC);
+                ALTER TABLE source_artifacts ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
                 ALTER TABLE runs ALTER COLUMN target_id DROP NOT NULL;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS source_artifact_id UUID
                     REFERENCES source_artifacts(id) ON DELETE CASCADE;
@@ -310,7 +311,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.161.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.162.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -494,15 +495,38 @@ def require_current_target_policy(
     require_dns_resolver_permission(tool_id, dns_resolver, workflow=workflow)
 
 
-def require_source_artifact_storage(artifact_id: UUID) -> None:
-    """Fail closed when an approved source artifact is missing or was altered into a link."""
+def source_artifact_content_sha256(content_root: Path) -> str:
+    entries: list[tuple[str, int, str]] = []
+    for path in content_root.rglob("*"):
+        if path.is_symlink():
+            raise HTTPException(status_code=409, detail="Approved source artifact contains an unsafe symbolic link")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise HTTPException(status_code=409, detail="Approved source artifact contains an unsupported file type")
+        file_digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                size += len(chunk)
+                file_digest.update(chunk)
+        entries.append((path.relative_to(content_root).as_posix(), size, file_digest.hexdigest()))
+    manifest_digest = hashlib.sha256()
+    for relative_path, size, digest in sorted(entries):
+        manifest_digest.update(f"{relative_path}\0{size}\0{digest}\n".encode("utf-8"))
+    return manifest_digest.hexdigest()
+
+
+def require_source_artifact_storage(artifact_id: UUID, expected_sha256: str | None) -> None:
+    """Fail closed when approved source content is missing, unsafe, or changed."""
     content_root = SOURCE_ROOT / str(artifact_id) / "content"
     try:
         if not content_root.is_dir() or content_root.is_symlink():
             raise HTTPException(status_code=409, detail="Approved source artifact is missing from storage")
-        for path in content_root.rglob("*"):
-            if path.is_symlink():
-                raise HTTPException(status_code=409, detail="Approved source artifact contains an unsafe symbolic link")
+        if not expected_sha256:
+            raise HTTPException(status_code=409, detail="Approved source artifact has no content integrity baseline; re-upload it")
+        if not secrets.compare_digest(source_artifact_content_sha256(content_root), expected_sha256):
+            raise HTTPException(status_code=409, detail="Approved source artifact content failed integrity verification")
     except OSError as exc:
         raise HTTPException(status_code=409, detail="Approved source artifact storage cannot be verified") from exc
 
@@ -2108,6 +2132,7 @@ async def upload_source_artifact(
     compressed_size = 0
     extracted_size = 0
     file_count = 0
+    content_sha256 = ""
     try:
         with archive_path.open("xb") as destination:
             while chunk := await archive.read(1024 * 1024):
@@ -2152,6 +2177,7 @@ async def upload_source_artifact(
         archive_path.unlink()
         if file_count == 0:
             raise HTTPException(status_code=422, detail="Source archive contains no files")
+        content_sha256 = source_artifact_content_sha256(content_root)
 
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
@@ -2160,18 +2186,18 @@ async def upload_source_artifact(
                     """
                     INSERT INTO source_artifacts
                         (id, project_id, filename, sha256, compressed_size, extracted_size,
-                         file_count, authorization_reference, authorization_confirmed)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                         file_count, authorization_reference, authorization_confirmed, content_sha256)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
                     """,
                     (
                         artifact_id, project_id, filename, digest.hexdigest(), compressed_size,
-                        extracted_size, file_count, authorization_reference,
+                        extracted_size, file_count, authorization_reference, content_sha256,
                     ),
                 )
                 record_audit(
                     cursor, project_id, "source_artifact.authorized", requested_by,
                     "source_artifact", artifact_id,
-                    {"filename": filename, "sha256": digest.hexdigest(), "file_count": file_count},
+                    {"filename": filename, "sha256": digest.hexdigest(), "content_sha256": content_sha256, "file_count": file_count},
                 )
     except HTTPException:
         shutil.rmtree(artifact_root, ignore_errors=True)
@@ -2187,6 +2213,7 @@ async def upload_source_artifact(
         "project_id": project_id,
         "filename": filename,
         "sha256": digest.hexdigest(),
+        "content_sha256": content_sha256,
         "compressed_size": compressed_size,
         "extracted_size": extracted_size,
         "file_count": file_count,
@@ -2937,7 +2964,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
             require_project_active(cursor, project_id)
             if input_type == "source":
                 cursor.execute(
-                    "SELECT authorization_confirmed FROM source_artifacts WHERE id = %s AND project_id = %s",
+                    "SELECT authorization_confirmed, content_sha256 FROM source_artifacts WHERE id = %s AND project_id = %s",
                     (payload.source_artifact_id, project_id),
                 )
                 source = cursor.fetchone()
@@ -2945,7 +2972,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=404, detail="Source artifact not found in project")
                 if not source[0]:
                     raise HTTPException(status_code=422, detail="Source authorization is not confirmed")
-                require_source_artifact_storage(payload.source_artifact_id)
+                require_source_artifact_storage(payload.source_artifact_id, source[1])
             else:
                 cursor.execute(
                     """
@@ -4901,7 +4928,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                 """
                 SELECT r.project_id, r.target_id, r.source_artifact_id, r.credential_profile_id,
                        r.tool_id, r.profile,
-                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
+                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE), s.content_sha256,
                        t.testing_window_start_minute_utc, t.testing_window_end_minute_utc,
                        t.allow_state_changing, t.allow_third_party_services, t.dns_resolver
                 FROM observations o
@@ -4917,7 +4944,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                 raise HTTPException(status_code=404, detail="Observation not found")
             (
                 project_id, target_id, source_artifact_id, credential_profile_id,
-                tool_id, profile, input_authorized, *target_policy,
+                tool_id, profile, input_authorized, source_content_sha256, *target_policy,
             ) = origin
             require_project_active(cursor, project_id)
             registry_tool = load_registry().get("tools", {}).get(tool_id)
@@ -4936,7 +4963,7 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                     tuple(target_policy),
                 )
             elif source_artifact_id is not None:
-                require_source_artifact_storage(source_artifact_id)
+                require_source_artifact_storage(source_artifact_id, source_content_sha256)
             adapter_runtime_admission(
                 [tool_id], load_adapters().get("adapters", {}), enforce=True
             )

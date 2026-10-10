@@ -530,7 +530,7 @@ def get_run(run_id: UUID) -> dict | None:
                 SELECT r.status, r.tool_id, r.profile, t.base_url, t.allowed_hosts,
                        t.excluded_paths, t.dns_resolver,
                        COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
-                       r.source_artifact_id, s.filename, s.sha256,
+                       r.source_artifact_id, s.filename, s.sha256, s.content_sha256,
                        r.credential_profile_id, cp.role_name, cp.login_url,
                        cp.username_selector, cp.password_selector, cp.submit_selector,
                        cp.success_selector, cp.encrypted_secret, t.max_run_seconds,
@@ -561,19 +561,20 @@ def get_run(run_id: UUID) -> dict | None:
         "source_artifact_id": row[8],
         "source_filename": row[9],
         "source_sha256": row[10],
-        "credential_profile_id": row[11],
-        "credential_role": row[12],
-        "credential_login_url": row[13],
-        "credential_username_selector": row[14],
-        "credential_password_selector": row[15],
-        "credential_submit_selector": row[16],
-        "credential_success_selector": row[17],
-        "credential_encrypted_secret": row[18],
-        "target_max_run_seconds": row[19],
-        "testing_window_start_minute_utc": row[20],
-        "testing_window_end_minute_utc": row[21],
-        "target_allow_state_changing": row[22],
-        "target_allow_third_party_services": row[23],
+        "source_content_sha256": row[11],
+        "credential_profile_id": row[12],
+        "credential_role": row[13],
+        "credential_login_url": row[14],
+        "credential_username_selector": row[15],
+        "credential_password_selector": row[16],
+        "credential_submit_selector": row[17],
+        "credential_success_selector": row[18],
+        "credential_encrypted_secret": row[19],
+        "target_max_run_seconds": row[20],
+        "testing_window_start_minute_utc": row[21],
+        "testing_window_end_minute_utc": row[22],
+        "target_allow_state_changing": row[23],
+        "target_allow_third_party_services": row[24],
     }
 
 
@@ -4823,6 +4824,37 @@ def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
     return wordlist
 
 
+def verify_source_content(content_root: Path, expected_sha256: str | None) -> str | None:
+    if not content_root.is_dir() or content_root.is_symlink():
+        return "Approved source artifact is missing from storage"
+    if not expected_sha256:
+        return "Approved source artifact has no content integrity baseline; re-upload it"
+    try:
+        entries: list[tuple[str, int, str]] = []
+        for path in content_root.rglob("*"):
+            if path.is_symlink():
+                return "Approved source artifact contains an unsafe symbolic link"
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                return "Approved source artifact contains an unsupported file type"
+            file_digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    size += len(chunk)
+                    file_digest.update(chunk)
+            entries.append((path.relative_to(content_root).as_posix(), size, file_digest.hexdigest()))
+        manifest_digest = hashlib.sha256()
+        for relative_path, size, digest in sorted(entries):
+            manifest_digest.update(f"{relative_path}\0{size}\0{digest}\n".encode("utf-8"))
+        if manifest_digest.hexdigest() != expected_sha256:
+            return "Approved source artifact content failed integrity verification"
+    except OSError:
+        return "Approved source artifact storage cannot be verified"
+    return None
+
+
 def execute_run(run_id: UUID) -> None:
     run = get_run(run_id)
     if run is None or run["status"] != "queued":
@@ -4841,8 +4873,9 @@ def execute_run(run_id: UUID) -> None:
             return
         source_container_path = SOURCE_ROOT / str(run["source_artifact_id"]) / "content"
         source_host_path = SOURCE_HOST_ROOT / str(run["source_artifact_id"]) / "content"
-        if not source_container_path.is_dir():
-            set_status(run_id, "failed", "Approved source artifact is missing from storage")
+        source_error = verify_source_content(source_container_path, run.get("source_content_sha256"))
+        if source_error:
+            set_status(run_id, "failed", source_error)
             return
     else:
         if run["profile"] == "extended-active" and not run.get("target_allow_state_changing"):
