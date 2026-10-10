@@ -8,6 +8,7 @@ from app import main
 from app.main import (
     require_dns_resolver_permission,
     require_open_testing_window,
+    require_load_testing_permission,
     require_state_changing_permission,
     require_third_party_service_permission,
     testing_window_allows,
@@ -16,11 +17,12 @@ from app.main import (
 
 class CurrentTargetPolicyTests(unittest.TestCase):
     def test_combined_gate_delegates_every_current_policy(self):
-        target_policy = (60, 120, True, True, "1.1.1.1")
+        target_policy = (60, 120, True, True, True, "1.1.1.1")
         with (
             patch.object(main, "require_open_testing_window") as window,
             patch.object(main, "require_state_changing_permission") as state,
             patch.object(main, "require_third_party_service_permission") as third_party,
+            patch.object(main, "require_load_testing_permission") as load,
             patch.object(main, "require_dns_resolver_permission") as dns,
         ):
             main.require_current_target_policy(
@@ -34,6 +36,7 @@ class CurrentTargetPolicyTests(unittest.TestCase):
         window.assert_called_once_with(60, 120)
         state.assert_called_once_with("controlled-active", True, workflow=True)
         third_party.assert_called_once_with(True, True, workflow=True)
+        load.assert_called_once_with("controlled-active", True, workflow=True)
         dns.assert_called_once_with("dnsx", "1.1.1.1", workflow=True)
 
     def test_closed_window_stops_later_policy_checks(self):
@@ -47,7 +50,7 @@ class CurrentTargetPolicyTests(unittest.TestCase):
                     "httpx",
                     "observe",
                     False,
-                    (60, 120, False, False, None),
+                    (60, 120, False, False, False, None),
                 )
 
         state.assert_not_called()
@@ -110,6 +113,23 @@ class ThirdPartyServicePermissionTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             require_third_party_service_permission(True, False, workflow=True)
 
+        self.assertIn("workflow steps", raised.exception.detail)
+
+
+class LoadTestingPermissionTests(unittest.TestCase):
+    def test_load_profile_requires_separate_target_opt_in(self):
+        with self.assertRaises(HTTPException) as raised:
+            require_load_testing_permission("load-resilience", False)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("load-resilience tests", raised.exception.detail)
+
+    def test_other_profiles_and_explicit_opt_in_are_allowed(self):
+        require_load_testing_permission("observe", False)
+        require_load_testing_permission("load-resilience", True)
+
+    def test_workflow_denial_is_explicit(self):
+        with self.assertRaises(HTTPException) as raised:
+            require_load_testing_permission("load-resilience", False, workflow=True)
         self.assertIn("workflow steps", raised.exception.detail)
 
 

@@ -1,4 +1,18 @@
 adapters:
+  k6:
+    version: 2.3.0
+    image: grafana/k6@sha256:e66db15b860113878fa74670e31f5e274830b7b6e42c8bff28b2f2d86a257603
+    input: target
+    profile: load-resilience
+    approval: explicit-target-load-opt-in-and-run-approval-required
+    timeout_seconds: 30
+    user: "12345:12345"
+    resources: {cpus: 0.5, memory: 256m, pids: 64}
+    output: sanitized-summary-json
+    capabilities: [single-request-resilience-smoke, latency-summary, request-failure-rate]
+    controls: [separate-load-testing-opt-in, exact-base-url-only, one-virtual-user, one-iteration, redirects-disabled, response-body-discarded, request-timeout-5s, no-custom-script, no-custom-headers, no-credentials, max-duration-30s, non-root-ephemeral-container, pinned-image]
+    state: verified-image
+
   schemathesis:
     version: 4.28.0
     image: ghcr.io/schemathesis/schemathesis@sha256:0a71757c60ccdba270c154a859d9dd3d019625f782f23ab36ad604771e15f78b

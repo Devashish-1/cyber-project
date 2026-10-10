@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.179' "$work_dir/dashboard.html"
+grep -q 'UI v0.180' "$work_dir/dashboard.html"
 grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
 grep -q 'function workflowInputType' "$work_dir/dashboard.html"
 grep -q 'source_artifact_id:input' "$work_dir/dashboard.html"

@@ -537,7 +537,8 @@ def get_run(run_id: UUID) -> dict | None:
                        t.testing_window_start_minute_utc,
                        t.testing_window_end_minute_utc,
                        t.allow_state_changing,
-                       t.allow_third_party_services
+                       t.allow_third_party_services,
+                       t.allow_load_testing
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -575,6 +576,7 @@ def get_run(run_id: UUID) -> dict | None:
         "testing_window_end_minute_utc": row[22],
         "target_allow_state_changing": row[23],
         "target_allow_third_party_services": row[24],
+        "target_allow_load_testing": row[25],
     }
 
 
@@ -1019,6 +1021,13 @@ def build_command(
             "-timeout", "10",
             "-retries", "1",
         ]
+    if tool_id == "k6":
+        return [
+            "run",
+            "--quiet",
+            "--summary-export=/tmp/k6-summary.json",
+            "/input/k6-smoke.js",
+        ]
     if tool_id == "whatweb":
         return [
             "whatweb",
@@ -1447,6 +1456,65 @@ def normalize_httpx(
                 records,
             )
     return len(records)
+
+
+def normalize_k6(run_id: UUID, output_file: Path, base_url: str) -> int:
+    try:
+        payload = json.loads(output_file.read_text(encoding="utf-8"))
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        if not isinstance(metrics, dict):
+            return 0
+        def metric_values(name: str) -> dict:
+            metric = metrics.get(name) or {}
+            if not isinstance(metric, dict):
+                return {}
+            values = metric.get("values")
+            return values if isinstance(values, dict) else metric
+
+        request_values = metric_values("http_reqs")
+        iteration_values = metric_values("iterations")
+        failure_values = metric_values("http_req_failed")
+        duration_values = metric_values("http_req_duration")
+        check_values = metric_values("checks")
+        requests = int(request_values.get("count") or 0)
+        iterations = int(iteration_values.get("count") or 0)
+        if requests != 1 or iterations != 1:
+            raise ValueError("Bounded k6 run did not execute exactly one request and one iteration")
+        details = {
+            "virtual_users": 1,
+            "iterations": iterations,
+            "requests": requests,
+            "request_failure_rate": float(failure_values.get("rate", failure_values.get("value", 0)) or 0),
+            "duration_ms": {
+                key: float(duration_values[key])
+                for key in ("avg", "med", "max", "p(90)", "p(95)")
+                if isinstance(duration_values.get(key), (int, float))
+            },
+            "checks_passed": int(check_values.get("passes") or 0),
+            "checks_failed": int(check_values.get("fails") or 0),
+            "response_body_retained": False,
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    fingerprint = hashlib.sha256(f"k6-bounded-smoke|{base_url}".encode()).hexdigest()
+    record = (
+        uuid4(), run_id, "load-resilience-smoke", "Bounded resilience smoke completed",
+        "info", base_url[:2000], json.dumps(details), fingerprint,
+    )
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                record,
+            )
+    return 1
 
 
 def write_whatweb_output(raw_bytes: bytes, output_file: Path, target_url: str) -> None:
@@ -4824,6 +4892,26 @@ def prepare_kiterunner_wordlist(run: dict, run_dir: Path) -> Path:
     return wordlist
 
 
+def prepare_k6_script(run: dict, run_dir: Path) -> Path:
+    script = run_dir / "k6-smoke.js"
+    script.write_text(
+        "import http from 'k6/http';\n"
+        "import { check } from 'k6';\n"
+        "export const options = {vus:1,iterations:1,maxRedirects:0,"
+        "discardResponseBodies:true,noConnectionReuse:true,"
+        "thresholds:{http_req_failed:['rate<1']}};\n"
+        f"const TARGET = {json.dumps(run['base_url'])};\n"
+        "export default function () {\n"
+        "  const response = http.get(TARGET, {redirects:0, timeout:'5s', "
+        "responseType:'none', tags:{name:'authorized-base-url'}});\n"
+        "  check(response, {'HTTP response received': r => r.status >= 100 && r.status <= 599});\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o644)
+    return script
+
+
 def verify_source_content(content_root: Path, expected_sha256: str | None) -> str | None:
     if not content_root.is_dir() or content_root.is_symlink():
         return "Approved source artifact is missing from storage"
@@ -4880,6 +4968,9 @@ def execute_run(run_id: UUID) -> None:
     else:
         if run["profile"] == "extended-active" and not run.get("target_allow_state_changing"):
             set_status(run_id, "failed", "Target does not authorize state-changing extended-active tests")
+            return
+        if run["profile"] == "load-resilience" and not run.get("target_allow_load_testing"):
+            set_status(run_id, "failed", "Target does not authorize separately controlled load-resilience tests")
             return
         if adapter.get("uses_third_party_services", False) and not run.get("target_allow_third_party_services"):
             set_status(run_id, "failed", "Target does not authorize third-party intelligence/provider access")
@@ -4951,6 +5042,9 @@ def execute_run(run_id: UUID) -> None:
                 "target_allow_third_party_services": (
                     bool(run.get("target_allow_third_party_services")) if input_type == "target" else None
                 ),
+                "target_allow_load_testing": (
+                    bool(run.get("target_allow_load_testing")) if input_type == "target" else None
+                ),
                 "credential_profile_id": str(run["credential_profile_id"]) if run.get("credential_profile_id") else None,
                 "authenticated_role": run.get("credential_role") if run.get("credential_profile_id") else None,
                 "duration_policy": {
@@ -5020,6 +5114,8 @@ def execute_run(run_id: UUID) -> None:
             prepare_playwright_input(run, run_dir)
         if run["tool_id"] == "kiterunner":
             prepare_kiterunner_wordlist(run, run_dir)
+        if run["tool_id"] == "k6":
+            prepare_k6_script(run, run_dir)
         command = build_command(
             run["tool_id"], run["base_url"], adapter, run["excluded_paths"], run["dns_resolver"]
         )
@@ -5085,6 +5181,10 @@ def execute_run(run_id: UUID) -> None:
             container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "browser-config.json")] = {
                 "bind": "/input/browser-config.json", "mode": "ro",
             }
+        elif run["tool_id"] == "k6":
+            container_volumes[str(EVIDENCE_HOST_ROOT / str(run_id) / "k6-smoke.js")] = {
+                "bind": "/input/k6-smoke.js", "mode": "ro",
+            }
         elif run["tool_id"] in {"feroxbuster", "ffuf", "gobuster"}:
             container_volumes[FFUF_WORDLIST_HOST_PATH] = {"bind": "/wordlists/content.txt", "mode": "ro"}
         elif run["tool_id"] == "kiterunner":
@@ -5119,9 +5219,10 @@ def execute_run(run_id: UUID) -> None:
             command=container_command,
             name=f"security-run-{run_id}",
             detach=True,
-            # testssl and ZAP need ephemeral writable image layers for their own runtimes.
+            # k6, testssl, and ZAP need ephemeral writable image layers so reports
+            # remain available after process exit and can be copied before removal.
             # They remain non-root, capability-free, resource-limited, and are removed after each run.
-            read_only=run["tool_id"] not in {"schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"},
+            read_only=run["tool_id"] not in {"k6", "schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"},
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             mem_limit=memory,
@@ -5166,10 +5267,11 @@ def execute_run(run_id: UUID) -> None:
             ),
             working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl", "theharvester"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
             entrypoint=container_entrypoint,
-            # testssl and ZAP reports must survive process exit long enough for docker cp.
+            # These reports must survive process exit long enough for docker cp;
+            # Docker discards tmpfs contents when the stopped container unmounts.
             # Their writable container layers are ephemeral and removed in finally.
             tmpfs=(
-                None if run["tool_id"] in {"schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
+                None if run["tool_id"] in {"k6", "schemathesis", "testssl", "wapiti", "zap-passive", "zap-baseline", "zap-full"}
                 else {
                     "/tmp": (
                         "rw,nosuid,nodev,size=2g"
@@ -5311,6 +5413,12 @@ def execute_run(run_id: UUID) -> None:
                 capture_testssl_output(container, output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] == "k6":
+            write_tool_log(run_dir / "tool.log", logs)
+            if exit_code == 0:
+                capture_json_output(container, "/tmp/k6-summary.json", output_file)
+            else:
+                output_file.write_text("{}\n", encoding="utf-8")
         elif run["tool_id"] == "schemathesis":
             write_tool_log(run_dir / "tool.log", logs)
             if exit_code in {0, 1}:
@@ -5591,7 +5699,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 4} if run["tool_id"] == "wpscan-passive" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "k6": normalize_k6, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             normalizer = normalizers[run["tool_id"]]
             if run["tool_id"] in {"ffuf", "httpx", "katana", "nuclei-reviewed"}:
                 observation_count = normalizer(
@@ -5603,6 +5711,8 @@ def execute_run(run_id: UUID) -> None:
             elif run["tool_id"] in {"naabu", "nmap"}:
                 expected_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
                 observation_count = normalizer(run_id, output_file, expected_host)
+            elif run["tool_id"] == "k6":
+                observation_count = normalizer(run_id, output_file, run["base_url"])
             else:
                 observation_count = normalizer(run_id, output_file)
             inherited_review_count = inherit_finding_reviews(run_id)
@@ -5632,8 +5742,12 @@ def execute_run(run_id: UUID) -> None:
                 container.remove(force=True)
             except docker.errors.DockerException:
                 pass
-        if run["tool_id"] == "playwright":
-            for temporary_name in ("browser-observe.js", "browser-config.json"):
+        if run["tool_id"] in {"playwright", "k6"}:
+            temporary_names = (
+                ("browser-observe.js", "browser-config.json")
+                if run["tool_id"] == "playwright" else ("k6-smoke.js",)
+            )
+            for temporary_name in temporary_names:
                 try:
                     (run_dir / temporary_name).unlink(missing_ok=True)
                 except OSError:

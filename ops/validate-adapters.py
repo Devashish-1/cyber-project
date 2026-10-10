@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_PATH = ROOT / "backend" / "app" / "main.py"
 ADAPTERS_PATH = ROOT / "config" / "adapters.yaml"
 VALID_INPUTS = {"target", "source"}
-VALID_PROFILES = {"observe", "controlled-active", "extended-active", "source-assisted"}
+VALID_PROFILES = {"observe", "controlled-active", "extended-active", "source-assisted", "load-resilience"}
 MEMORY_LIMIT = re.compile(r"^[1-9][0-9]*(?:[kmg])$", re.IGNORECASE)
 
 

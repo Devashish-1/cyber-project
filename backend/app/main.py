@@ -52,7 +52,7 @@ RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 PLATFORM_PAUSE = "security-platform:control:paused"
-RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
 SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
     "adapter", "approval-gated", "external-service-gated",
 })
@@ -147,6 +147,7 @@ def init_database() -> None:
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS testing_window_end_minute_utc INTEGER;
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS allow_state_changing BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE targets ADD COLUMN IF NOT EXISTS allow_third_party_services BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE targets ADD COLUMN IF NOT EXISTS allow_load_testing BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE targets
                     DROP CONSTRAINT IF EXISTS targets_valid_testing_window;
                 ALTER TABLE targets
@@ -329,7 +330,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.169.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.170.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -396,6 +397,7 @@ class TargetCreate(BaseModel):
     testing_window_end_minute_utc: int | None = Field(default=None, ge=0, le=1439)
     allow_state_changing: bool = False
     allow_third_party_services: bool = False
+    allow_load_testing: bool = False
     authorization_reference: str = Field(min_length=3, max_length=500)
     authorization_confirmed: bool
 
@@ -480,6 +482,20 @@ def require_third_party_service_permission(
         )
 
 
+def require_load_testing_permission(
+    profile: str,
+    allow_load_testing: bool,
+    *,
+    workflow: bool = False,
+) -> None:
+    if profile == "load-resilience" and not allow_load_testing:
+        subject = "workflow steps" if workflow else "tests"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Target does not authorize separately controlled load-resilience {subject}",
+        )
+
+
 def require_dns_resolver_permission(
     tool_id: str,
     dns_resolver: str | None,
@@ -502,7 +518,7 @@ def require_current_target_policy(
     *,
     workflow: bool = False,
 ) -> None:
-    start_minute_utc, end_minute_utc, allow_state_changing, allow_third_party_services, dns_resolver = target_policy
+    start_minute_utc, end_minute_utc, allow_state_changing, allow_third_party_services, allow_load_testing, dns_resolver = target_policy
     require_open_testing_window(start_minute_utc, end_minute_utc)
     require_state_changing_permission(profile, allow_state_changing, workflow=workflow)
     require_third_party_service_permission(
@@ -510,6 +526,7 @@ def require_current_target_policy(
         allow_third_party_services,
         workflow=workflow,
     )
+    require_load_testing_permission(profile, allow_load_testing, workflow=workflow)
     require_dns_resolver_permission(tool_id, dns_resolver, workflow=workflow)
 
 
@@ -2653,9 +2670,9 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     (id, project_id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                      max_run_seconds, testing_window_start_minute_utc,
                      testing_window_end_minute_utc, allow_state_changing,
-                     allow_third_party_services, authorization_reference,
+                     allow_third_party_services, allow_load_testing, authorization_reference,
                      authorization_confirmed)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
                 """,
                 (
                     target_id,
@@ -2669,6 +2686,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     payload.testing_window_end_minute_utc,
                     payload.allow_state_changing,
                     payload.allow_third_party_services,
+                    payload.allow_load_testing,
                     payload.authorization_reference,
                 ),
             )
@@ -2682,6 +2700,7 @@ def create_target(project_id: UUID, payload: TargetCreate) -> dict:
                     "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
                     "allow_state_changing": payload.allow_state_changing,
                     "allow_third_party_services": payload.allow_third_party_services,
+                    "allow_load_testing": payload.allow_load_testing,
                     "authorization_reference": payload.authorization_reference,
                 },
             )
@@ -2702,7 +2721,7 @@ def list_targets(project_id: UUID) -> dict:
                 SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services, authorization_reference,
+                       allow_third_party_services, allow_load_testing, authorization_reference,
                        authorization_confirmed, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at DESC
                 """,
@@ -2721,8 +2740,9 @@ def list_targets(project_id: UUID) -> dict:
                 "testing_window_label": format_testing_window(row[6], row[7]),
                 "allow_state_changing": row[8],
                 "allow_third_party_services": row[9],
-                "authorization_reference": row[10],
-                "authorization_confirmed": row[11], "created_at": row[12],
+                "allow_load_testing": row[10],
+                "authorization_reference": row[11],
+                "authorization_confirmed": row[12], "created_at": row[13],
             }
             for row in rows
         ]
@@ -2743,7 +2763,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services, authorization_reference
+                       allow_third_party_services, allow_load_testing, authorization_reference
                 FROM targets
                 WHERE id = %s AND project_id = %s
                 FOR UPDATE
@@ -2798,6 +2818,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                     testing_window_end_minute_utc = %s,
                     allow_state_changing = %s,
                     allow_third_party_services = %s,
+                    allow_load_testing = %s,
                     authorization_reference = %s,
                     authorization_confirmed = TRUE
                 WHERE id = %s AND project_id = %s
@@ -2811,6 +2832,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                     payload.testing_window_end_minute_utc,
                     payload.allow_state_changing,
                     payload.allow_third_party_services,
+                    payload.allow_load_testing,
                     payload.authorization_reference,
                     target_id,
                     project_id,
@@ -2829,7 +2851,8 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                         "testing_window_end_minute_utc": previous[6],
                         "allow_state_changing": previous[7],
                         "allow_third_party_services": previous[8],
-                        "authorization_reference": previous[9],
+                        "allow_load_testing": previous[9],
+                        "authorization_reference": previous[10],
                     },
                     "current": {
                         "allowed_hosts": payload.allowed_hosts,
@@ -2840,6 +2863,7 @@ def update_target(project_id: UUID, target_id: UUID, payload: TargetUpdate) -> d
                         "testing_window_end_minute_utc": payload.testing_window_end_minute_utc,
                         "allow_state_changing": payload.allow_state_changing,
                         "allow_third_party_services": payload.allow_third_party_services,
+                        "allow_load_testing": payload.allow_load_testing,
                         "authorization_reference": payload.authorization_reference,
                     },
                 },
@@ -3083,7 +3107,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     """
                     SELECT authorization_confirmed, testing_window_start_minute_utc,
                            testing_window_end_minute_utc, allow_state_changing,
-                           allow_third_party_services, dns_resolver
+                           allow_third_party_services, allow_load_testing, dns_resolver
                     FROM targets WHERE id = %s AND project_id = %s
                     """,
                     (payload.target_id, project_id),
@@ -3097,7 +3121,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     payload.tool_id,
                     payload.profile,
                     bool(adapter.get("uses_third_party_services", False)),
-                    target[1:6],
+                    target[1:7],
                 )
                 if payload.credential_profile_id is not None:
                     cursor.execute(
@@ -3188,7 +3212,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                     """
                     SELECT authorization_confirmed, testing_window_start_minute_utc,
                            testing_window_end_minute_utc, allow_state_changing,
-                           allow_third_party_services, dns_resolver
+                           allow_third_party_services, allow_load_testing, dns_resolver
                     FROM targets WHERE id = %s AND project_id = %s
                     """,
                     (payload.target_id, project_id),
@@ -3203,7 +3227,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                         tool_id,
                         adapters[tool_id].get("profile", ""),
                         bool(adapters[tool_id].get("uses_third_party_services", False)),
-                        target[1:6],
+                        target[1:7],
                         workflow=True,
                     )
             else:
@@ -4556,7 +4580,8 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
                 SELECT id, base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services, authorization_reference, created_at
+                       allow_third_party_services, allow_load_testing,
+                       authorization_reference, created_at
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -4657,8 +4682,9 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
                     },
                     "allow_state_changing": row[8],
                     "allow_third_party_services": row[9],
-                    "authorization_reference": row[10],
-                    "created_at": row[11],
+                    "allow_load_testing": row[10],
+                    "authorization_reference": row[11],
+                    "created_at": row[12],
                 }
                 for row in targets
             ],
@@ -4740,7 +4766,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 SELECT base_url, allowed_hosts, excluded_paths, dns_resolver,
                        max_run_seconds, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services, authorization_reference
+                       allow_third_party_services, allow_load_testing,
+                       authorization_reference
                 FROM targets WHERE project_id = %s ORDER BY created_at
                 """,
                 (project_id,),
@@ -4861,6 +4888,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             base_url, allowed_hosts, excluded_paths, dns_resolver, max_run_seconds,
             testing_window_start_minute_utc, testing_window_end_minute_utc,
             allow_state_changing, allow_third_party_services,
+            allow_load_testing,
             authorization_reference,
         ) in targets:
             lines.extend([
@@ -4878,6 +4906,8 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
                 + ("Explicitly allowed" if allow_state_changing else "Not allowed"),
                 "  - Third-party intelligence/provider access: "
                 + ("Explicitly allowed" if allow_third_party_services else "Not allowed"),
+                "  - Load and resilience testing: "
+                + ("Explicitly allowed" if allow_load_testing else "Not allowed"),
                 f"  - Authorization reference: {md(authorization_reference)}",
             ])
     else:
@@ -5171,7 +5201,8 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                        r.tool_id, r.profile,
                        COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE), s.content_sha256,
                        t.testing_window_start_minute_utc, t.testing_window_end_minute_utc,
-                       t.allow_state_changing, t.allow_third_party_services, t.dns_resolver
+                       t.allow_state_changing, t.allow_third_party_services,
+                       t.allow_load_testing, t.dns_resolver
                 FROM observations o
                 JOIN runs r ON r.id = o.run_id
                 LEFT JOIN targets t ON t.id = r.target_id

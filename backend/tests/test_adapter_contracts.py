@@ -1,6 +1,7 @@
 import unittest
 import json
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -19,6 +20,7 @@ from app.runner import (
     url_is_in_target_scope,
     hostname_is_exact_target,
     nmap_host_is_target,
+    normalize_k6,
 )
 
 
@@ -92,6 +94,43 @@ class AdapterContractTests(unittest.TestCase):
             with self.subTest(tool_id=tool_id):
                 command = self.command_for(tool_id)
                 self.assertEqual(command[command.index("-z") + 1], "-Xmx2048m")
+
+    def test_k6_is_a_fixed_single_request_smoke(self):
+        adapter = self.adapters["k6"]
+        command = self.command_for("k6")
+        self.assertEqual(adapter["profile"], "load-resilience")
+        self.assertEqual(command, [
+            "run", "--quiet", "--summary-export=/tmp/k6-summary.json", "/input/k6-smoke.js",
+        ])
+        self.assertIn("one-virtual-user", adapter["controls"])
+        self.assertIn("one-iteration", adapter["controls"])
+        self.assertIn("separate-load-testing-opt-in", adapter["controls"])
+
+    def test_k6_summary_normalizer_rejects_malformed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "k6.json"
+            output.write_text('{"metrics":[]}', encoding="utf-8")
+            self.assertEqual(normalize_k6("00000000-0000-0000-0000-000000000000", output, BASE_URL), 0)
+
+    @mock.patch("app.runner.psycopg.connect")
+    def test_k6_summary_normalizer_supports_current_machine_summary(self, connect):
+        payload = {"metrics": {
+            "http_reqs": {"count": 1, "rate": 10},
+            "iterations": {"count": 1, "rate": 10},
+            "http_req_failed": {"value": 0},
+            "http_req_duration": {"avg": 1.2, "med": 1.1, "max": 1.4, "p(90)": 1.3, "p(95)": 1.35},
+            "checks": {"passes": 1, "fails": 0, "value": 1},
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "k6.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(normalize_k6("00000000-0000-0000-0000-000000000000", output, BASE_URL), 1)
+        record = connect.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value.execute.call_args.args[1]
+        details = json.loads(record[6])
+        self.assertEqual(details["requests"], 1)
+        self.assertEqual(details["iterations"], 1)
+        self.assertEqual(details["checks_passed"], 1)
+        self.assertEqual(details["duration_ms"]["p(95)"], 1.35)
 
     def test_subfinder_requires_separate_third_party_opt_in(self):
         adapter = self.adapters["subfinder"]

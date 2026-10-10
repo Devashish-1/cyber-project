@@ -8,8 +8,8 @@ The dashboard is bound to server localhost and is intended to be reached through
 
 - FastAPI control plane, PostgreSQL, Redis, and a multi-view web dashboard.
 - Projects with reversible read-only archival, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
-- 74 catalogued tools with 45 supervised adapters; adapter images are pinned by digest.
-- Observe, controlled-active, extended-active, and source-assisted execution profiles.
+- 75 catalogued tools with 46 supervised adapters; adapter images are pinned by digest.
+- Observe, controlled-active, extended-active, source-assisted, and separately opted-in load-resilience execution profiles.
 - Reviewed single-tool runs plus ordered target and source-analysis workflow templates with cancellation and emergency stop.
 - Dedicated Docker runner with read-only filesystems, dropped capabilities, non-root execution, resource limits, bounded output, and no Docker socket inside scanner containers.
 - Live run events, normalized observations, deduplicated project findings, review states, notes, and bounded retests.

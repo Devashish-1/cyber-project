@@ -3,6 +3,7 @@ profiles:
   controlled-active: {description: Reviewed active checks, max_concurrency: 1, tools: [subfinder, dnsx, katana, nuclei-reviewed, zap-baseline, nikto, schemathesis]}
   extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox]}
   source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, syft, grype, trivy, gitleaks, trufflehog, osv-scanner, checkov, kics, hadolint, shellcheck]}
+  load-resilience: {description: Separately approved bounded resilience probes, max_concurrency: 1, requires_operator: true, tools: [k6]}
 
 tools:
   amass: {category: recon, risk: medium, availability: optional, execution: external-service-gated, automation_note: "Passive enumeration contacts third-party data sources; require provider/scope approval before automation."}
@@ -40,6 +41,7 @@ tools:
   schemathesis: {category: api, risk: medium, availability: core, execution: adapter}
   kiterunner: {category: api-discovery, risk: high, availability: optional, execution: approval-gated}
   playwright: {category: browser-auth, risk: medium, availability: core, execution: adapter}
+  k6: {category: load-resilience, risk: high, availability: optional, execution: approval-gated, official_url: "https://grafana.com/oss/k6/", automation_note: "A separately approved target-level load-testing opt-in is required. The supervised adapter is intentionally limited to one virtual user, one iteration, one exact base-URL request, and no redirects."}
   semgrep: {category: sast, risk: low, availability: core, execution: adapter}
   bandit: {category: sast-python, risk: low, availability: core, execution: adapter}
   codeql: {category: sast, risk: low, availability: optional, execution: adapter}
