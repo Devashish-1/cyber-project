@@ -330,7 +330,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.170.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.171.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -502,7 +502,7 @@ def require_dns_resolver_permission(
     *,
     workflow: bool = False,
 ) -> None:
-    if tool_id in {"dnsx", "massdns"} and not dns_resolver:
+    if tool_id in {"dnsrecon", "dnsx", "massdns"} and not dns_resolver:
         subject = "workflow step" if workflow else "adapter"
         raise HTTPException(
             status_code=409,

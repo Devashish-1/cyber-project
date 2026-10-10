@@ -58,7 +58,7 @@ class CurrentTargetPolicyTests(unittest.TestCase):
 
 class DnsResolverPermissionTests(unittest.TestCase):
     def test_dns_adapters_require_an_approved_resolver(self):
-        for tool_id in ("dnsx", "massdns"):
+        for tool_id in ("dnsrecon", "dnsx", "massdns"):
             with self.subTest(tool_id=tool_id):
                 with self.assertRaises(HTTPException) as raised:
                     require_dns_resolver_permission(tool_id, None)
@@ -67,6 +67,7 @@ class DnsResolverPermissionTests(unittest.TestCase):
 
     def test_non_dns_adapters_and_configured_resolvers_are_allowed(self):
         require_dns_resolver_permission("httpx", None)
+        require_dns_resolver_permission("dnsrecon", "1.1.1.1:53")
         require_dns_resolver_permission("dnsx", "1.1.1.1")
         require_dns_resolver_permission("massdns", "2606:4700:4700::1111")
 

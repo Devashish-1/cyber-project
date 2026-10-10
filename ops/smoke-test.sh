@@ -134,6 +134,7 @@ grep -q 'Target policy blocks required third-party provider access' "$work_dir/d
 grep -q 'runApproved&&!runBlocker' "$work_dir/dashboard.html"
 grep -q 'batchApproved&&!workflowBlocker' "$work_dir/dashboard.html"
 grep -q 'Approved DNS resolver required by:' "$work_dir/dashboard.html"
+grep -q "\['dnsrecon','dnsx','massdns'\]" "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
 grep -q 'Per-target coverage' "$work_dir/dashboard.html"
