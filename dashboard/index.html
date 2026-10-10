@@ -22,7 +22,7 @@
 </head>
 <body>
 <div class="app-shell">
-<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="tools" onclick="showView('tools')">⌘ Tool Catalog</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.169<br>Private operator console</div></aside>
+<aside class="sidebar"><div class="brand"><div class="brand-mark">KS</div><div><strong>KillSwitch</strong><small>Security workspace</small></div></div><nav class="nav" aria-label="Dashboard views"><button data-nav="overview" onclick="showView('overview')">⌂ Overview</button><button data-nav="scope" onclick="showView('scope')">◎ Projects &amp; Scope</button><button data-nav="runs" onclick="showView('runs')">▶ Runs</button><button data-nav="workflows" onclick="showView('workflows')">↳ Workflows</button><button data-nav="findings" onclick="showView('findings')">◇ Findings &amp; Review</button><button data-nav="reports" onclick="showView('reports')">▤ Reports &amp; Evidence</button><button data-nav="tools" onclick="showView('tools')">⌘ Tool Catalog</button><button data-nav="operations" onclick="showView('operations')">⚙ Operations</button></nav><div class="sidebar-foot">UI v0.170<br>Private operator console</div></aside>
 <main class="workspace">
   <header class="topbar">
 <div>
@@ -198,7 +198,7 @@
     <article>
 <h2 data-section="scope">Project</h2>
       <p class="muted">Create projects here. Use the workspace bar above to switch the active project from any view.</p>
-<select id="projects" class="project-context-select" aria-label="Active project" onchange="findingReviewDirty=false;projectSelectionChanged()">
+<select id="projects" class="project-context-select" aria-label="Active project" onchange="findingReviewDirty=false;resetRunApproval();resetBatchApproval();projectSelectionChanged()">
 <option value="">Select a project</option>
 </select>
       <label>New project name</label>
@@ -252,19 +252,19 @@
     <article>
 <h2 data-section="runs">Queue approved run</h2>
       <label id="target-selector-label">Target</label>
-<select id="targets" onchange="adapterChanged();planChanged();applyQueueAdmissionUi()">
+<select id="targets" onchange="resetRunApproval();resetBatchApproval();adapterChanged();planChanged();applyQueueAdmissionUi()">
 <option value="">Select a target</option>
 </select>
       <label id="source-selector-label">Source archive</label>
-<select id="run-source-artifact">
+<select id="run-source-artifact" onchange="resetRunApproval()">
 <option value="">Select a source archive</option>
 </select>
       <label>Encrypted test account (optional; Playwright only)</label>
-<select id="run-credential-profile" disabled>
+<select id="run-credential-profile" onchange="resetRunApproval()" disabled>
 <option value="">Anonymous session</option>
 </select>
       <label>Implemented adapter</label>
-<select id="adapters" onchange="adapterChanged()">
+<select id="adapters" onchange="resetRunApproval();adapterChanged()">
 <option value="">Select an adapter</option>
 </select>
       <label>Execution profile</label>
@@ -538,7 +538,7 @@
 <h2 data-section="workflows">Approved workflow</h2>
 <p class="muted">Queue a reviewed sequence of adapters. Each step is dispatched only after the previous step succeeds; failure or cancellation stops the remaining steps.</p>
     <div class="grid">
-      <label>Workflow plan<select id="run-plans" onchange="planChanged();applyQueueAdmissionUi()">
+      <label>Workflow plan<select id="run-plans" onchange="resetBatchApproval();planChanged();applyQueueAdmissionUi()">
 <option value="">Select a workflow</option>
 </select>
 </label>
@@ -559,7 +559,7 @@
 </ol>
 <span class="muted">Use ↑/↓ to set the exact sequential execution order.</span>
 </div>
-      <label>Encrypted test account (Playwright step only)<select id="batch-credential-profile" disabled>
+      <label>Encrypted test account (Playwright step only)<select id="batch-credential-profile" onchange="resetBatchApproval()" disabled>
 <option value="">Anonymous workflow</option>
 </select>
 </label>
@@ -711,6 +711,8 @@ const archivedBlockedActions=new Set(['uploadSourceArtifact','deleteSourceArtifa
 function queueAdmissionReason(requestedSlots=1){if(!queueAdmission)return 'Queue admission status is unavailable.';if(queueAdmission.paused)return `Platform paused${queueAdmission.pause?.reason?`: ${queueAdmission.pause.reason}`:''}.`;if(queueAdmission.available_slots<requestedSlots)return `Queue capacity unavailable: ${queueAdmission.pending}/${queueAdmission.maximum_pending} pending, ${queueAdmission.available_slots} slot(s) free.`;return `${queueAdmission.available_slots} queue slot(s) available.`}
 function newWorkAdmissionReason(requestedSlots=1){if(!storageAdmission)return 'Protected storage status is unavailable.';if(!storageAdmission.allowed)return `Protected storage reserve reached: ${bytes(storageAdmission.free_bytes)} free, ${bytes(storageAdmission.minimum_free_bytes)} required.`;return queueAdmissionReason(requestedSlots)}
 function approvalAwareAdmissionReason(requestedSlots,approved,label){const admission=newWorkAdmissionReason(requestedSlots),ready=!!queueAdmission?.allowed&&!!storageAdmission?.allowed&&queueAdmission.available_slots>=requestedSlots;return ready&&!approved?`${admission} Explicit ${label} approval is required.`:admission}
+function resetRunApproval(){el('run-approved').checked=false;applyQueueAdmissionUi()}
+function resetBatchApproval(){el('batch-approved').checked=false;applyQueueAdmissionUi()}
 function applyQueueAdmissionUi(){const unlocked=!!controlPlaneToken,viewer=controlPlaneRole==='viewer',archiveBlocked=projectArchived,admissionReady=!!queueAdmission?.allowed&&!!storageAdmission?.allowed,runApproved=el('run-approved').checked,batchApproved=el('batch-approved').checked,runAllowed=unlocked&&admissionReady&&queueAdmission.available_slots>=1&&runApproved&&!viewer&&!archiveBlocked,workflowSlots=Math.max(1,selectedWorkflowSteps().length),workflowAllowed=unlocked&&admissionReady&&queueAdmission.available_slots>=workflowSlots&&batchApproved&&!viewer&&!archiveBlocked,runButton=el('queue-run-button'),workflowButton=el('queue-workflow-button'),runReason=approvalAwareAdmissionReason(1,runApproved,'run'),workflowReason=approvalAwareAdmissionReason(workflowSlots,batchApproved,'workflow');runButton.disabled=!runAllowed;workflowButton.disabled=!workflowAllowed;runButton.title=runAllowed?'':runReason;workflowButton.title=workflowAllowed?'':workflowReason;el('run-admission-status').textContent=runReason;el('workflow-admission-status').textContent=workflowReason}
 function applyRoleUi(){const viewer=controlPlaneRole==='viewer';document.body.classList.toggle('viewer-mode',viewer);el('role-guidance').style.display=viewer?'block':'none';document.querySelectorAll('button[onclick]').forEach(button=>{const action=(button.getAttribute('onclick')||'').match(/^([A-Za-z0-9_]+)/)?.[1]||'';if(mutatingActions.has(action)){const archiveBlocked=projectArchived&&archivedBlockedActions.has(action);button.disabled=viewer||archiveBlocked;button.title=viewer?'Viewer role is read-only.':archiveBlocked?'Archived projects are read-only.':''}});applyQueueAdmissionUi()}
 let roleUiRefreshPending=false;new MutationObserver(()=>{if((controlPlaneRole!=='viewer'&&!projectArchived)||roleUiRefreshPending)return;roleUiRefreshPending=true;requestAnimationFrame(()=>{roleUiRefreshPending=false;applyRoleUi()})}).observe(document.body,{childList:true,subtree:true});
@@ -770,13 +772,13 @@ async function updateTarget(){const project=el('projects').value,target=el('targ
 async function deleteTarget(){const project=el('projects').value,target=el('target-edit-select').value;if(!project||!target)return msg('target-message','Select an unused saved target first.',true);const confirmation=prompt('Type DELETE AUTHORIZED TARGET to remove this unused target. Targets with runs, workflow batches, or credential profiles are protected.');if(confirmation!=='DELETE AUTHORIZED TARGET')return;try{msg('target-message','Deleting unused target…');await req(`/projects/${project}/targets/${target}`,{method:'DELETE',body:JSON.stringify({requested_by:el('requested-by').value||'killswitch',confirmation})});resetTargetEditor();await projectChanged();msg('target-message','Unused target deleted.')}catch(e){msg('target-message',e.message,true)}}
 function refreshCustomWorkflowOptions(){const selector=el('custom-workflow-picker');selector.innerHTML='<option value="">Choose an adapter</option>'+Object.entries(adapterMap).filter(([,adapter])=>(adapter.input||'target')==='target').sort(([left],[right])=>left.localeCompare(right)).map(([id,adapter])=>`<option value="${id}">${esc(id)} · ${esc(adapter.profile||'')}</option>`).join('');renderCustomWorkflowTools()}
 function renderWorkflowTemplates(items,selected=''){workflowTemplates=items;el('workflow-template-select').innerHTML='<option value="">Select a saved template</option>'+items.map(template=>`<option value="${template.id}">${esc(template.name)} · ${template.tool_ids.length} steps</option>`).join('');if(items.some(template=>template.id===selected))el('workflow-template-select').value=selected}
-function loadWorkflowTemplate(){const template=workflowTemplates.find(item=>item.id===el('workflow-template-select').value);if(!template)return;customWorkflowToolIds=[...template.tool_ids];el('workflow-template-name').value=template.name;renderCustomWorkflowTools();planChanged();msg('batch-message',`Loaded template ${template.name}`)}
+function loadWorkflowTemplate(){const template=workflowTemplates.find(item=>item.id===el('workflow-template-select').value);if(!template)return;resetBatchApproval();customWorkflowToolIds=[...template.tool_ids];el('workflow-template-name').value=template.name;renderCustomWorkflowTools();planChanged();msg('batch-message',`Loaded template ${template.name}`)}
 async function saveWorkflowTemplate(){const project=el('projects').value,name=el('workflow-template-name').value.trim();if(!project)return msg('batch-message','Select a project before saving a workflow template.',true);if(!name||customWorkflowToolIds.length===0)return msg('batch-message','Enter a template name and add at least one adapter.',true);try{const template=await req(`/projects/${project}/workflow-templates`,{method:'POST',body:JSON.stringify({name,tool_ids:customWorkflowToolIds,created_by:el('batch-requested-by').value||'killswitch'})});msg('batch-message',`Saved workflow template ${template.name}`);await projectChanged();el('workflow-template-select').value=template.id}catch(e){msg('batch-message',e.message,true)}}
 async function deleteWorkflowTemplate(){const id=el('workflow-template-select').value;if(!id)return msg('batch-message','Select a saved template to delete.',true);const confirmation=prompt('Type DELETE WORKFLOW TEMPLATE to permanently remove this saved template.');if(confirmation!=='DELETE WORKFLOW TEMPLATE')return;try{await req(`/workflow-templates/${id}`,{method:'DELETE',body:JSON.stringify({requested_by:el('batch-requested-by').value||'killswitch',confirmation})});customWorkflowToolIds=[];el('workflow-template-name').value='';renderCustomWorkflowTools();msg('batch-message','Workflow template deleted.');await projectChanged()}catch(e){msg('batch-message',e.message,true)}}
 function renderCustomWorkflowTools(){el('custom-workflow-tools').innerHTML=customWorkflowToolIds.length?customWorkflowToolIds.map((id,index)=>`<li><code>${esc(id)}</code> · ${esc(adapterMap[id]?.profile||'unknown')} <button class="secondary" onclick="moveCustomWorkflowTool(${index},-1)" ${index===0?'disabled':''}>↑</button><button class="secondary" onclick="moveCustomWorkflowTool(${index},1)" ${index===customWorkflowToolIds.length-1?'disabled':''}>↓</button><button class="danger" onclick="removeCustomWorkflowTool(${index})">Remove</button></li>`).join(''):'<li class="muted">No adapters selected.</li>'}
-function addCustomWorkflowTool(){const id=el('custom-workflow-picker').value;if(!id||customWorkflowToolIds.includes(id))return;customWorkflowToolIds.push(id);el('custom-workflow-picker').value='';el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
-function moveCustomWorkflowTool(index,offset){const next=index+offset;if(next<0||next>=customWorkflowToolIds.length)return;[customWorkflowToolIds[index],customWorkflowToolIds[next]]=[customWorkflowToolIds[next],customWorkflowToolIds[index]];el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
-function removeCustomWorkflowTool(index){customWorkflowToolIds.splice(index,1);el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
+function addCustomWorkflowTool(){const id=el('custom-workflow-picker').value;if(!id||customWorkflowToolIds.includes(id))return;resetBatchApproval();customWorkflowToolIds.push(id);el('custom-workflow-picker').value='';el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
+function moveCustomWorkflowTool(index,offset){const next=index+offset;if(next<0||next>=customWorkflowToolIds.length)return;resetBatchApproval();[customWorkflowToolIds[index],customWorkflowToolIds[next]]=[customWorkflowToolIds[next],customWorkflowToolIds[index]];el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
+function removeCustomWorkflowTool(index){resetBatchApproval();customWorkflowToolIds.splice(index,1);el('workflow-template-select').value='';renderCustomWorkflowTools();planChanged()}
 function selectedWorkflowSteps(){const plan=el('run-plans').value;if(plan!=='custom')return planMap[plan]||[];return customWorkflowToolIds.map(id=>({tool_id:id,profile:adapterMap[id]?.profile||'unknown'}))}
 async function loadAdapters(){const d=await req('/adapters');adapterMap=d.adapters||{};el('adapters').innerHTML='<option value="">Select an adapter</option>'+Object.entries(adapterMap).map(([id,a])=>`<option value="${id}">${esc(id)} · ${esc(a.version||'')}</option>`).join('');refreshCustomWorkflowOptions();planChanged();renderTools()}
 async function loadPlans(){const d=await req('/run-plans');planMap=d.plans||{};el('run-plans').innerHTML='<option value="">Select a workflow</option>'+Object.keys(planMap).map(id=>`<option value="${id}">${esc(id)}</option>`).join('')+'<option value="custom">custom · choose adapters</option>';planChanged()}
