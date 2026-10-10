@@ -48,10 +48,11 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.173' "$work_dir/dashboard.html"
-grep -q 'verified baseline' "$work_dir/dashboard.html"
+grep -q 'UI v0.174' "$work_dir/dashboard.html"
+grep -q 'baseline ready' "$work_dir/dashboard.html"
 grep -q 're-upload required' "$work_dir/dashboard.html"
 grep -q 'integrity_baseline_ready' "$work_dir/dashboard.html"
+grep -q 'function verifySourceArtifact' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -193,6 +194,7 @@ jq -e '
   and (.paths["/projects/{project_id}/imports/burp"].get != null)
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
+  and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}/integrity"].get != null)
   and (.paths["/projects/{project_id}/targets/{target_id}"].delete != null)
   and (.paths["/projects/{project_id}/archive"].post != null)
   and (.paths["/projects/{project_id}/restore"].post != null)
@@ -354,6 +356,15 @@ PY
       (.content_sha256 | type == "string" and length == 64)
     )
   ' "$work_dir/source-artifacts-before-delete.json" >/dev/null
+  curl --config "$curl_config" \
+    "$base_url/projects/$project_id/source-artifacts/$smoke_source_artifact_id/integrity" \
+    > "$work_dir/source-integrity.json"
+  jq -e --arg artifact_id "$smoke_source_artifact_id" '
+    (.artifact_id | tostring) == $artifact_id and
+    .status == "verified" and
+    (.content_sha256 | type == "string" and length == 64) and
+    (.checked_at | type == "string")
+  ' "$work_dir/source-integrity.json" >/dev/null
   curl --config "$curl_config" \
     -H 'Content-Type: application/json' -X DELETE \
     "$base_url/projects/$project_id/source-artifacts/$smoke_source_artifact_id" \
@@ -627,10 +638,10 @@ if [ -n "$project_id" ]; then
     all(.external_approval_required[]; . == "amass" or . == "spiderfoot" or . == "subfinder" or . == "theharvester") and
     (.disclaimer | contains("does not prove"))
   ' "$work_dir/coverage-gaps.json" >/dev/null
-  jq -e --arg project_id "$project_id" '
+  jq -e --arg project_id "$project_id" --arg platform_version "$(jq -r '.info.version' "$work_dir/openapi.json")" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.163.0" and
+    .platform_version == $platform_version and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and

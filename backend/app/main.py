@@ -311,7 +311,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.163.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.164.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2247,6 +2247,26 @@ def list_source_artifacts(project_id: UUID) -> dict:
             }
             for row in rows
         ]
+    }
+
+
+@app.get("/projects/{project_id}/source-artifacts/{artifact_id}/integrity")
+def verify_source_artifact_integrity(project_id: UUID, artifact_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT content_sha256 FROM source_artifacts WHERE id = %s AND project_id = %s",
+                (artifact_id, project_id),
+            )
+            artifact = cursor.fetchone()
+            if artifact is None:
+                raise HTTPException(status_code=404, detail="Source artifact not found in project")
+    require_source_artifact_storage(artifact_id, artifact[0])
+    return {
+        "artifact_id": artifact_id,
+        "status": "verified",
+        "content_sha256": artifact[0],
+        "checked_at": datetime.now(timezone.utc),
     }
 
 
