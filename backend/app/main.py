@@ -310,7 +310,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.160.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.161.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -492,6 +492,19 @@ def require_current_target_policy(
         workflow=workflow,
     )
     require_dns_resolver_permission(tool_id, dns_resolver, workflow=workflow)
+
+
+def require_source_artifact_storage(artifact_id: UUID) -> None:
+    """Fail closed when an approved source artifact is missing or was altered into a link."""
+    content_root = SOURCE_ROOT / str(artifact_id) / "content"
+    try:
+        if not content_root.is_dir() or content_root.is_symlink():
+            raise HTTPException(status_code=409, detail="Approved source artifact is missing from storage")
+        for path in content_root.rglob("*"):
+            if path.is_symlink():
+                raise HTTPException(status_code=409, detail="Approved source artifact contains an unsafe symbolic link")
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail="Approved source artifact storage cannot be verified") from exc
 
 
 def format_testing_window(start_minute_utc: int | None, end_minute_utc: int | None) -> str:
@@ -2932,6 +2945,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=404, detail="Source artifact not found in project")
                 if not source[0]:
                     raise HTTPException(status_code=422, detail="Source authorization is not confirmed")
+                require_source_artifact_storage(payload.source_artifact_id)
             else:
                 cursor.execute(
                     """
@@ -4921,6 +4935,8 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                     bool(adapter.get("uses_third_party_services", False)),
                     tuple(target_policy),
                 )
+            elif source_artifact_id is not None:
+                require_source_artifact_storage(source_artifact_id)
             adapter_runtime_admission(
                 [tool_id], load_adapters().get("adapters", {}), enforce=True
             )
