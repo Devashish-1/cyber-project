@@ -310,7 +310,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.158.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.159.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -458,6 +458,20 @@ def require_third_party_service_permission(
         raise HTTPException(
             status_code=409,
             detail=f"Target does not authorize third-party intelligence/provider access for this {subject}",
+        )
+
+
+def require_dns_resolver_permission(
+    tool_id: str,
+    dns_resolver: str | None,
+    *,
+    workflow: bool = False,
+) -> None:
+    if tool_id in {"dnsx", "massdns"} and not dns_resolver:
+        subject = "workflow step" if workflow else "adapter"
+        raise HTTPException(
+            status_code=409,
+            detail=f"The {tool_id} {subject} requires an approved target DNS resolver",
         )
 
 
@@ -2904,7 +2918,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     """
                     SELECT authorization_confirmed, testing_window_start_minute_utc,
                            testing_window_end_minute_utc, allow_state_changing,
-                           allow_third_party_services
+                           allow_third_party_services, dns_resolver
                     FROM targets WHERE id = %s AND project_id = %s
                     """,
                     (payload.target_id, project_id),
@@ -2920,6 +2934,7 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     bool(adapter.get("uses_third_party_services", False)),
                     target[4],
                 )
+                require_dns_resolver_permission(payload.tool_id, target[5])
                 if payload.credential_profile_id is not None:
                     cursor.execute(
                         """
@@ -3001,7 +3016,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 """
                 SELECT authorization_confirmed, testing_window_start_minute_utc,
                        testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services
+                       allow_third_party_services, dns_resolver
                 FROM targets WHERE id = %s AND project_id = %s
                 """,
                 (payload.target_id, project_id),
@@ -3023,6 +3038,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                     target[4],
                     workflow=True,
                 )
+                require_dns_resolver_permission(tool_id, target[5], workflow=True)
             credential_role = None
             if payload.credential_profile_id is not None:
                 cursor.execute(

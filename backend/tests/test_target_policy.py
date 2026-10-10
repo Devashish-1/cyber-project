@@ -4,11 +4,33 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.main import (
+    require_dns_resolver_permission,
     require_open_testing_window,
     require_state_changing_permission,
     require_third_party_service_permission,
     testing_window_allows,
 )
+
+
+class DnsResolverPermissionTests(unittest.TestCase):
+    def test_dns_adapters_require_an_approved_resolver(self):
+        for tool_id in ("dnsx", "massdns"):
+            with self.subTest(tool_id=tool_id):
+                with self.assertRaises(HTTPException) as raised:
+                    require_dns_resolver_permission(tool_id, None)
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertIn("approved target DNS resolver", raised.exception.detail)
+
+    def test_non_dns_adapters_and_configured_resolvers_are_allowed(self):
+        require_dns_resolver_permission("httpx", None)
+        require_dns_resolver_permission("dnsx", "1.1.1.1")
+        require_dns_resolver_permission("massdns", "2606:4700:4700::1111")
+
+    def test_workflow_denial_identifies_the_step(self):
+        with self.assertRaises(HTTPException) as raised:
+            require_dns_resolver_permission("dnsx", None, workflow=True)
+
+        self.assertIn("workflow step", raised.exception.detail)
 
 
 class StateChangingPermissionTests(unittest.TestCase):

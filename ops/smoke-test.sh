@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.171' "$work_dir/dashboard.html"
+grep -q 'UI v0.172' "$work_dir/dashboard.html"
 grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
@@ -120,6 +120,7 @@ grep -q 'Select an authorized source archive' "$work_dir/dashboard.html"
 grep -q 'Target policy blocks required third-party provider access' "$work_dir/dashboard.html"
 grep -q 'runApproved&&!runBlocker' "$work_dir/dashboard.html"
 grep -q 'batchApproved&&!workflowBlocker' "$work_dir/dashboard.html"
+grep -q 'Approved DNS resolver required by:' "$work_dir/dashboard.html"
 grep -q 'Download audit JSON' "$work_dir/dashboard.html"
 grep -q 'Project adapter coverage' "$work_dir/dashboard.html"
 grep -q 'Per-target coverage' "$work_dir/dashboard.html"
@@ -613,7 +614,7 @@ if [ -n "$project_id" ]; then
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-coverage-gaps/v1" and
     (.generated_at | type == "string") and
-    .platform_version == "0.158.0" and
+    .platform_version == "0.159.0" and
     .project_id == $project_id and
     (.status == "gaps-present" or .status == "no-recorded-gaps") and
     (.gap_count | type == "number") and
