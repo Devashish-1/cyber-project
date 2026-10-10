@@ -10,7 +10,7 @@ The dashboard is bound to server localhost and is intended to be reached through
 - Projects with reversible read-only archival, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
 - 74 catalogued tools with 45 supervised adapters; adapter images are pinned by digest.
 - Observe, controlled-active, extended-active, and source-assisted execution profiles.
-- Reviewed single-tool runs and ordered workflow templates with cancellation and emergency stop.
+- Reviewed single-tool runs plus ordered target and source-analysis workflow templates with cancellation and emergency stop.
 - Dedicated Docker runner with read-only filesystems, dropped capabilities, non-root execution, resource limits, bounded output, and no Docker socket inside scanner containers.
 - Live run events, normalized observations, deduplicated project findings, review states, notes, and bounded retests.
 - Sealed evidence with integrity verification plus SARIF, DefectDojo JSON, Markdown, JSON, audit, coverage-gap, and report-bundle exports.

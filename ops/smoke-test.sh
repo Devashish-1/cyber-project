@@ -48,7 +48,10 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.175' "$work_dir/dashboard.html"
+grep -q 'UI v0.176' "$work_dir/dashboard.html"
+grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
+grep -q 'function workflowInputType' "$work_dir/dashboard.html"
+grep -q 'source_artifact_id:input' "$work_dir/dashboard.html"
 grep -q 'baseline ready' "$work_dir/dashboard.html"
 grep -q 're-upload required' "$work_dir/dashboard.html"
 grep -q 'integrity_baseline_ready' "$work_dir/dashboard.html"
@@ -76,7 +79,7 @@ grep -q 'requires target-level opt-in and explicit authorization' "$work_dir/das
 grep -q 'blocked until the selected target explicitly opts in' "$work_dir/dashboard.html"
 grep -q 'Selected target policy does not allow third-party provider access' "$work_dir/dashboard.html"
 grep -q "adapterMap\[tool\].uses_third_party_services&&!targetMap\[target\]?.allow_third_party_services" "$work_dir/dashboard.html"
-grep -q "externalTools.length&&!targetMap\[target\]?.allow_third_party_services" "$work_dir/dashboard.html"
+grep -q "external.length&&!target.allow_third_party_services" "$work_dir/dashboard.html"
 grep -q 'function validationEvidenceAction' "$work_dir/dashboard.html"
 grep -q "validationEvidenceAction(item)" "$work_dir/dashboard.html"
 grep -q "validationEvidenceAction(toolCoverageMap\[name\],'Review proof')" "$work_dir/dashboard.html"
@@ -90,7 +93,7 @@ grep -q 'Wait for the supervised runner inventory before preparing this gap' "$w
 grep -q 'State-changing access:' "$work_dir/dashboard.html"
 grep -q 'does not allow state-changing extended-active tests' "$work_dir/dashboard.html"
 grep -q "adapterMap\[tool\].profile==='extended-active'&&!targetMap\[target\]?.allow_state_changing" "$work_dir/dashboard.html"
-grep -q "extendedTools.length&&!targetMap\[target\]?.allow_state_changing" "$work_dir/dashboard.html"
+grep -q "extended.length&&!target.allow_state_changing" "$work_dir/dashboard.html"
 grep -q 'by server UTC' "$work_dir/dashboard.html"
 grep -q 'Selected target testing window is currently closed' "$work_dir/dashboard.html"
 grep -q "targetMap\[target\]?.testing_window_open===false" "$work_dir/dashboard.html"
@@ -199,6 +202,14 @@ jq -e '
   and (.paths["/projects/{project_id}/archive"].post != null)
   and (.paths["/projects/{project_id}/restore"].post != null)
 ' "$work_dir/openapi.json" >/dev/null
+
+curl --config "$curl_config" "$base_url/run-plans" > "$work_dir/run-plans.json"
+jq -e '
+  (.plans["source-secrets-and-quality"] | length) >= 1 and
+  (.plans["source-dependencies-and-iac"] | length) >= 1 and
+  all(.plans["source-secrets-and-quality"][]; .profile == "source-assisted") and
+  all(.plans["source-dependencies-and-iac"][]; .profile == "source-assisted")
+' "$work_dir/run-plans.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
 jq -e '

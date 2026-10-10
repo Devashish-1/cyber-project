@@ -61,6 +61,8 @@ RUN_PLANS = {
     "authenticated-browser": ["httpx", "playwright"],
     "controlled-web": ["dnsx", "naabu", "nmap", "httpx", "playwright", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster", "feroxbuster", "kiterunner", "wapiti", "sqlmap-controlled"],
+    "source-secrets-and-quality": ["gitleaks", "trufflehog", "semgrep", "bandit", "brakeman", "njsscan", "shellcheck", "hadolint"],
+    "source-dependencies-and-iac": ["syft", "grype", "osv-scanner", "trivy", "checkov", "kics", "kubescape"],
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
@@ -214,6 +216,8 @@ def init_database() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS workflow_templates_project_created_idx
                     ON workflow_templates(project_id, created_at DESC);
+                ALTER TABLE workflow_templates ADD COLUMN IF NOT EXISTS input_type TEXT
+                    NOT NULL DEFAULT 'target' CHECK (input_type IN ('target', 'source'));
                 ALTER TABLE run_batches ADD COLUMN IF NOT EXISTS template_id UUID
                     REFERENCES workflow_templates(id) ON DELETE SET NULL;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS batch_id UUID;
@@ -274,6 +278,20 @@ def init_database() -> None:
                 CREATE INDEX IF NOT EXISTS source_artifacts_project_created_idx
                     ON source_artifacts(project_id, created_at DESC);
                 ALTER TABLE source_artifacts ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
+                ALTER TABLE run_batches ALTER COLUMN target_id DROP NOT NULL;
+                ALTER TABLE run_batches ADD COLUMN IF NOT EXISTS source_artifact_id UUID
+                    REFERENCES source_artifacts(id) ON DELETE RESTRICT;
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'run_batches_exactly_one_input'
+                    ) THEN
+                        ALTER TABLE run_batches ADD CONSTRAINT run_batches_exactly_one_input CHECK (
+                            (target_id IS NOT NULL AND source_artifact_id IS NULL)
+                            OR (target_id IS NULL AND source_artifact_id IS NOT NULL)
+                        );
+                    END IF;
+                END $$;
                 ALTER TABLE runs ALTER COLUMN target_id DROP NOT NULL;
                 ALTER TABLE runs ADD COLUMN IF NOT EXISTS source_artifact_id UUID
                     REFERENCES source_artifacts(id) ON DELETE CASCADE;
@@ -311,7 +329,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.165.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.166.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -583,9 +601,10 @@ class SourceArtifactDelete(BaseModel):
 
 
 class BatchCreate(BaseModel):
-    target_id: UUID
+    target_id: UUID | None = None
+    source_artifact_id: UUID | None = None
     credential_profile_id: UUID | None = None
-    plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web)$")
+    plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web|source-secrets-and-quality|source-dependencies-and-iac)$")
     tool_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
     template_id: UUID | None = None
     requested_by: str = Field(min_length=2, max_length=120)
@@ -595,6 +614,7 @@ class BatchCreate(BaseModel):
 class WorkflowTemplateCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     tool_ids: list[str] = Field(min_length=1, max_length=20)
+    input_type: str = Field(default="target", pattern="^(target|source)$")
     created_by: str = Field(min_length=2, max_length=120)
 
 
@@ -670,7 +690,9 @@ def target_path_is_excluded(path: str, excluded_paths: list[str]) -> bool:
     return False
 
 
-def validate_workflow_tool_ids(tool_ids: list[str]) -> dict:
+def validate_workflow_tool_ids(tool_ids: list[str], input_type: str = "target") -> dict:
+    if input_type not in {"target", "source"}:
+        raise HTTPException(status_code=422, detail="Workflow input must be target or source")
     if len(tool_ids) != len(set(tool_ids)):
         raise HTTPException(status_code=422, detail="Custom workflows cannot contain duplicate adapters")
     registry = load_registry().get("tools", {})
@@ -682,8 +704,12 @@ def validate_workflow_tool_ids(tool_ids: list[str]) -> dict:
             raise HTTPException(status_code=422, detail=f"Workflow adapter is unavailable: {tool_id}")
         if tool.get("execution") in {"disabled", "manual"}:
             raise HTTPException(status_code=422, detail=f"Workflow adapter cannot run automatically: {tool_id}")
-        if adapter.get("input", "target") != "target":
-            raise HTTPException(status_code=422, detail=f"Target workflows cannot contain source adapter: {tool_id}")
+        adapter_input = adapter.get("input", "target")
+        if adapter_input != input_type:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{input_type.title()} workflows cannot contain {adapter_input} adapter: {tool_id}",
+            )
     return adapters
 
 
@@ -1920,7 +1946,7 @@ def list_workflow_templates(project_id: UUID) -> dict:
                 raise HTTPException(status_code=404, detail="Project not found")
             cursor.execute(
                 """
-                SELECT id, name, tool_ids, created_by, created_at
+                SELECT id, name, tool_ids, created_by, created_at, input_type
                 FROM workflow_templates WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -1928,7 +1954,7 @@ def list_workflow_templates(project_id: UUID) -> dict:
             rows = cursor.fetchall()
     return {
         "templates": [
-            {"id": row[0], "name": row[1], "tool_ids": row[2], "created_by": row[3], "created_at": row[4]}
+            {"id": row[0], "name": row[1], "tool_ids": row[2], "created_by": row[3], "created_at": row[4], "input_type": row[5]}
             for row in rows
         ]
     }
@@ -1936,7 +1962,7 @@ def list_workflow_templates(project_id: UUID) -> dict:
 
 @app.post("/projects/{project_id}/workflow-templates", status_code=201)
 def create_workflow_template(project_id: UUID, payload: WorkflowTemplateCreate) -> dict:
-    validate_workflow_tool_ids(payload.tool_ids)
+    validate_workflow_tool_ids(payload.tool_ids, payload.input_type)
     template_id = uuid4()
     try:
         with psycopg.connect(DATABASE_URL) as connection:
@@ -1944,14 +1970,14 @@ def create_workflow_template(project_id: UUID, payload: WorkflowTemplateCreate) 
                 require_project_active(cursor, project_id)
                 cursor.execute(
                     """
-                    INSERT INTO workflow_templates (id, project_id, name, tool_ids, created_by)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO workflow_templates (id, project_id, name, tool_ids, input_type, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (template_id, project_id, payload.name.strip(), Jsonb(payload.tool_ids), payload.created_by),
+                    (template_id, project_id, payload.name.strip(), Jsonb(payload.tool_ids), payload.input_type, payload.created_by),
                 )
                 record_audit(
                     cursor, project_id, "workflow_template.created", payload.created_by,
-                    "workflow_template", template_id, {"name": payload.name.strip(), "tools": payload.tool_ids},
+                    "workflow_template", template_id, {"name": payload.name.strip(), "tools": payload.tool_ids, "input_type": payload.input_type},
                 )
     except psycopg.errors.UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="A workflow template with this name already exists") from exc
@@ -3062,6 +3088,10 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
     choices = sum(value is not None for value in (payload.plan_id, payload.tool_ids, payload.template_id))
     if choices != 1:
         raise HTTPException(status_code=422, detail="Select exactly one preset plan, saved template, or custom tool sequence")
+    inputs = sum(value is not None for value in (payload.target_id, payload.source_artifact_id))
+    if inputs != 1:
+        raise HTTPException(status_code=422, detail="Select exactly one authorized target or source archive")
+    input_type = "source" if payload.source_artifact_id is not None else "target"
     template_name = None
     if payload.template_id is not None:
         with psycopg.connect(DATABASE_URL) as connection:
@@ -3077,43 +3107,61 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         tool_ids = list(template_tools)
     else:
         tool_ids = list(RUN_PLANS[payload.plan_id]) if payload.plan_id else list(payload.tool_ids or [])
-    adapters = validate_workflow_tool_ids(tool_ids)
+    adapters = validate_workflow_tool_ids(tool_ids, input_type)
     adapter_runtime_admission(tool_ids, adapters, enforce=True)
     plan_id = (
         payload.plan_id
         or (f"template-{payload.template_id}" if payload.template_id else None)
         or f"custom-{hashlib.sha256(json.dumps(tool_ids).encode()).hexdigest()[:12]}"
     )
-    if payload.credential_profile_id is not None and "playwright" not in tool_ids:
-        raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
+    if payload.credential_profile_id is not None:
+        if input_type == "source":
+            raise HTTPException(status_code=422, detail="Source workflows cannot use a credential profile")
+        if "playwright" not in tool_ids:
+            raise HTTPException(status_code=422, detail="Selected workflow does not contain a Playwright step")
     queue_admission(requested_slots=len(tool_ids), enforce=True)
     batch_id = uuid4()
     run_ids = [uuid4() for _ in tool_ids]
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             require_project_active(cursor, project_id)
-            cursor.execute(
-                """
-                SELECT authorization_confirmed, testing_window_start_minute_utc,
-                       testing_window_end_minute_utc, allow_state_changing,
-                       allow_third_party_services, dns_resolver
-                FROM targets WHERE id = %s AND project_id = %s
-                """,
-                (payload.target_id, project_id),
-            )
-            target = cursor.fetchone()
-            if target is None:
-                raise HTTPException(status_code=404, detail="Target not found in project")
-            if not target[0]:
-                raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
-            for tool_id in tool_ids:
-                require_current_target_policy(
-                    tool_id,
-                    adapters[tool_id].get("profile", ""),
-                    bool(adapters[tool_id].get("uses_third_party_services", False)),
-                    target[1:6],
-                    workflow=True,
+            if input_type == "target":
+                cursor.execute(
+                    """
+                    SELECT authorization_confirmed, testing_window_start_minute_utc,
+                           testing_window_end_minute_utc, allow_state_changing,
+                           allow_third_party_services, dns_resolver
+                    FROM targets WHERE id = %s AND project_id = %s
+                    """,
+                    (payload.target_id, project_id),
                 )
+                target = cursor.fetchone()
+                if target is None:
+                    raise HTTPException(status_code=404, detail="Target not found in project")
+                if not target[0]:
+                    raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
+                for tool_id in tool_ids:
+                    require_current_target_policy(
+                        tool_id,
+                        adapters[tool_id].get("profile", ""),
+                        bool(adapters[tool_id].get("uses_third_party_services", False)),
+                        target[1:6],
+                        workflow=True,
+                    )
+            else:
+                cursor.execute(
+                    """
+                    SELECT authorization_confirmed, content_sha256
+                    FROM source_artifacts WHERE id = %s AND project_id = %s
+                    """,
+                    (payload.source_artifact_id, project_id),
+                )
+                source = cursor.fetchone()
+                if source is None:
+                    raise HTTPException(status_code=404, detail="Source archive not found in project")
+                if not source[0]:
+                    raise HTTPException(status_code=422, detail="Source authorization is not confirmed")
+                require_source_artifact_storage(payload.source_artifact_id, source[1])
             credential_role = None
             if payload.credential_profile_id is not None:
                 cursor.execute(
@@ -3130,24 +3178,26 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             cursor.execute(
                 """
                 INSERT INTO run_batches
-                    (id, project_id, target_id, credential_profile_id, template_id, plan_id, requested_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (id, project_id, target_id, source_artifact_id, credential_profile_id,
+                     template_id, plan_id, requested_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    batch_id, project_id, payload.target_id, payload.credential_profile_id,
+                    batch_id, project_id, payload.target_id, payload.source_artifact_id,
+                    payload.credential_profile_id,
                     payload.template_id, plan_id, payload.requested_by,
                 ),
             )
             cursor.executemany(
                 """
                 INSERT INTO runs
-                    (id, project_id, target_id, credential_profile_id, tool_id, profile,
+                    (id, project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile,
                      status, requested_by, batch_id, batch_step)
-                VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s)
                 """,
                 [
                     (
-                        run_id, project_id, payload.target_id,
+                        run_id, project_id, payload.target_id, payload.source_artifact_id,
                         payload.credential_profile_id if tool_id == "playwright" else None, tool_id,
                         adapters[tool_id]["profile"], payload.requested_by, batch_id, batch_step,
                     )
@@ -3157,7 +3207,9 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
             record_audit(
                 cursor, project_id, "workflow.approved", payload.requested_by, "batch", batch_id,
                 {
-                    "target_id": str(payload.target_id), "plan_id": plan_id,
+                    "target_id": str(payload.target_id) if payload.target_id else None,
+                    "source_artifact_id": str(payload.source_artifact_id) if payload.source_artifact_id else None,
+                    "input_type": input_type, "plan_id": plan_id,
                     "plan_type": "preset" if payload.plan_id else "template" if payload.template_id else "custom",
                     "template_id": str(payload.template_id) if payload.template_id else None,
                     "template_name": template_name, "tools": tool_ids,
@@ -3173,6 +3225,7 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
         "plan_id": plan_id,
         "template_id": payload.template_id,
         "target_id": payload.target_id,
+        "source_artifact_id": payload.source_artifact_id,
         "credential_profile_id": payload.credential_profile_id,
         "run_ids": run_ids,
         "tools": tool_ids,
@@ -3185,7 +3238,8 @@ def list_batches(project_id: UUID) -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, target_id, plan_id, requested_by, created_at, credential_profile_id, template_id
+                SELECT id, target_id, plan_id, requested_by, created_at, credential_profile_id,
+                       template_id, source_artifact_id
                 FROM run_batches WHERE project_id = %s ORDER BY created_at DESC
                 """,
                 (project_id,),
@@ -3208,6 +3262,7 @@ def list_batches(project_id: UUID) -> dict:
                         "id": row[0], "target_id": row[1], "plan_id": row[2],
                         "requested_by": row[3], "created_at": row[4], "credential_profile_id": row[5],
                         "template_id": row[6],
+                        "source_artifact_id": row[7],
                         "status": derive_batch_status(statuses),
                         "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
                         "runs": runs,
@@ -3221,7 +3276,7 @@ def get_batch(batch_id: UUID) -> dict:
     with psycopg.connect(DATABASE_URL) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id, project_id, target_id, plan_id, requested_by, created_at, credential_profile_id, template_id FROM run_batches WHERE id = %s",
+                "SELECT id, project_id, target_id, plan_id, requested_by, created_at, credential_profile_id, template_id, source_artifact_id FROM run_batches WHERE id = %s",
                 (batch_id,),
             )
             batch = cursor.fetchone()
@@ -3241,6 +3296,7 @@ def get_batch(batch_id: UUID) -> dict:
         "id": batch[0], "project_id": batch[1], "target_id": batch[2],
         "plan_id": batch[3], "requested_by": batch[4], "created_at": batch[5],
         "credential_profile_id": batch[6], "template_id": batch[7],
+        "source_artifact_id": batch[8],
         "status": derive_batch_status([run["status"] for run in runs]), "runs": runs,
     }
 
