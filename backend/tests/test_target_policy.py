@@ -1,8 +1,10 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
+from app import main
 from app.main import (
     require_dns_resolver_permission,
     require_open_testing_window,
@@ -10,6 +12,45 @@ from app.main import (
     require_third_party_service_permission,
     testing_window_allows,
 )
+
+
+class CurrentTargetPolicyTests(unittest.TestCase):
+    def test_combined_gate_delegates_every_current_policy(self):
+        target_policy = (60, 120, True, True, "1.1.1.1")
+        with (
+            patch.object(main, "require_open_testing_window") as window,
+            patch.object(main, "require_state_changing_permission") as state,
+            patch.object(main, "require_third_party_service_permission") as third_party,
+            patch.object(main, "require_dns_resolver_permission") as dns,
+        ):
+            main.require_current_target_policy(
+                "dnsx",
+                "controlled-active",
+                True,
+                target_policy,
+                workflow=True,
+            )
+
+        window.assert_called_once_with(60, 120)
+        state.assert_called_once_with("controlled-active", True, workflow=True)
+        third_party.assert_called_once_with(True, True, workflow=True)
+        dns.assert_called_once_with("dnsx", "1.1.1.1", workflow=True)
+
+    def test_closed_window_stops_later_policy_checks(self):
+        denial = HTTPException(status_code=409, detail="closed")
+        with (
+            patch.object(main, "require_open_testing_window", side_effect=denial),
+            patch.object(main, "require_state_changing_permission") as state,
+        ):
+            with self.assertRaises(HTTPException):
+                main.require_current_target_policy(
+                    "httpx",
+                    "observe",
+                    False,
+                    (60, 120, False, False, None),
+                )
+
+        state.assert_not_called()
 
 
 class DnsResolverPermissionTests(unittest.TestCase):

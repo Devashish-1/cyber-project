@@ -310,7 +310,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.159.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.160.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -473,6 +473,25 @@ def require_dns_resolver_permission(
             status_code=409,
             detail=f"The {tool_id} {subject} requires an approved target DNS resolver",
         )
+
+
+def require_current_target_policy(
+    tool_id: str,
+    profile: str,
+    uses_third_party_services: bool,
+    target_policy: tuple,
+    *,
+    workflow: bool = False,
+) -> None:
+    start_minute_utc, end_minute_utc, allow_state_changing, allow_third_party_services, dns_resolver = target_policy
+    require_open_testing_window(start_minute_utc, end_minute_utc)
+    require_state_changing_permission(profile, allow_state_changing, workflow=workflow)
+    require_third_party_service_permission(
+        uses_third_party_services,
+        allow_third_party_services,
+        workflow=workflow,
+    )
+    require_dns_resolver_permission(tool_id, dns_resolver, workflow=workflow)
 
 
 def format_testing_window(start_minute_utc: int | None, end_minute_utc: int | None) -> str:
@@ -2928,13 +2947,12 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     raise HTTPException(status_code=404, detail="Target not found in project")
                 if not target[0]:
                     raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
-                require_open_testing_window(target[1], target[2])
-                require_state_changing_permission(payload.profile, target[3])
-                require_third_party_service_permission(
+                require_current_target_policy(
+                    payload.tool_id,
+                    payload.profile,
                     bool(adapter.get("uses_third_party_services", False)),
-                    target[4],
+                    target[1:6],
                 )
-                require_dns_resolver_permission(payload.tool_id, target[5])
                 if payload.credential_profile_id is not None:
                     cursor.execute(
                         """
@@ -3026,19 +3044,14 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                 raise HTTPException(status_code=404, detail="Target not found in project")
             if not target[0]:
                 raise HTTPException(status_code=422, detail="Target authorization is not confirmed")
-            require_open_testing_window(target[1], target[2])
             for tool_id in tool_ids:
-                require_state_changing_permission(
+                require_current_target_policy(
+                    tool_id,
                     adapters[tool_id].get("profile", ""),
-                    target[3],
-                    workflow=True,
-                )
-                require_third_party_service_permission(
                     bool(adapters[tool_id].get("uses_third_party_services", False)),
-                    target[4],
+                    target[1:6],
                     workflow=True,
                 )
-                require_dns_resolver_permission(tool_id, target[5], workflow=True)
             credential_role = None
             if payload.credential_profile_id is not None:
                 cursor.execute(
@@ -4874,7 +4887,9 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                 """
                 SELECT r.project_id, r.target_id, r.source_artifact_id, r.credential_profile_id,
                        r.tool_id, r.profile,
-                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE)
+                       COALESCE(t.authorization_confirmed, s.authorization_confirmed, FALSE),
+                       t.testing_window_start_minute_utc, t.testing_window_end_minute_utc,
+                       t.allow_state_changing, t.allow_third_party_services, t.dns_resolver
                 FROM observations o
                 JOIN runs r ON r.id = o.run_id
                 LEFT JOIN targets t ON t.id = r.target_id
@@ -4886,7 +4901,10 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
             origin = cursor.fetchone()
             if origin is None:
                 raise HTTPException(status_code=404, detail="Observation not found")
-            project_id, target_id, source_artifact_id, credential_profile_id, tool_id, profile, input_authorized = origin
+            (
+                project_id, target_id, source_artifact_id, credential_profile_id,
+                tool_id, profile, input_authorized, *target_policy,
+            ) = origin
             require_project_active(cursor, project_id)
             registry_tool = load_registry().get("tools", {}).get(tool_id)
             adapter = load_adapters().get("adapters", {}).get(tool_id)
@@ -4896,6 +4914,13 @@ def retest_observation(observation_id: UUID, payload: RetestCreate) -> dict:
                 raise HTTPException(status_code=422, detail="Original adapter is no longer available")
             if registry_tool.get("execution") in {"disabled", "manual"} or adapter.get("profile") != profile:
                 raise HTTPException(status_code=422, detail="Original adapter policy no longer permits this retest")
+            if target_id is not None:
+                require_current_target_policy(
+                    tool_id,
+                    profile,
+                    bool(adapter.get("uses_third_party_services", False)),
+                    tuple(target_policy),
+                )
             adapter_runtime_admission(
                 [tool_id], load_adapters().get("adapters", {}), enforce=True
             )
