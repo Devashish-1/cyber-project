@@ -329,7 +329,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.167.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.168.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -1855,9 +1855,16 @@ def backup_status() -> dict:
         raise HTTPException(status_code=503, detail="Latest database backup name is invalid")
     timestamp = match.group(1)
     config_backup = BACKUP_ROOT / f"config-{timestamp}.tar.gz"
-    paired = config_backup.is_file() and not config_backup.is_symlink()
+    artifacts_backup = BACKUP_ROOT / f"artifacts-{timestamp}.tar.gz"
+    checksum_manifest = BACKUP_ROOT / f"backup-{timestamp}.sha256"
+    paired = all(
+        path.is_file() and not path.is_symlink()
+        for path in (config_backup, artifacts_backup, checksum_manifest)
+    )
     database_valid = False
     config_valid = False
+    artifacts_valid = False
+    checksums_valid = False
     if database_backup.stat().st_size <= 512 * 1024 * 1024:
         try:
             expanded = 0
@@ -1869,17 +1876,50 @@ def backup_status() -> dict:
             database_valid = expanded > 0
         except (OSError, EOFError, ValueError):
             database_valid = False
-    if paired and config_backup.stat().st_size <= 512 * 1024 * 1024:
+    def safe_tar(path: Path, size_limit: int, member_limit: int) -> bool:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > size_limit:
+            return False
         try:
-            with tarfile.open(config_backup, "r:gz") as archive:
+            with tarfile.open(path, "r:gz") as archive:
                 members = archive.getmembers()
-                config_valid = 0 < len(members) <= 10_000 and all(
+                return 0 < len(members) <= member_limit and all(
                     not PurePosixPath(member.name).is_absolute()
                     and ".." not in PurePosixPath(member.name).parts
+                    and not member.issym()
+                    and not member.islnk()
                     for member in members
                 )
         except (OSError, EOFError, tarfile.TarError):
-            config_valid = False
+            return False
+
+    config_valid = safe_tar(config_backup, 512 * 1024 * 1024, 10_000)
+    artifacts_valid = safe_tar(artifacts_backup, 8 * 1024 * 1024 * 1024, 100_000)
+
+    def sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    if paired and checksum_manifest.stat().st_size <= 64 * 1024:
+        expected_names = {database_backup.name, config_backup.name, artifacts_backup.name}
+        try:
+            recorded: dict[str, str] = {}
+            for line in checksum_manifest.read_text(encoding="ascii").splitlines():
+                digest, filename = line.split(maxsplit=1)
+                filename = filename.lstrip("*")
+                if not re.fullmatch(r"[0-9a-f]{64}", digest) or Path(filename).name != filename:
+                    raise ValueError("Invalid checksum entry")
+                recorded[filename] = digest
+            if set(recorded) != expected_names:
+                raise ValueError("Checksum set is incomplete")
+            checksums_valid = all(
+                sha256_file(path) == recorded[path.name]
+                for path in (database_backup, config_backup, artifacts_backup)
+            )
+        except (OSError, UnicodeDecodeError, ValueError):
+            checksums_valid = False
     created_at = datetime.fromtimestamp(database_backup.stat().st_mtime, timezone.utc)
     age_seconds = max(0, int((datetime.now(timezone.utc) - created_at).total_seconds()))
     restore_validation = {"available": False, "status": "not-run", "matches_latest": False}
@@ -1895,7 +1935,14 @@ def backup_status() -> dict:
             "backup": restore_payload.get("backup"),
             "finished_at": restore_payload.get("finished_at"),
             "row_counts": restore_payload.get("row_counts") or [],
-            "matches_latest": restore_payload.get("backup") == database_backup.name,
+            "checksums_verified": bool(restore_payload.get("checksums_verified")),
+            "artifact_members": restore_payload.get("artifact_members"),
+            "matches_latest": (
+                restore_payload.get("backup") == database_backup.name
+                and restore_payload.get("configuration") == config_backup.name
+                and restore_payload.get("artifacts") == artifacts_backup.name
+                and restore_payload.get("manifest") == checksum_manifest.name
+            ),
         }
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         pass
@@ -1907,7 +1954,7 @@ def backup_status() -> dict:
         "fresh": age_seconds <= MAX_BACKUP_AGE_HOURS * 3600,
         "max_age_hours": MAX_BACKUP_AGE_HOURS,
         "paired": paired,
-        "verified": paired and database_valid and config_valid,
+        "verified": paired and database_valid and config_valid and artifacts_valid and checksums_valid,
         "database": {
             "filename": database_backup.name,
             "size_bytes": database_backup.stat().st_size,
@@ -1917,6 +1964,16 @@ def backup_status() -> dict:
             "filename": config_backup.name if paired else None,
             "size_bytes": config_backup.stat().st_size if paired else None,
             "valid": config_valid,
+        },
+        "artifacts": {
+            "filename": artifacts_backup.name if paired else None,
+            "size_bytes": artifacts_backup.stat().st_size if paired else None,
+            "valid": artifacts_valid,
+        },
+        "manifest": {
+            "filename": checksum_manifest.name if paired else None,
+            "size_bytes": checksum_manifest.stat().st_size if paired else None,
+            "valid": checksums_valid,
         },
         "restore_validation": restore_validation,
     }

@@ -1,5 +1,5 @@
 [Unit]
-Description=Security Platform database and configuration backup
+Description=Security Platform verified database, configuration, evidence, and source backup
 Requires=docker.service
 After=docker.service network-online.target
 
