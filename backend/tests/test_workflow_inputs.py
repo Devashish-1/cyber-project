@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from app.main import validate_workflow_tool_ids
+from app.main import RUN_PLANS, validate_workflow_tool_ids
 
 
 REGISTRY = {
@@ -45,6 +45,14 @@ class WorkflowInputValidationTests(unittest.TestCase):
             self.validate(["httpx", "semgrep"], "target")
         with self.assertRaises(HTTPException):
             self.validate(["semgrep", "semgrep"], "source")
+
+    def test_deep_web_plan_has_broad_ordered_coverage(self):
+        plan = RUN_PLANS["deep-web-authorized"]
+        self.assertGreaterEqual(len(plan), 15)
+        self.assertEqual(len(plan), len(set(plan)))
+        self.assertTrue({"httpx", "whatweb", "testssl", "katana", "nuclei-reviewed", "dalfox", "zap-full"}.issubset(plan))
+        self.assertLess(plan.index("zap-baseline"), plan.index("zap-full"))
+        self.assertEqual(plan[-1], "zap-full")
 
 
 if __name__ == "__main__":

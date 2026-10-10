@@ -217,6 +217,9 @@ curl --config "$curl_config" "$base_url/run-plans" > "$work_dir/run-plans.json"
 jq -e '
   (.plans["source-secrets-and-quality"] | length) >= 1 and
   (.plans["source-dependencies-and-iac"] | length) >= 1 and
+  (.plans["deep-web-authorized"] | length) >= 15 and
+  any(.plans["deep-web-authorized"][]; .tool_id == "zap-full" and .profile == "extended-active") and
+  any(.plans["deep-web-authorized"][]; .tool_id == "dalfox" and .profile == "extended-active") and
   all(.plans["source-secrets-and-quality"][]; .profile == "source-assisted") and
   all(.plans["source-dependencies-and-iac"][]; .profile == "source-assisted")
 ' "$work_dir/run-plans.json" >/dev/null

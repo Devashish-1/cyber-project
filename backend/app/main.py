@@ -61,6 +61,11 @@ RUN_PLANS = {
     "authenticated-browser": ["httpx", "playwright"],
     "controlled-web": ["dnsx", "naabu", "nmap", "httpx", "playwright", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster", "feroxbuster", "kiterunner", "wapiti", "sqlmap-controlled"],
+    "deep-web-authorized": [
+        "httpx", "whatweb", "testssl", "naabu", "nmap", "katana", "arjun",
+        "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster",
+        "feroxbuster", "kiterunner", "wapiti", "dalfox", "zap-full",
+    ],
     "source-secrets-and-quality": ["gitleaks", "trufflehog", "semgrep", "bandit", "brakeman", "njsscan", "shellcheck", "hadolint"],
     "source-dependencies-and-iac": ["syft", "grype", "osv-scanner", "trivy", "checkov", "kics", "kubescape"],
 }
@@ -330,7 +335,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.173.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.174.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -621,7 +626,7 @@ class BatchCreate(BaseModel):
     target_id: UUID | None = None
     source_artifact_id: UUID | None = None
     credential_profile_id: UUID | None = None
-    plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web|source-secrets-and-quality|source-dependencies-and-iac)$")
+    plan_id: str | None = Field(default=None, pattern="^(observe|authenticated-browser|controlled-web|extended-web|deep-web-authorized|source-secrets-and-quality|source-dependencies-and-iac)$")
     tool_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
     template_id: UUID | None = None
     requested_by: str = Field(min_length=2, max_length=120)
