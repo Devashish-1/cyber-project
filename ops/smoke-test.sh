@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.174' "$work_dir/dashboard.html"
+grep -q 'UI v0.175' "$work_dir/dashboard.html"
 grep -q 'baseline ready' "$work_dir/dashboard.html"
 grep -q 're-upload required' "$work_dir/dashboard.html"
 grep -q 'integrity_baseline_ready' "$work_dir/dashboard.html"
@@ -541,6 +541,7 @@ if [ -n "$project_id" ]; then
     (.coverage.coverage_gaps.gaps.untested_targets | type == "array") and
     (.coverage.coverage_gaps.gaps.target_adapter_gaps | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_sources | type == "array") and
+    (.coverage.coverage_gaps.gaps.sources_without_integrity_baseline | type == "array") and
     (.coverage.coverage_gaps.gaps.source_adapter_gaps | type == "array") and
     (.coverage.coverage_gaps.gaps.untested_roles | type == "array") and
     (.coverage.coverage_gaps.external_approval_required | type == "array") and
@@ -549,6 +550,8 @@ if [ -n "$project_id" ]; then
     all(.coverage.source_coverage.artifacts[];
       (.filename | type == "string") and
       (.sha256 | type == "string") and
+      ((.content_sha256 == null) or ((.content_sha256 | type) == "string")) and
+      (.integrity_baseline_ready | type == "boolean") and
       (.attempted_adapters | type == "array") and
       (.successful_adapters | type == "array") and
       (.unattempted_adapters | type == "array")
@@ -612,6 +615,8 @@ if [ -n "$project_id" ]; then
     all(.artifacts[];
       (.filename | type == "string") and
       (.sha256 | type == "string") and
+      ((.content_sha256 == null) or ((.content_sha256 | type) == "string")) and
+      (.integrity_baseline_ready | type == "boolean") and
       (.attempted_adapters | type == "array") and
       (.successful_adapters | type == "array") and
       (.unattempted_adapters | type == "array")
@@ -629,6 +634,7 @@ if [ -n "$project_id" ]; then
     all(.gaps.target_adapter_gaps[]; (.unattempted_adapters | type == "array")) and
     (.gaps.untested_sources | type == "array") and
     (.gaps.sources_without_success | type == "array") and
+    (.gaps.sources_without_integrity_baseline | type == "array") and
     (.gaps.source_adapter_gaps | type == "array") and
     all(.gaps.source_adapter_gaps[]; (.unattempted_adapters | type == "array")) and
     (.gaps.untested_roles | type == "array") and
@@ -689,6 +695,7 @@ if [ -n "$project_id" ]; then
   grep -q '^- Unresolved adapters requiring separate third-party approval:' "$work_dir/report.md"
   grep -q '^- Targets with incomplete adapter coverage:' "$work_dir/report.md"
   grep -q '^- Source archives with incomplete adapter coverage:' "$work_dir/report.md"
+  grep -q '^- Source archives requiring re-upload for integrity baseline:' "$work_dir/report.md"
   jq -e --arg project_id "$project_id" '
     .schema == "security-platform-audit/v1" and
     .project_id == $project_id and

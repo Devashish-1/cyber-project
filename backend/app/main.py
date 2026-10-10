@@ -311,7 +311,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.164.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.165.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -4056,10 +4056,12 @@ def summarize_source_coverage(rows: list[tuple], available_adapters: list[str]) 
     available = sorted(set(available_adapters))
     available_set = set(available)
     artifacts: dict[str, dict] = {}
-    for artifact_id, filename, sha256, tool_id, status, run_count, last_finished_at in rows:
+    for artifact_id, filename, sha256, content_sha256, tool_id, status, run_count, last_finished_at in rows:
         key = str(artifact_id)
         artifact = artifacts.setdefault(key, {
             "id": artifact_id, "filename": filename, "sha256": sha256,
+            "content_sha256": content_sha256,
+            "integrity_baseline_ready": bool(content_sha256),
             "attempted_adapters": set(), "successful_adapters": set(),
             "run_count": 0, "last_finished_at": None,
         })
@@ -4092,12 +4094,12 @@ def summarize_source_coverage(rows: list[tuple], available_adapters: list[str]) 
 def fetch_source_coverage_rows(cursor, project_id: UUID) -> list[tuple]:
     cursor.execute(
         """
-        SELECT s.id, s.filename, s.sha256, r.tool_id, r.status,
+        SELECT s.id, s.filename, s.sha256, s.content_sha256, r.tool_id, r.status,
                COUNT(r.id), MAX(r.finished_at)
         FROM source_artifacts s
         LEFT JOIN runs r ON r.source_artifact_id = s.id
         WHERE s.project_id = %s
-        GROUP BY s.id, s.filename, s.sha256, r.tool_id, r.status
+        GROUP BY s.id, s.filename, s.sha256, s.content_sha256, r.tool_id, r.status
         ORDER BY s.filename, r.tool_id, r.status
         """,
         (project_id,),
@@ -4239,6 +4241,11 @@ def summarize_coverage_gaps(
             for item in source_coverage.get("artifacts", [])
             if item.get("attempted_adapters") and not item.get("successful_adapters")
         ],
+        "sources_without_integrity_baseline": [
+            {"id": item["id"], "filename": item["filename"], "sha256": item["sha256"]}
+            for item in source_coverage.get("artifacts", [])
+            if not item.get("integrity_baseline_ready")
+        ],
         "source_adapter_gaps": [
             {
                 "id": item["id"],
@@ -4348,7 +4355,7 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
             targets = cursor.fetchall()
             cursor.execute(
                 """
-                SELECT filename, sha256, file_count, compressed_size, extracted_size,
+                SELECT filename, sha256, content_sha256, file_count, compressed_size, extracted_size,
                        authorization_reference, created_at
                 FROM source_artifacts WHERE project_id = %s ORDER BY created_at
                 """,
@@ -4450,11 +4457,13 @@ def get_project_json_report(project_id: UUID, include_info: bool = True) -> Resp
                 {
                     "filename": row[0],
                     "sha256": row[1],
-                    "file_count": row[2],
-                    "compressed_size": row[3],
-                    "extracted_size": row[4],
-                    "authorization_reference": row[5],
-                    "created_at": row[6],
+                    "content_sha256": row[2],
+                    "integrity_baseline_ready": bool(row[2]),
+                    "file_count": row[3],
+                    "compressed_size": row[4],
+                    "extracted_size": row[5],
+                    "authorization_reference": row[6],
+                    "created_at": row[7],
                 }
                 for row in sources
             ],
@@ -4545,7 +4554,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
             tools = [row[0] for row in cursor.fetchall()]
             cursor.execute(
                 """
-                SELECT filename, sha256, file_count, compressed_size, extracted_size,
+                SELECT filename, sha256, content_sha256, file_count, compressed_size, extracted_size,
                        authorization_reference, created_at
                 FROM source_artifacts WHERE project_id = %s ORDER BY created_at
                 """,
@@ -4666,10 +4675,11 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         lines.append("No targets recorded.")
     lines.extend(["", "### Authorized source archives", ""])
     if sources:
-        for filename, sha256, file_count, compressed_size, extracted_size, authorization_reference, created_at in sources:
+        for filename, sha256, content_sha256, file_count, compressed_size, extracted_size, authorization_reference, created_at in sources:
             lines.extend([
                 f"- Source: `{md(filename)}` ({file_count} files, {extracted_size} extracted bytes)",
                 f"  - SHA-256: `{md(sha256)}`",
+                f"  - Extracted-content integrity baseline: {'ready (`' + md(content_sha256) + '`)' if content_sha256 else 'missing — re-upload required'}",
                 f"  - Archive size: {compressed_size} bytes",
                 f"  - Authorization reference: {md(authorization_reference)}",
                 f"  - Added: {created_at.isoformat()}",
@@ -4710,6 +4720,7 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         f"- Targets with incomplete adapter coverage: {md(target_adapter_gap_summary or 'None')}",
         f"- Untested source archives: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['untested_sources']) or 'None')}",
         f"- Source archives attempted without success: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['sources_without_success']) or 'None')}",
+        f"- Source archives requiring re-upload for integrity baseline: {md(', '.join(item['filename'] for item in coverage_gaps['gaps']['sources_without_integrity_baseline']) or 'None')}",
         f"- Source archives with incomplete adapter coverage: {md(source_adapter_gap_summary or 'None')}",
         f"- Untested authenticated roles: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['untested_roles']) or 'None')}",
         f"- Authenticated roles attempted without success: {md(', '.join(item['role_name'] for item in coverage_gaps['gaps']['roles_without_success']) or 'None')}",
@@ -4743,15 +4754,15 @@ def get_project_report(project_id: UUID, include_info: bool = False) -> str:
         "",
         "### Per-source adapter coverage",
         "",
-        "| Source archive | SHA-256 | Attempted | Successful | Untested | Runs | Latest completion |",
-        "|---|---|---:|---:|---:|---:|---|",
+        "| Source archive | SHA-256 | Integrity | Attempted | Successful | Untested | Runs | Latest completion |",
+        "|---|---|---|---:|---:|---:|---:|---|",
     ])
     lines.extend(
-        f"| {md(item['filename'])} | `{md(item['sha256'])}` | {len(item['attempted_adapters'])}/{item['available_adapter_count']} ({item['attempted_coverage_percent']}%) | {len(item['successful_adapters'])}/{item['available_adapter_count']} ({item['successful_coverage_percent']}%) | {len(item['unattempted_adapters'])} | {item['run_count']} | {item['last_finished_at'].isoformat() if item['last_finished_at'] else '—'} |"
+        f"| {md(item['filename'])} | `{md(item['sha256'])}` | {'Ready' if item['integrity_baseline_ready'] else 'Re-upload required'} | {len(item['attempted_adapters'])}/{item['available_adapter_count']} ({item['attempted_coverage_percent']}%) | {len(item['successful_adapters'])}/{item['available_adapter_count']} ({item['successful_coverage_percent']}%) | {len(item['unattempted_adapters'])} | {item['run_count']} | {item['last_finished_at'].isoformat() if item['last_finished_at'] else '—'} |"
         for item in source_coverage["artifacts"]
     )
     if not source_coverage["artifacts"]:
-        lines.append("| — | — | 0 | 0 | 0 | 0 | No authorized source archives configured |")
+        lines.append("| — | — | — | 0 | 0 | 0 | 0 | No authorized source archives configured |")
     lines.extend([
         "",
         "### Run coverage matrix",

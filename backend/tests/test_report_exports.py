@@ -383,22 +383,25 @@ class SourceCoverageSummaryTests(unittest.TestCase):
         first = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         second = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         rows = [
-            (first, "app.zip", "1" * 64, "semgrep", "succeeded", 1, NOW),
-            (first, "app.zip", "1" * 64, "gitleaks", "failed", 1, NOW),
-            (second, "api.zip", "2" * 64, None, None, 0, None),
+            (first, "app.zip", "1" * 64, "a" * 64, "semgrep", "succeeded", 1, NOW),
+            (first, "app.zip", "1" * 64, "a" * 64, "gitleaks", "failed", 1, NOW),
+            (second, "api.zip", "2" * 64, None, None, None, 0, None),
         ]
         coverage = summarize_source_coverage(rows, ["gitleaks", "semgrep"])
         artifacts = {str(item["id"]): item for item in coverage["artifacts"]}
         self.assertEqual(artifacts[str(first)]["attempted_adapters"], ["gitleaks", "semgrep"])
         self.assertEqual(artifacts[str(first)]["successful_adapters"], ["semgrep"])
         self.assertEqual(artifacts[str(first)]["successful_coverage_percent"], 50.0)
+        self.assertTrue(artifacts[str(first)]["integrity_baseline_ready"])
+        self.assertEqual(artifacts[str(first)]["content_sha256"], "a" * 64)
         self.assertEqual(artifacts[str(second)]["attempted_adapters"], [])
+        self.assertFalse(artifacts[str(second)]["integrity_baseline_ready"])
         self.assertEqual(artifacts[str(second)]["unattempted_adapters"], ["gitleaks", "semgrep"])
 
     def test_ignores_target_only_adapters(self):
         artifact_id = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
         coverage = summarize_source_coverage([
-            (artifact_id, "source.zip", "3" * 64, "httpx", "succeeded", 1, NOW),
+            (artifact_id, "source.zip", "3" * 64, "b" * 64, "httpx", "succeeded", 1, NOW),
         ], ["semgrep"])
         artifact = coverage["artifacts"][0]
         self.assertEqual(artifact["attempted_adapters"], [])
@@ -414,7 +417,7 @@ class CoverageGapSummaryTests(unittest.TestCase):
                 {"id": "t2", "base_url": "https://b.test", "attempted_adapters": ["httpx"], "successful_adapters": [], "unattempted_adapters": ["subfinder", "testssl"]},
             ]},
             {"artifacts": [
-                {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["semgrep"]},
+                {"id": "s1", "filename": "app.zip", "sha256": "1" * 64, "integrity_baseline_ready": False, "attempted_adapters": [], "successful_adapters": [], "unattempted_adapters": ["semgrep"]},
             ]},
             {"profiles": [
                 {"id": "r1", "name": "Admin", "role_name": "admin", "target": "https://a.test", "attempted_runs": 1, "successful_runs": 0},
@@ -422,10 +425,11 @@ class CoverageGapSummaryTests(unittest.TestCase):
             ["testssl", "subfinder"],
         )
         self.assertEqual(result["status"], "gaps-present")
-        self.assertEqual(result["gap_count"], 9)
+        self.assertEqual(result["gap_count"], 10)
         self.assertEqual(result["gaps"]["untested_targets"][0]["id"], "t1")
         self.assertEqual(result["gaps"]["targets_without_success"][0]["id"], "t2")
         self.assertEqual(result["gaps"]["untested_sources"][0]["filename"], "app.zip")
+        self.assertEqual(result["gaps"]["sources_without_integrity_baseline"][0]["filename"], "app.zip")
         self.assertEqual(result["gaps"]["roles_without_success"][0]["role_name"], "admin")
         self.assertEqual(result["gaps"]["target_adapter_gaps"][1]["unattempted_adapters"], ["subfinder", "testssl"])
         self.assertEqual(result["gaps"]["source_adapter_gaps"][0]["unattempted_adapters"], ["semgrep"])
