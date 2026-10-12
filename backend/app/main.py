@@ -360,7 +360,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.178.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.179.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -940,6 +940,91 @@ def parse_burp_issues(
         "duplicate_count": duplicate_count,
     }
 
+
+def parse_greenbone_results(
+    document: bytes, base_url: str, allowed_hosts: list[str]
+) -> dict:
+    if not document:
+        raise ValueError("Greenbone XML report is empty")
+    if len(document) > MAX_BURP_IMPORT_BYTES:
+        raise ValueError("Greenbone XML report exceeds 10 MiB limit")
+    lowered = document.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise ValueError("DTD and entity declarations are not accepted")
+    try:
+        root = ET.fromstring(document)
+    except ET.ParseError as exc:
+        raise ValueError("Greenbone XML report is malformed") from exc
+
+    def local_name(element: ET.Element) -> str:
+        return str(element.tag).rsplit("}", 1)[-1].lower()
+
+    def direct_child(element: ET.Element, name: str) -> ET.Element | None:
+        return next((child for child in element if local_name(child) == name), None)
+
+    def child_text(element: ET.Element, name: str, limit: int) -> str:
+        child = direct_child(element, name)
+        value = "".join(child.itertext()).strip() if child is not None else ""
+        return re.sub(r"s+", " ", value)[:limit]
+
+    allowed = {str(host).strip().lower().rstrip(".") for host in allowed_hosts}
+    base = urlsplit(base_url)
+    results = [element for element in root.iter() if local_name(element) == "result"]
+    if len(results) > MAX_BURP_IMPORT_ISSUES:
+        raise ValueError("Greenbone XML report exceeds 1,000-result limit")
+
+    observations, seen = [], set()
+    skipped_out_of_scope = 0
+    duplicate_count = 0
+    for result in results:
+        host = child_text(result, "host", 255).lower().rstrip(".")
+        if not host or host not in allowed:
+            skipped_out_of_scope += 1
+            continue
+        title = child_text(result, "name", 500) or "Greenbone finding"
+        port = child_text(result, "port", 80)
+        try:
+            score = float(child_text(result, "severity", 20) or 0)
+        except ValueError:
+            score = 0.0
+        severity = (
+            "critical" if score >= 9 else "high" if score >= 7
+            else "medium" if score >= 4 else "low" if score > 0 else "info"
+        )
+        nvt = direct_child(result, "nvt")
+        oid = str(nvt.attrib.get("oid") or "")[:160] if nvt is not None else ""
+        cve_text = child_text(nvt, "cve", 2000) if nvt is not None else ""
+        cves = sorted(set(re.findall(r"CVE-[0-9]{4}-[0-9]{4,}", cve_text.upper())))[:20]
+        scheme = base.scheme if base.scheme in {"http", "https"} else "https"
+        display_host = f"[{host}]" if ":" in host else host
+        asset = f"{scheme}://{display_host}"
+        if port and port not in {"general/tcp", "0/tcp"}:
+            asset = f"{asset} ({port})"
+        details = {
+            "source": "greenbone-xml",
+            "nvt_oid": oid,
+            "port": port,
+            "cvss_score": max(0.0, min(score, 10.0)),
+            "cves": cves,
+            "threat": child_text(result, "threat", 40),
+            "raw_report_retained": False,
+        }
+        fingerprint = hashlib.sha256(
+            f"greenbone|{oid}|{title}|{host}|{port}".encode("utf-8")
+        ).hexdigest()
+        if fingerprint in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fingerprint)
+        observations.append({
+            "type": "greenbone-finding", "title": title, "severity": severity,
+            "asset": asset[:2000], "details": details, "fingerprint": fingerprint,
+        })
+    return {
+        "observations": observations,
+        "skipped_out_of_scope": skipped_out_of_scope,
+        "duplicate_count": duplicate_count,
+    }
 
 def sarif_review_metadata(finding: dict) -> tuple[dict, dict]:
     status = str(finding.get("review_status") or "new")
@@ -2831,6 +2916,96 @@ async def import_burp_findings(
     }
 
 
+@app.post("/projects/{project_id}/imports/greenbone", status_code=201)
+async def import_greenbone_findings(
+    project_id: UUID,
+    report: UploadFile = File(...),
+    target_id: UUID = Form(...),
+    requested_by: str = Form(..., min_length=2, max_length=120),
+    authorization_reference: str = Form(..., min_length=3, max_length=500),
+    authorization_confirmed: bool = Form(...),
+) -> dict:
+    if not authorization_confirmed:
+        raise HTTPException(status_code=422, detail="Explicit Greenbone import authorization is required")
+    try:
+        filename = normalize_upload_filename(report.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not filename.lower().endswith(".xml"):
+        raise HTTPException(status_code=422, detail="Only Greenbone XML reports are accepted")
+    document = bytearray()
+    try:
+        while chunk := await report.read(1024 * 1024):
+            document.extend(chunk)
+            if len(document) > MAX_BURP_IMPORT_BYTES:
+                raise HTTPException(status_code=413, detail="Greenbone XML report exceeds 10 MiB limit")
+    finally:
+        await report.close()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
+            cursor.execute(
+                """SELECT base_url,allowed_hosts,authorization_confirmed
+                   FROM targets WHERE id = %s AND project_id = %s""",
+                (target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Authorized target not found in project")
+            if not target[2]:
+                raise HTTPException(status_code=409, detail="Target authorization is not confirmed")
+            try:
+                parsed = parse_greenbone_results(bytes(document), target[0], target[1])
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            observations = parsed["observations"]
+            if not observations:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Greenbone report contains no unique findings within the saved target scope",
+                )
+            run_id = uuid4()
+            cursor.execute(
+                """INSERT INTO runs
+                       (id,project_id,target_id,tool_id,profile,status,requested_by,
+                        started_at,finished_at)
+                   VALUES (%s,%s,%s,'greenbone','manual-import','succeeded',%s,NOW(),NOW())""",
+                (run_id, project_id, target_id, requested_by),
+            )
+            cursor.executemany(
+                """INSERT INTO observations
+                       (id,run_id,observation_type,title,severity,asset,details,fingerprint)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+                [
+                    (
+                        uuid4(), run_id, item["type"], item["title"], item["severity"],
+                        item["asset"], Jsonb(item["details"]), item["fingerprint"],
+                    )
+                    for item in observations
+                ],
+            )
+            digest = hashlib.sha256(document).hexdigest()
+            record_audit(
+                cursor, project_id, "greenbone.findings_imported", requested_by,
+                "run", run_id,
+                {
+                    "target_id": str(target_id), "filename": filename, "sha256": digest,
+                    "authorization_reference": authorization_reference,
+                    "imported_count": len(observations),
+                    "skipped_out_of_scope": parsed["skipped_out_of_scope"],
+                    "duplicate_count": parsed["duplicate_count"],
+                    "raw_report_retained": False,
+                },
+            )
+    return {
+        "run_id": run_id, "tool_id": "greenbone", "status": "succeeded",
+        "imported_count": len(observations),
+        "skipped_out_of_scope": parsed["skipped_out_of_scope"],
+        "duplicate_count": parsed["duplicate_count"],
+        "sha256": digest,
+    }
+
 def serialize_burp_import_row(row: tuple) -> dict:
     details = row[6] if isinstance(row[6], dict) else {}
     return {
@@ -2922,6 +3097,42 @@ def delete_burp_import(project_id: UUID, run_id: UUID, payload: ManualImportDele
         "deleted_observation_count": observation_count,
     }
 
+
+@app.delete("/projects/{project_id}/imports/greenbone/{run_id}")
+def delete_greenbone_import(
+    project_id: UUID, run_id: UUID, payload: ManualImportDelete
+) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            require_project_active(cursor, project_id)
+            cursor.execute(
+                """SELECT target_id,requested_by,created_at FROM runs
+                   WHERE id = %s AND project_id = %s AND tool_id = 'greenbone'
+                     AND profile = 'manual-import' AND status = 'succeeded'
+                   FOR UPDATE""",
+                (run_id, project_id),
+            )
+            imported_run = cursor.fetchone()
+            if imported_run is None:
+                raise HTTPException(status_code=404, detail="Manual Greenbone import not found")
+            cursor.execute("SELECT COUNT(*) FROM observations WHERE run_id = %s", (run_id,))
+            observation_count = int(cursor.fetchone()[0])
+            cursor.execute("DELETE FROM observations WHERE run_id = %s", (run_id,))
+            cursor.execute("DELETE FROM runs WHERE id = %s", (run_id,))
+            record_audit(
+                cursor, project_id, "greenbone.import_deleted", payload.requested_by,
+                "manual-import", run_id,
+                {
+                    "target_id": str(imported_run[0]),
+                    "original_requested_by": imported_run[1],
+                    "original_created_at": imported_run[2].isoformat(),
+                    "deleted_observation_count": observation_count,
+                },
+            )
+    return {
+        "run_id": run_id, "status": "deleted",
+        "deleted_observation_count": observation_count,
+    }
 
 @app.post("/projects/{project_id}/targets", status_code=201)
 def create_target(project_id: UUID, payload: TargetCreate) -> dict:

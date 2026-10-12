@@ -20,6 +20,7 @@ smoke_source_project_id=""
 smoke_source_artifact_id=""
 smoke_target_project_id=""
 smoke_target_id=""
+smoke_greenbone_run_id=""
 smoke_archived_project_id=""
 cleanup_smoke_test() {
   if [ -n "$smoke_source_project_id" ] && [ -n "$smoke_source_artifact_id" ]; then
@@ -27,6 +28,9 @@ cleanup_smoke_test() {
       -H 'Content-Type: application/json' -X DELETE \
       "$base_url/projects/$smoke_source_project_id/source-artifacts/$smoke_source_artifact_id" \
       -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE SOURCE ARCHIVE"}' || true
+  fi
+  if [ -n "$smoke_target_project_id" ] && [ -n "$smoke_greenbone_run_id" ]; then
+    curl --config "$curl_config" --no-fail -sS -o /dev/null       -H 'Content-Type: application/json' -X DELETE       "$base_url/projects/$smoke_target_project_id/imports/greenbone/$smoke_greenbone_run_id"       -d '{"requested_by":"smoke-cleanup","confirmation":"DELETE MANUAL IMPORT"}' || true
   fi
   if [ -n "$smoke_target_project_id" ] && [ -n "$smoke_target_id" ]; then
     curl --config "$curl_config" --no-fail -sS -o /dev/null \
@@ -48,7 +52,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.183' "$work_dir/dashboard.html"
+grep -q 'UI v0.184' "$work_dir/dashboard.html"
 grep -q 'Load and resilience access:' "$work_dir/dashboard.html"
 grep -q 'fixed at one virtual user, one iteration, and one exact base-URL request' "$work_dir/dashboard.html"
 grep -q "loadTools=input==='target'" "$work_dir/dashboard.html"
@@ -71,6 +75,9 @@ grep -q 'Delete import' "$work_dir/dashboard.html"
 grep -q 'DELETE MANUAL IMPORT' "$work_dir/dashboard.html"
 grep -q "msg('burp-import-message','Deleting the selected manual import" "$work_dir/dashboard.html"
 grep -q 'Manual import history' "$work_dir/dashboard.html"
+grep -q 'Import Greenbone report' "$work_dir/dashboard.html"
+grep -q 'raw report content, and credentials are discarded' "$work_dir/dashboard.html"
+grep -q 'function importGreenboneFindings' "$work_dir/dashboard.html"
 grep -q 'loadBurpImports' "$work_dir/dashboard.html"
 grep -q 'id="finding-provenance"' "$work_dir/dashboard.html"
 grep -q "provenance==='all'||f.provenance===provenance" "$work_dir/dashboard.html"
@@ -211,6 +218,8 @@ jq -e '
   and (.paths["/projects/{project_id}/coverage-gaps.json"] != null)
   and (.paths["/projects/{project_id}/imports/burp"].get != null)
   and (.paths["/projects/{project_id}/imports/burp"].post != null)
+  and (.paths["/projects/{project_id}/imports/greenbone"].post != null)
+  and (.paths["/projects/{project_id}/imports/greenbone/{run_id}"].delete != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}"].delete != null)
   and (.paths["/projects/{project_id}/source-artifacts/{artifact_id}/integrity"].get != null)
   and (.paths["/batches/{batch_id}/evidence-bundle"].get != null)
@@ -448,6 +457,15 @@ PY
       "authorization_confirmed":true
     }' > "$work_dir/target-create.json"
   smoke_target_id="$(jq -er '.id' "$work_dir/target-create.json")"
+  printf '%s\n' '<report><results><result id="fixture"><name>Fixture finding</name><host>127.0.0.1</host><port>65535/tcp</port><severity>7.5</severity><threat>High</threat><nvt oid="fixture.1"><cve>CVE-2021-41773</cve></nvt><description>discard me</description></result></results></report>' > "$work_dir/greenbone.xml"
+  curl --config "$curl_config" -X POST     "$base_url/projects/$project_id/imports/greenbone"     -F "report=@$work_dir/greenbone.xml;type=application/xml"     -F "target_id=$smoke_target_id"     -F "requested_by=smoke-greenbone"     -F "authorization_reference=local-greenbone-smoke"     -F "authorization_confirmed=true" > "$work_dir/greenbone-import.json"
+  smoke_greenbone_run_id="$(jq -er '.run_id' "$work_dir/greenbone-import.json")"
+  jq -e '.tool_id == "greenbone" and .status == "succeeded" and .imported_count == 1' "$work_dir/greenbone-import.json" >/dev/null
+  curl --config "$curl_config" "$base_url/runs/$smoke_greenbone_run_id/observations" > "$work_dir/greenbone-observations.json"
+  jq -e '.observations | length == 1 and .[0].type == "greenbone-finding" and .[0].severity == "high" and .[0].details.raw_report_retained == false and (.[0].details | has("description") | not)' "$work_dir/greenbone-observations.json" >/dev/null
+  curl --config "$curl_config" -H 'Content-Type: application/json' -X DELETE     "$base_url/projects/$project_id/imports/greenbone/$smoke_greenbone_run_id"     -d '{"requested_by":"smoke-greenbone-delete","confirmation":"DELETE MANUAL IMPORT"}' > "$work_dir/greenbone-delete.json"
+  jq -e '.status == "deleted" and .deleted_observation_count == 1' "$work_dir/greenbone-delete.json" >/dev/null
+  smoke_greenbone_run_id=""
   curl --config "$curl_config" "$base_url/projects/$project_id/adaptive-plan?target_id=$smoke_target_id" > "$work_dir/adaptive-plan.json"
   jq -e '(.source_observation_count == 0) and (.recommendations | length >= 1) and all(.recommendations[]; .requires_operator_approval and (.automatically_queued == false))' "$work_dir/adaptive-plan.json" >/dev/null
   curl --config "$curl_config" \

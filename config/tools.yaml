@@ -63,7 +63,7 @@ tools:
   kube-bench: {category: kubernetes, risk: medium, availability: optional, execution: manual-host-audit, automation_note: "Full CIS assessment requires explicit read-only node configuration and host PID access; never mounted by the supervised runner."}
   kubescape: {category: kubernetes, risk: low, availability: optional, execution: adapter}
   mobsf: {category: mobile, risk: low, availability: optional, execution: standalone}
-  greenbone: {category: infrastructure, risk: high, availability: optional-heavy, execution: standalone}
+  greenbone: {category: infrastructure, risk: high, availability: optional-heavy, execution: connector, official_url: "https://greenbone.github.io/docs/latest/", automation_note: "Official container stack is staged but not exposed or auto-started. Authorized XML reports can be imported through the dashboard with scope filtering, sanitization, deduplication, and audit provenance."}
   defectdojo: {category: reporting, risk: low, availability: export-ready, execution: connector, export_format: generic-findings-json, automation_note: "Sanitized Generic Findings JSON export is available in the report center; direct API sync remains credential-gated and disabled."}
   faraday: {category: reporting, risk: low, availability: export-ready, execution: connector, export_format: sarif-2.1.0, automation_note: "Sanitized SARIF 2.1.0 export is available in the report center and can be imported with Faraday's SARIF report plugin; direct API sync remains credential-gated and disabled."}
   hydra: {category: credential-testing, risk: critical, availability: manual-lab, execution: disabled}

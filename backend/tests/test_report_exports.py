@@ -15,6 +15,7 @@ from app.main import (
     build_defectdojo_report,
     normalize_upload_filename,
     parse_burp_issues,
+    parse_greenbone_results,
     serialize_burp_import_row,
     summarize_adapter_coverage,
     summarize_assessment_provenance,
@@ -180,6 +181,41 @@ def finding(**overrides) -> dict:
     result.update(overrides)
     return result
 
+
+class GreenboneImportTests(unittest.TestCase):
+    def test_imports_only_unique_in_scope_sanitized_results(self):
+        report = b"""<report><results>
+          <result id="one"><name>Apache path traversal</name><host>lab.invalid</host>
+            <port>443/tcp</port><severity>9.1</severity><threat>High</threat>
+            <nvt oid="1.3.6.1.4.1"><cve>CVE-2021-41773</cve></nvt>
+            <description>sensitive raw detail must not be retained</description>
+          </result>
+          <result id="duplicate"><name>Apache path traversal</name><host>lab.invalid</host>
+            <port>443/tcp</port><severity>9.1</severity><threat>High</threat>
+            <nvt oid="1.3.6.1.4.1"><cve>CVE-2021-41773</cve></nvt>
+          </result>
+          <result id="outside"><name>Outside</name><host>other.invalid</host>
+            <port>80/tcp</port><severity>5.0</severity><nvt oid="outside"/></result>
+        </results></report>"""
+        parsed = parse_greenbone_results(
+            report, "https://lab.invalid/", ["lab.invalid"]
+        )
+        self.assertEqual(len(parsed["observations"]), 1)
+        self.assertEqual(parsed["duplicate_count"], 1)
+        self.assertEqual(parsed["skipped_out_of_scope"], 1)
+        finding = parsed["observations"][0]
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["details"]["cves"], ["CVE-2021-41773"])
+        self.assertFalse(finding["details"]["raw_report_retained"])
+        self.assertNotIn("description", finding["details"])
+
+    def test_rejects_xml_entity_declarations(self):
+        with self.assertRaisesRegex(ValueError, "DTD and entity"):
+            parse_greenbone_results(
+                b'<!DOCTYPE report [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><report/>',
+                "https://lab.invalid/",
+                ["lab.invalid"],
+            )
 
 class DefectDojoExportTests(unittest.TestCase):
     def test_exports_supported_generic_finding_fields(self):
