@@ -71,7 +71,7 @@ tools:
   hashcat: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
   john: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
   metasploit: {category: exploitation, risk: critical, availability: manual-lab, execution: disabled, automation_note: "Exploit, payload, handler, session, post-exploitation, and arbitrary module execution remain disabled."}
-  metasploit-check-runtime: {category: evidence-validation, risk: high, availability: installed-hardened, execution: manual-lab, official_url: "https://github.com/rapid7/metasploit-framework", automation_note: "Pinned official image derived to non-root UID 65532 with Ruby capabilities removed. The default offline command prints the framework version only. Dashboard execution remains disabled until a fixed CVE-to-module map and prior-evidence gate are implemented."}
+  metasploit-check-runtime: {category: evidence-validation, risk: high, availability: installed-hardened, execution: manual-lab, official_url: "https://github.com/rapid7/metasploit-framework", automation_note: "Pinned official image derived to non-root UID 65532 with Ruby capabilities removed. The default offline command prints the framework version only. The dashboard now surfaces only fixed CVE-to-module candidates after exact CVE-plus-version evidence. Execution remains disabled until the isolated check-only adapter is separately validated."}
   netexec: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
   impacket: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
   bloodhound: {category: active-directory, risk: high, availability: manual-lab, execution: disabled}

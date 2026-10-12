@@ -81,6 +81,18 @@ ADAPTIVE_TARGET_RULES = (
     ({"sql injection", "sqli", "database error"}, ("sqlmap-controlled",), "SQL-injection-specific evidence supports the non-destructive controlled SQLMap profile."),
     ({"cve-", "known exploited", "vulnerable version"}, ("nmap-vuln-reviewed", "nuclei-reviewed"), "CVE or vulnerable-version evidence supports only reviewed vulnerability checks."),
 )
+METASPLOIT_CHECK_MAP = {
+    "CVE-2021-41773": {
+        "module": "auxiliary/scanner/http/apache_normalize_path",
+        "action": "CHECK_TRAVERSAL",
+        "required_evidence_tokens": ("apache", "2.4.49"),
+    },
+    "CVE-2021-42013": {
+        "module": "auxiliary/scanner/http/apache_normalize_path",
+        "action": "CHECK_TRAVERSAL",
+        "required_evidence_tokens": ("apache", "2.4.50"),
+    },
+}
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
@@ -348,7 +360,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.177.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.178.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2065,6 +2077,25 @@ def build_adaptive_target_plan(
         for tool_id in tools:
             add(tool_id, reason, triggers, fingerprints)
 
+    metasploit_check_candidates = []
+    for cve_id, check in METASPLOIT_CHECK_MAP.items():
+        matching = [
+            fingerprint for blob, fingerprint in evidence
+            if cve_id.lower() in blob
+            and all(token in blob for token in check["required_evidence_tokens"])
+        ]
+        if matching:
+            metasploit_check_candidates.append({
+                "cve_id": cve_id,
+                "module": check["module"],
+                "action": check["action"],
+                "evidence_fingerprints": [value for value in matching if value][:5],
+                "check_only": True,
+                "arbitrary_module_selection": False,
+                "execution_enabled": False,
+                "reason": "Exact CVE and affected Apache version are both present in prior saved evidence.",
+            })
+
     recommendations, policy_blocked = [], []
     for item in candidates.values():
         adapter = adapters[item["tool_id"]]
@@ -2095,6 +2126,7 @@ def build_adaptive_target_plan(
         "completed_tools": sorted(completed_tools),
         "recommendations": recommendations,
         "policy_blocked": policy_blocked,
+        "metasploit_check_candidates": metasploit_check_candidates,
         "disclaimer": "Evidence-derived suggestions require operator review and explicit run approval; no work is queued automatically.",
     }
 
