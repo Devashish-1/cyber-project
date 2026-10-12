@@ -54,6 +54,9 @@ RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 GREENBONE_READINESS = "security-platform:greenbone:readiness"
+GREENBONE_FEED_STATUS_PATH = Path(os.getenv("GREENBONE_FEED_STATUS_PATH", "/validation/greenbone-feed-status.json"))
+MAX_GREENBONE_FEED_STATUS_AGE_SECONDS = 3600
+GREENBONE_REQUIRED_FEEDS = frozenset({"NVT", "SCAP", "CERT", "GVMD_DATA"})
 PLATFORM_PAUSE = "security-platform:control:paused"
 RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "metasploit-cve-2021-41773-check", "metasploit-cve-2021-42013-check", "naabu", "nikto", "njsscan", "nmap", "nmap-vuln-reviewed", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
 SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
@@ -368,7 +371,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.182.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.183.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2317,8 +2320,56 @@ def build_adaptive_target_plan(
         "disclaimer": "Evidence-derived suggestions require operator review and explicit run approval; no work is queued automatically.",
     }
 
+def sanitize_greenbone_feed_status(payload: object, now: float | None = None) -> dict:
+    unknown = {"state": "unknown", "fresh": False, "checked_at": None, "feeds": []}
+    if not isinstance(payload, dict):
+        return unknown
+    checked_at = payload.get("checked_at")
+    feeds = payload.get("feeds")
+    if not isinstance(checked_at, (int, float)) or not isinstance(feeds, list):
+        return unknown
+    sanitized = []
+    seen = set()
+    for item in feeds:
+        if not isinstance(item, dict) or set(item) != {"type", "name", "version"}:
+            return unknown
+        feed_type, name, version = item["type"], item["name"], item["version"]
+        if (
+            feed_type not in GREENBONE_REQUIRED_FEEDS
+            or feed_type in seen
+            or not isinstance(name, str)
+            or not 1 <= len(name) <= 200
+            or not isinstance(version, str)
+            or re.fullmatch(r"\d{12}", version) is None
+        ):
+            return unknown
+        seen.add(feed_type)
+        sanitized.append({"type": feed_type, "name": name, "version": version})
+    if seen != GREENBONE_REQUIRED_FEEDS:
+        return unknown
+    age = (time.time() if now is None else now) - checked_at
+    fresh = 0 <= age <= MAX_GREENBONE_FEED_STATUS_AGE_SECONDS
+    return {
+        "state": "verified" if fresh else "stale",
+        "fresh": fresh,
+        "checked_at": checked_at,
+        "feeds": sorted(sanitized, key=lambda item: item["type"]),
+    }
+
+
+def load_greenbone_feed_status() -> dict:
+    try:
+        if GREENBONE_FEED_STATUS_PATH.stat().st_size > 65536:
+            return sanitize_greenbone_feed_status(None)
+        payload = json.loads(GREENBONE_FEED_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    return sanitize_greenbone_feed_status(payload)
+
+
 @app.get("/greenbone/status")
 def greenbone_status() -> dict:
+    feed_status = load_greenbone_feed_status()
     raw = queue_client().get(GREENBONE_READINESS)
     try:
         payload = json.loads(raw) if raw else None
@@ -2348,6 +2399,7 @@ def greenbone_status() -> dict:
             "unhealthy_services": [],
             "staged": True,
             "report_import_enabled": True,
+            "feeds": feed_status,
             "operator_action": "Wait for the runner readiness inventory. The control plane will not start Greenbone or submit a scan automatically.",
         }
     allowed_states = {"stopped", "initializing", "degraded", "ready"}
@@ -2366,6 +2418,7 @@ def greenbone_status() -> dict:
         "unhealthy_services": [str(value) for value in payload.get("unhealthy_services") or []][:20],
         "staged": True,
         "report_import_enabled": True,
+        "feeds": feed_status,
         "operator_action": str(payload.get("operator_action") or "")[:500],
         "disclaimer": "Greenbone remains operator-controlled. Readiness does not authorize a scan or any neighboring-address discovery.",
     }

@@ -52,7 +52,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.187' "$work_dir/dashboard.html"
+grep -q 'UI v0.188' "$work_dir/dashboard.html"
 grep -q 'Load and resilience access:' "$work_dir/dashboard.html"
 grep -q 'fixed at one virtual user, one iteration, and one exact base-URL request' "$work_dir/dashboard.html"
 grep -q "loadTools=input==='target'" "$work_dir/dashboard.html"
@@ -61,6 +61,7 @@ grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
 grep -q 'function workflowInputType' "$work_dir/dashboard.html"
 grep -q 'id="adaptive-plan"' "$work_dir/dashboard.html"
 grep -q 'id="greenbone-readiness"' "$work_dir/dashboard.html"
+grep -q 'Verified feed versions' "$work_dir/dashboard.html"
 grep -q 'async function loadAdaptivePlan' "$work_dir/dashboard.html"
 grep -q 'Nothing is queued automatically' "$work_dir/dashboard.html"
 grep -q 'Controlled Metasploit check candidates' "$work_dir/dashboard.html"
@@ -256,8 +257,12 @@ jq -e '
   (.fresh == true) and
   (.scan_submission_enabled == false) and
   (.automatic_target_discovery == false) and
-  (.report_import_enabled == true) and
-  (.state | IN("stopped", "initializing", "degraded", "ready"))
+(.report_import_enabled == true) and
+  (.state | IN("stopped", "initializing", "degraded", "ready")) and
+  (.feeds.state == "verified") and
+  (.feeds.fresh == true) and
+  (.feeds.feeds | length == 4) and
+  ([.feeds.feeds[].type] | sort == ["CERT","GVMD_DATA","NVT","SCAP"])
 ' "$work_dir/greenbone-status.json" >/dev/null
 curl --config "$curl_config" "$base_url/vulnerability-intelligence/status" > "$work_dir/vulnerability-intelligence.json"
 jq -e '
