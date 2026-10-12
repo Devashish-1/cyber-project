@@ -48,13 +48,16 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.181' "$work_dir/dashboard.html"
+grep -q 'UI v0.182' "$work_dir/dashboard.html"
 grep -q 'Load and resilience access:' "$work_dir/dashboard.html"
 grep -q 'fixed at one virtual user, one iteration, and one exact base-URL request' "$work_dir/dashboard.html"
 grep -q "loadTools=input==='target'" "$work_dir/dashboard.html"
 grep -q 'loadTools.length||target' "$work_dir/dashboard.html"
 grep -q 'id="batch-source-artifact"' "$work_dir/dashboard.html"
 grep -q 'function workflowInputType' "$work_dir/dashboard.html"
+grep -q 'id="adaptive-plan"' "$work_dir/dashboard.html"
+grep -q 'async function loadAdaptivePlan' "$work_dir/dashboard.html"
+grep -q 'Nothing is queued automatically' "$work_dir/dashboard.html"
 grep -q 'source_artifact_id:input' "$work_dir/dashboard.html"
 grep -q 'function downloadBatchEvidenceBundle' "$work_dir/dashboard.html"
 grep -q '>Workflow bundle</button>' "$work_dir/dashboard.html"
@@ -198,6 +201,7 @@ jq -e '
   and (.paths["/projects/{project_id}/imports/burp/{run_id}"].delete != null)
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
+  and (.paths["/projects/{project_id}/adaptive-plan"].get != null)
   and (.paths["/projects/{project_id}/role-coverage"] != null)
   and (.paths["/projects/{project_id}/target-coverage"] != null)
   and (.paths["/projects/{project_id}/source-coverage"] != null)
@@ -442,6 +446,8 @@ PY
       "authorization_confirmed":true
     }' > "$work_dir/target-create.json"
   smoke_target_id="$(jq -er '.id' "$work_dir/target-create.json")"
+  curl --config "$curl_config" "$base_url/projects/$project_id/adaptive-plan?target_id=$smoke_target_id" > "$work_dir/adaptive-plan.json"
+  jq -e '(.source_observation_count == 0) and (.recommendations | length >= 1) and all(.recommendations[]; .requires_operator_approval and (.automatically_queued == false))' "$work_dir/adaptive-plan.json" >/dev/null
   curl --config "$curl_config" \
     -H 'Content-Type: application/json' -X DELETE \
     "$base_url/projects/$project_id/targets/$smoke_target_id" \

@@ -70,6 +70,17 @@ RUN_PLANS = {
     "source-secrets-and-quality": ["gitleaks", "trufflehog", "semgrep", "bandit", "brakeman", "njsscan", "shellcheck", "hadolint"],
     "source-dependencies-and-iac": ["syft", "grype", "osv-scanner", "trivy", "checkov", "kics", "kubescape"],
 }
+ADAPTIVE_TARGET_RULES = (
+    ({"http", "web", "nginx", "apache", "iis"}, ("whatweb", "katana", "zap-baseline", "nuclei-reviewed"), "Web service evidence supports bounded technology, crawl, passive, and reviewed-template checks."),
+    ({"tls", "ssl", "certificate", "https"}, ("testssl",), "TLS or certificate evidence supports a dedicated configuration review."),
+    ({"port", "service", "tcp"}, ("nmap", "nmap-vuln-reviewed"), "Network-service evidence supports bounded service identification and reviewed NSE checks."),
+    ({"wordpress", "wp-content", "wp-json"}, ("wpscan-passive",), "WordPress evidence supports passive WordPress fingerprinting."),
+    ({"openapi", "swagger", "graphql", "api endpoint", "api schema"}, ("schemathesis", "kiterunner"), "API-schema or API-route evidence supports schema and route validation."),
+    ({"parameter", "query string", "form", "input field"}, ("arjun",), "Input-surface evidence supports bounded parameter discovery."),
+    ({"xss", "cross-site scripting", "javascript parameter"}, ("dalfox",), "XSS-specific evidence supports a bounded specialist validation pass."),
+    ({"sql injection", "sqli", "database error"}, ("sqlmap-controlled",), "SQL-injection-specific evidence supports the non-destructive controlled SQLMap profile."),
+    ({"cve-", "known exploited", "vulnerable version"}, ("nmap-vuln-reviewed", "nuclei-reviewed"), "CVE or vulnerable-version evidence supports only reviewed vulnerability checks."),
+)
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
 IMAGE_AUDIT_ROOT = Path(os.getenv("IMAGE_AUDIT_ROOT", "/image-audits"))
@@ -337,7 +348,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.176.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.177.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2004,6 +2015,89 @@ def backup_status() -> dict:
     }
 
 
+def build_adaptive_target_plan(
+    observations: list[dict],
+    completed_tools: set[str],
+    adapters: dict[str, dict],
+    target_policy: dict,
+) -> dict:
+    """Build a review-only next-step plan from saved evidence; never queues work."""
+    evidence = []
+    for observation in observations:
+        blob = " ".join((
+            str(observation.get("type") or ""),
+            str(observation.get("title") or ""),
+            str(observation.get("asset") or ""),
+            json.dumps(observation.get("details") or {}, sort_keys=True, default=str),
+        )).lower()
+        evidence.append((blob, str(observation.get("fingerprint") or "")))
+
+    candidates: dict[str, dict] = {}
+
+    def add(tool_id: str, reason: str, triggers: set[str], fingerprints: list[str]) -> None:
+        if tool_id in completed_tools or tool_id not in adapters:
+            return
+        adapter = adapters[tool_id]
+        if (adapter.get("input") or "target") != "target":
+            return
+        item = candidates.setdefault(tool_id, {
+            "tool_id": tool_id,
+            "profile": adapter.get("profile", "unknown"),
+            "reason": reason,
+            "triggered_by": set(),
+            "evidence_fingerprints": [],
+        })
+        item["triggered_by"].update(triggers)
+        for fingerprint in fingerprints:
+            if fingerprint and fingerprint not in item["evidence_fingerprints"]:
+                item["evidence_fingerprints"].append(fingerprint)
+
+    baseline_reason = "Baseline coverage has not yet succeeded for this target."
+    for tool_id in ("httpx", "testssl", "zap-baseline"):
+        add(tool_id, baseline_reason, {"baseline-gap"}, [])
+
+    for tokens, tools, reason in ADAPTIVE_TARGET_RULES:
+        matches = [(blob, fingerprint) for blob, fingerprint in evidence if any(token in blob for token in tokens)]
+        if not matches:
+            continue
+        triggers = {token for token in tokens if any(token in blob for blob, _ in matches)}
+        fingerprints = [fingerprint for _, fingerprint in matches][:5]
+        for tool_id in tools:
+            add(tool_id, reason, triggers, fingerprints)
+
+    recommendations, policy_blocked = [], []
+    for item in candidates.values():
+        adapter = adapters[item["tool_id"]]
+        blockers = []
+        if adapter.get("uses_third_party_services") and not target_policy.get("allow_third_party_services"):
+            blockers.append("third-party provider access is not authorized")
+        if item["profile"] == "extended-active" and not target_policy.get("allow_state_changing"):
+            blockers.append("state-changing extended-active testing is not authorized")
+        if item["profile"] == "load-resilience" and not target_policy.get("allow_load_testing"):
+            blockers.append("load/resilience testing is not authorized")
+        if item["tool_id"] in {"dnsrecon", "dnsx", "massdns"} and not target_policy.get("dns_resolver"):
+            blockers.append("no approved DNS resolver is configured")
+        serialized = {
+            **item,
+            "triggered_by": sorted(item["triggered_by"]),
+            "evidence_fingerprints": item["evidence_fingerprints"][:5],
+            "requires_operator_approval": True,
+            "automatically_queued": False,
+        }
+        if blockers:
+            serialized["policy_blockers"] = blockers
+            policy_blocked.append(serialized)
+        elif len(recommendations) < 12:
+            recommendations.append(serialized)
+
+    return {
+        "source_observation_count": len(observations),
+        "completed_tools": sorted(completed_tools),
+        "recommendations": recommendations,
+        "policy_blocked": policy_blocked,
+        "disclaimer": "Evidence-derived suggestions require operator review and explicit run approval; no work is queued automatically.",
+    }
+
 @app.get("/run-plans")
 def run_plans() -> dict:
     adapters = load_adapters().get("adapters", {})
@@ -2028,6 +2122,59 @@ def vulnerability_intel_connection() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     return connection
 
+
+@app.get("/projects/{project_id}/adaptive-plan")
+def get_adaptive_plan(project_id: UUID, target_id: UUID) -> dict:
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT base_url,allow_state_changing,allow_third_party_services,
+                          allow_load_testing,dns_resolver
+                   FROM targets WHERE id = %s AND project_id = %s""",
+                (target_id, project_id),
+            )
+            target = cursor.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Authorized target not found")
+            cursor.execute(
+                """SELECT DISTINCT tool_id FROM runs
+                   WHERE project_id = %s AND target_id = %s AND status = 'succeeded'""",
+                (project_id, target_id),
+            )
+            completed_tools = {row[0] for row in cursor.fetchall()}
+            cursor.execute(
+                """SELECT DISTINCT ON (o.fingerprint)
+                          o.observation_type,o.title,o.asset,o.details,o.fingerprint
+                   FROM observations o JOIN runs r ON r.id = o.run_id
+                   WHERE r.project_id = %s AND r.target_id = %s
+                   ORDER BY o.fingerprint,o.created_at DESC,o.id DESC""",
+                (project_id, target_id),
+            )
+            observations = [
+                {
+                    "type": row[0], "title": row[1], "asset": row[2],
+                    "details": row[3], "fingerprint": row[4],
+                }
+                for row in cursor.fetchall()
+            ]
+    plan = build_adaptive_target_plan(
+        observations,
+        completed_tools,
+        load_adapters().get("adapters", {}),
+        {
+            "allow_state_changing": bool(target[1]),
+            "allow_third_party_services": bool(target[2]),
+            "allow_load_testing": bool(target[3]),
+            "dns_resolver": target[4],
+        },
+    )
+    return {
+        "project_id": project_id,
+        "target_id": target_id,
+        "target": target[0],
+        "generated_at": datetime.now(timezone.utc),
+        **plan,
+    }
 
 @app.get("/vulnerability-intelligence/status")
 def vulnerability_intelligence_status() -> dict:
