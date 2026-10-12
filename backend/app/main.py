@@ -54,7 +54,7 @@ RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 PLATFORM_PAUSE = "security-platform:control:paused"
-RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nmap-vuln-reviewed", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "metasploit-cve-2021-41773-check", "metasploit-cve-2021-42013-check", "naabu", "nikto", "njsscan", "nmap", "nmap-vuln-reviewed", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
 SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
     "adapter", "approval-gated", "external-service-gated",
 })
@@ -84,15 +84,21 @@ ADAPTIVE_TARGET_RULES = (
 )
 METASPLOIT_CHECK_MAP = {
     "CVE-2021-41773": {
+        "tool_id": "metasploit-cve-2021-41773-check",
         "module": "auxiliary/scanner/http/apache_normalize_path",
         "action": "CHECK_TRAVERSAL",
         "required_evidence_tokens": ("apache", "2.4.49"),
     },
     "CVE-2021-42013": {
+        "tool_id": "metasploit-cve-2021-42013-check",
         "module": "auxiliary/scanner/http/apache_normalize_path",
         "action": "CHECK_TRAVERSAL",
         "required_evidence_tokens": ("apache", "2.4.50"),
     },
+}
+METASPLOIT_CHECK_TOOLS = {
+    value["tool_id"]: {"cve_id": cve_id, **value}
+    for cve_id, value in METASPLOIT_CHECK_MAP.items()
 }
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/evidence/runs"))
 SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT", "/sources"))
@@ -361,7 +367,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.180.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.181.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2145,6 +2151,57 @@ def backup_status() -> dict:
     }
 
 
+def metasploit_check_evidence(
+    cursor,
+    project_id: UUID,
+    target_id: UUID,
+    tool_id: str,
+) -> list[str]:
+    """Return active evidence fingerprints for a fixed Metasploit check."""
+    requirement = METASPLOIT_CHECK_TOOLS.get(tool_id)
+    if requirement is None:
+        return []
+    cursor.execute(
+        """
+        SELECT o.observation_type, o.title, o.asset, o.details, o.fingerprint
+        FROM observations o
+        JOIN runs r ON r.id = o.run_id
+        WHERE r.project_id = %s AND r.target_id = %s
+          AND r.status = 'succeeded'
+          AND o.review_status NOT IN ('false_positive', 'resolved')
+        ORDER BY o.created_at DESC
+        LIMIT 1000
+        """,
+        (project_id, target_id),
+    )
+    matched = []
+    required = (requirement["cve_id"].lower(), *requirement["required_evidence_tokens"])
+    for observation_type, title, asset, details, fingerprint in cursor.fetchall():
+        blob = " ".join((
+            str(observation_type or ""), str(title or ""), str(asset or ""),
+            json.dumps(details or {}, sort_keys=True, default=str),
+        )).lower()
+        if all(token in blob for token in required):
+            matched.append(str(fingerprint))
+    return matched[:5]
+
+
+def require_metasploit_check_evidence(
+    cursor,
+    project_id: UUID,
+    target_id: UUID,
+    tool_id: str,
+) -> list[str]:
+    if tool_id not in METASPLOIT_CHECK_TOOLS:
+        return []
+    fingerprints = metasploit_check_evidence(cursor, project_id, target_id, tool_id)
+    if not fingerprints:
+        raise HTTPException(
+            status_code=409,
+            detail="Fixed Metasploit check requires active prior evidence containing the exact CVE and affected Apache version",
+        )
+    return fingerprints
+
 def build_adaptive_target_plan(
     observations: list[dict],
     completed_tools: set[str],
@@ -2203,14 +2260,25 @@ def build_adaptive_target_plan(
             and all(token in blob for token in check["required_evidence_tokens"])
         ]
         if matching:
+            tool_id = check["tool_id"]
+            policy_blockers = []
+            if tool_id not in adapters:
+                policy_blockers.append("fixed check adapter is not configured")
+            if not target_policy.get("allow_state_changing"):
+                policy_blockers.append("state-changing extended-active testing is not authorized")
             metasploit_check_candidates.append({
                 "cve_id": cve_id,
+                "tool_id": tool_id,
+                "profile": "extended-active",
                 "module": check["module"],
                 "action": check["action"],
                 "evidence_fingerprints": [value for value in matching if value][:5],
                 "check_only": True,
                 "arbitrary_module_selection": False,
-                "execution_enabled": False,
+                "execution_enabled": not policy_blockers,
+                "requires_operator_approval": True,
+                "automatically_queued": False,
+                "policy_blockers": policy_blockers,
                 "reason": "Exact CVE and affected Apache version are both present in prior saved evidence.",
             })
 
@@ -3643,6 +3711,10 @@ def create_run(project_id: UUID, payload: RunCreate) -> dict:
                     bool(adapter.get("uses_third_party_services", False)),
                     target[1:7],
                 )
+                require_metasploit_check_evidence(
+                    cursor, project_id, payload.target_id, payload.tool_id
+                )
+
                 if payload.credential_profile_id is not None:
                     cursor.execute(
                         """
@@ -3750,6 +3822,10 @@ def create_batch(project_id: UUID, payload: BatchCreate) -> dict:
                         target[1:7],
                         workflow=True,
                     )
+                    require_metasploit_check_evidence(
+                        cursor, project_id, payload.target_id, tool_id
+                    )
+
             else:
                 cursor.execute(
                     """

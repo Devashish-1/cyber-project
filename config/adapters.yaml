@@ -500,6 +500,31 @@ adapters:
     controls: [single-authorized-base-url, force-disabled, enumeration-disabled, password-attacks-disabled, api-token-disabled, updates-disabled, passive-detection-only, one-thread, half-second-throttle, five-second-connect-timeout, ten-second-request-timeout, no-retries, raw-findings-traces-users-and-urls-omitted, bundled-database-read-only, non-root-read-only-container, ephemeral-runtime-cache, pinned-upstream-image]
     state: verified-upstream-image
 
+  metasploit-cve-2021-41773-check:
+    version: 6.5.5-dev
+    image: security-platform/metasploit-check@sha256:38bf8a9d155ccef0295c92006a5207fb429d356c4d989d3c00b9a514b8e37950
+    profile: extended-active
+    approval: explicit-run-state-changing-opt-in-and-exact-prior-evidence-required
+    timeout_seconds: 180
+    user: "65532:65532"
+    resources: {cpus: 1.0, memory: 1536m, pids: 192}
+    output: sanitized-fixed-check-json
+    capabilities: [fixed-cve-2021-41773-traversal-validation]
+    controls: [single-authorized-host, exact-cve-and-apache-2.4.49-evidence-gate, evidence-revalidated-at-queue-and-execution, fixed-module, fixed-check-traversal-action, fixed-cve, fixed-cgi-bin-path, arbitrary-modules-disabled, rce-action-disabled, read-file-action-disabled, payloads-disabled, handlers-disabled, sessions-disabled, post-exploitation-disabled, raw-response-not-retained, non-root, read-only-container, ephemeral-home, cap-drop-all, no-new-privileges, pinned-local-image]
+    state: verified-local-image
+
+  metasploit-cve-2021-42013-check:
+    version: 6.5.5-dev
+    image: security-platform/metasploit-check@sha256:38bf8a9d155ccef0295c92006a5207fb429d356c4d989d3c00b9a514b8e37950
+    profile: extended-active
+    approval: explicit-run-state-changing-opt-in-and-exact-prior-evidence-required
+    timeout_seconds: 180
+    user: "65532:65532"
+    resources: {cpus: 1.0, memory: 1536m, pids: 192}
+    output: sanitized-fixed-check-json
+    capabilities: [fixed-cve-2021-42013-traversal-validation]
+    controls: [single-authorized-host, exact-cve-and-apache-2.4.50-evidence-gate, evidence-revalidated-at-queue-and-execution, fixed-module, fixed-check-traversal-action, fixed-cve, fixed-cgi-bin-path, arbitrary-modules-disabled, rce-action-disabled, read-file-action-disabled, payloads-disabled, handlers-disabled, sessions-disabled, post-exploitation-disabled, raw-response-not-retained, non-root, read-only-container, ephemeral-home, cap-drop-all, no-new-privileges, pinned-local-image]
+    state: verified-local-image
   naabu:
     version: v2.6.1
     image: projectdiscovery/naabu@sha256:0b7efcd6eb4bf7be2c5cfb2bbfe091a132df0e442e549267bca818a4cef15ea4

@@ -8,7 +8,7 @@ The dashboard is bound to server localhost and is intended to be reached through
 
 - FastAPI control plane, PostgreSQL, Redis, and a multi-view web dashboard.
 - Projects with reversible read-only archival, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
-- 76 catalogued tools with 47 supervised adapters; adapter images are pinned by digest.
+- 79 catalogued tools with 49 supervised adapters; adapter images are pinned by digest.
 - Observe, controlled-active, extended-active, source-assisted, and separately opted-in load-resilience execution profiles.
 - Reviewed single-tool runs plus ordered target and source-analysis workflow templates with cancellation and emergency stop. The `deep-web-authorized` preset performs broad fingerprinting, TLS and network checks, crawling, parameter and content discovery, reviewed vulnerability checks, focused XSS testing, and bounded full DAST after one explicit scope-and-impact approval.
 - Dedicated Docker runner with read-only filesystems, dropped capabilities, non-root execution, resource limits, bounded output, and no Docker socket inside scanner containers.
@@ -17,6 +17,10 @@ The dashboard is bound to server localhost and is intended to be reached through
 - Sanitized Burp Suite XML finding import. Raw requests, responses, cookies, and credentials are discarded; manual imports remain distinct from supervised coverage.
 - Adapter readiness, storage and queue admission, deployment confinement, backup status, image audit history, and health monitoring.
 - Local vulnerability intelligence index populated from the NVD CVE 2.0 API, CISA Known Exploited Vulnerabilities catalog, and FIRST EPSS daily dataset. The API exposes source freshness, record counts, and evidence for exact CVE identifiers; it does not treat a database match as proof that a target is vulnerable.
+- Evidence-driven next-step planning recommends only policy-compatible adapters from saved findings and never queues work automatically.
+- Greenbone XML reports can be imported through a scope-filtered, sanitized, auditable connector; the heavy scanner stack remains opt-in and is not auto-started.
+- Two Metasploit validation adapters are fixed to the Apache path-traversal `CHECK_TRAVERSAL` action for CVE-2021-41773 and CVE-2021-42013. They require exact active CVE-plus-version evidence, extended-active target opt-in, explicit operator approval, and runner-time evidence revalidation. Arbitrary modules, RCE/read-file actions, payloads, handlers, sessions, post-exploitation, and raw response retention remain disabled.
+- Third-party provider readiness reports only configured/missing environment-variable names. Secret values are never returned or injected into tool containers.
 
 Runtime proof is deliberately separate from implementation status. Adapters that depend on third-party discovery providers remain marked as requiring separate authorization until they are tested against an explicitly approved target.
 

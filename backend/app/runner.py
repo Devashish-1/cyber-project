@@ -99,6 +99,20 @@ MAX_TOOL_LOG_LINES = int(os.getenv("MAX_TOOL_LOG_LINES", "20000"))
 MAX_RUN_EVIDENCE_BYTES = int(os.getenv("MAX_RUN_EVIDENCE_BYTES", str(64 * 1024 * 1024)))
 MAX_RUN_EVIDENCE_FILES = int(os.getenv("MAX_RUN_EVIDENCE_FILES", "32"))
 MAX_CONTAINER_ARCHIVE_BYTES = MAX_TOOL_OUTPUT_BYTES + 2 * 1024 * 1024
+METASPLOIT_CHECK_TOOLS = {
+    "metasploit-cve-2021-41773-check": {
+        "cve_id": "CVE-2021-41773",
+        "module": "auxiliary/scanner/http/apache_normalize_path",
+        "action": "CHECK_TRAVERSAL",
+        "required_evidence_tokens": ("apache", "2.4.49"),
+    },
+    "metasploit-cve-2021-42013-check": {
+        "cve_id": "CVE-2021-42013",
+        "module": "auxiliary/scanner/http/apache_normalize_path",
+        "action": "CHECK_TRAVERSAL",
+        "required_evidence_tokens": ("apache", "2.4.50"),
+    },
+}
 LOG_TRUNCATION_MARKER = b"[security-platform: earlier tool output truncated]\n"
 if not 1024 <= MAX_TOOL_OUTPUT_BYTES <= 64 * 1024 * 1024:
     raise RuntimeError("MAX_TOOL_OUTPUT_BYTES must be between 1 KiB and 64 MiB")
@@ -538,7 +552,7 @@ def get_run(run_id: UUID) -> dict | None:
                        t.testing_window_end_minute_utc,
                        t.allow_state_changing,
                        t.allow_third_party_services,
-                       t.allow_load_testing
+                       t.allow_load_testing, r.project_id, r.target_id
                 FROM runs r
                 LEFT JOIN targets t ON t.id = r.target_id
                 LEFT JOIN source_artifacts s ON s.id = r.source_artifact_id
@@ -577,8 +591,40 @@ def get_run(run_id: UUID) -> dict | None:
         "target_allow_state_changing": row[23],
         "target_allow_third_party_services": row[24],
         "target_allow_load_testing": row[25],
+        "project_id": row[26],
+        "target_id": row[27],
     }
 
+
+def metasploit_check_evidence_valid(run: dict) -> bool:
+    requirement = METASPLOIT_CHECK_TOOLS.get(run["tool_id"])
+    if requirement is None:
+        return True
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT o.observation_type, o.title, o.asset, o.details
+                FROM observations o
+                JOIN runs r ON r.id = o.run_id
+                WHERE r.project_id = %s AND r.target_id = %s
+                  AND r.status = 'succeeded'
+                  AND o.review_status NOT IN ('false_positive', 'resolved')
+                ORDER BY o.created_at DESC
+                LIMIT 1000
+                """,
+                (run["project_id"], run["target_id"]),
+            )
+            rows = cursor.fetchall()
+    required = (requirement["cve_id"].lower(), *requirement["required_evidence_tokens"])
+    for observation_type, title, asset, details in rows:
+        blob = " ".join((
+            str(observation_type or ""), str(title or ""), str(asset or ""),
+            json.dumps(details or {}, sort_keys=True, default=str),
+        )).lower()
+        if all(token in blob for token in required):
+            return True
+    return False
 
 def effective_timeout_seconds(adapter: dict, run: dict) -> int:
     adapter_timeout = max(30, min(int(adapter.get("timeout_seconds", 600)), 7200))
@@ -776,6 +822,34 @@ def build_command(
             "-o", "json",
             "-q",
         ]
+    if tool_id in METASPLOIT_CHECK_TOOLS:
+        requirement = METASPLOIT_CHECK_TOOLS[tool_id]
+        target = urlsplit(base_url)
+        hostname = (target.hostname or "").lower().rstrip(".")
+        if target.scheme not in {"http", "https"} or not hostname:
+            raise ValueError("Metasploit fixed check requires an HTTP(S) target")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+                raise ValueError("Metasploit fixed check target hostname is invalid")
+        try:
+            port = target.port or (443 if target.scheme == "https" else 80)
+        except ValueError as exc:
+            raise ValueError("Metasploit fixed check target port is invalid") from exc
+        script = "; ".join((
+            f"use {requirement['module']}",
+            f"set RHOSTS {hostname}",
+            f"set RPORT {port}",
+            f"set SSL {'true' if target.scheme == 'https' else 'false'}",
+            "set TARGETURI /cgi-bin",
+            "set DEPTH 5",
+            f"set CVE {requirement['cve_id']}",
+            f"set ACTION {requirement['action']}",
+            "run",
+            "exit -y",
+        ))
+        return ["-q", "-x", script]
     if tool_id == "sqlmap-controlled":
         target = urlsplit(base_url)
         if target.scheme not in {"http", "https"} or not target.netloc:
@@ -2419,6 +2493,88 @@ def write_sqlmap_output(raw_output: bytes, output_file: Path) -> None:
         encoding="utf-8",
     )
 
+
+def write_metasploit_check_output(logs: bytes, output_file: Path, tool_id: str) -> None:
+    requirement = METASPLOIT_CHECK_TOOLS[tool_id]
+    text = logs.decode("utf-8", errors="replace")
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    vulnerable_marker = f"The target is vulnerable to {requirement['cve_id']}"
+    safe_marker = "The target is not vulnerable"
+    if vulnerable_marker in text:
+        outcome = "vulnerable"
+    elif safe_marker in text:
+        outcome = "not-vulnerable"
+    elif "No response, target seems down" in text:
+        outcome = "no-response"
+    else:
+        outcome = "inconclusive"
+    output_file.write_text(
+        json.dumps({
+            "kind": "metasploit-fixed-check",
+            "cve_id": requirement["cve_id"],
+            "module": requirement["module"],
+            "action": requirement["action"],
+            "outcome": outcome,
+            "raw_response_retained": False,
+        }, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def normalize_metasploit_check(
+    run_id: UUID,
+    output_file: Path,
+    base_url: str,
+) -> int:
+    try:
+        payload = json.loads(output_file.read_text(encoding="utf-8").splitlines()[0])
+        cve_id = str(payload["cve_id"])
+        module = str(payload["module"])
+        action = str(payload["action"])
+        outcome = str(payload["outcome"])
+        if (
+            payload.get("kind") != "metasploit-fixed-check"
+            or action != "CHECK_TRAVERSAL"
+            or outcome not in {"vulnerable", "not-vulnerable", "no-response", "inconclusive"}
+        ):
+            return 0
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError):
+        return 0
+    severity = "high" if outcome == "vulnerable" else "info"
+    title = (
+        f"Fixed Metasploit check indicates {cve_id}"
+        if outcome == "vulnerable"
+        else f"Fixed Metasploit check completed for {cve_id}: {outcome}"
+    )
+    details = {
+        "cve_id": cve_id,
+        "module": module,
+        "action": action,
+        "outcome": outcome,
+        "check_only": True,
+        "arbitrary_module_selection": False,
+        "raw_response_retained": False,
+    }
+    fingerprint = hashlib.sha256(
+        f"metasploit-fixed-check|{cve_id}|{base_url}|{outcome}".encode()
+    ).hexdigest()
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO observations
+                    (id, run_id, observation_type, title, severity, asset, details, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (run_id, fingerprint) DO UPDATE SET
+                    title = EXCLUDED.title, severity = EXCLUDED.severity,
+                    asset = EXCLUDED.asset, details = EXCLUDED.details
+                """,
+                (
+                    uuid4(), run_id, "metasploit-fixed-check", title, severity,
+                    base_url, json.dumps(details), fingerprint,
+                ),
+            )
+    return 1
 
 def normalize_sqlmap(run_id: UUID, output_file: Path) -> int:
     records = []
@@ -5040,6 +5196,9 @@ def execute_run(run_id: UUID) -> None:
         if not target_host or target_host not in allowed_hosts:
             set_status(run_id, "failed", "Target host is not present in the saved allowed-host scope")
             return
+        if run["tool_id"] in METASPLOIT_CHECK_TOOLS and not metasploit_check_evidence_valid(run):
+            set_status(run_id, "failed", "Required exact CVE and affected Apache-version evidence is no longer active")
+            return
 
     timeout_seconds = effective_timeout_seconds(adapter, run)
     run_dir = EVIDENCE_ROOT / str(run_id)
@@ -5308,6 +5467,8 @@ def execute_run(run_id: UUID) -> None:
                 if run["tool_id"] == "osv-scanner" else
                 {"HOME": "/tmp", "GRYPE_CHECK_FOR_APP_UPDATE": "false", "GRYPE_DB_AUTO_UPDATE": "false", "GRYPE_DB_CACHE_DIR": "/cache"}
                 if run["tool_id"] == "grype" else
+                {"HOME": "/home/msfcheck"}
+                if run["tool_id"] in METASPLOIT_CHECK_TOOLS else
                 {"HOME": "/tmp"}
                 if run["tool_id"] in {"schemathesis", "sqlmap-controlled"} else
                 {"HOME": "/tmp", "SYFT_CHECK_FOR_APP_UPDATE": "false", "SYFT_CACHE_DIR": "/tmp"}
@@ -5317,7 +5478,7 @@ def execute_run(run_id: UUID) -> None:
                 {"HOME": "/tmp/trivy-home", "XDG_CACHE_HOME": "/tmp/trivy-xdg"}
                 if run["tool_id"] == "trivy" else None
             ),
-            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl", "theharvester"} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
+            working_dir="/src" if input_type == "source" else "/tmp" if run["tool_id"] in {"schemathesis", "sqlmap-controlled", "testssl", "theharvester", *METASPLOIT_CHECK_TOOLS} else "/zap/wrk" if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else None,
             entrypoint=container_entrypoint,
             # These reports must survive process exit long enough for docker cp;
             # Docker discards tmpfs contents when the stopped container unmounts.
@@ -5359,6 +5520,11 @@ def execute_run(run_id: UUID) -> None:
                     **(
                         {"/var/lib/spiderfoot": "rw,nosuid,nodev,noexec,size=192m,uid=999,gid=999,mode=0700"}
                         if run["tool_id"] == "spiderfoot"
+                        else {}
+                    ),
+                    **(
+                        {"/home/msfcheck": "rw,nosuid,nodev,noexec,size=128m,uid=65532,gid=65532,mode=0700"}
+                        if run["tool_id"] in METASPLOIT_CHECK_TOOLS
                         else {}
                     ),
                     **(
@@ -5667,6 +5833,12 @@ def execute_run(run_id: UUID) -> None:
                 write_dalfox_output(capture_container_logs(container, stdout=True, stderr=False), output_file)
             else:
                 output_file.write_bytes(logs)
+        elif run["tool_id"] in METASPLOIT_CHECK_TOOLS:
+            (run_dir / "tool.log").write_text(
+                "Metasploit raw console and HTTP response content omitted; only the fixed check outcome is retained.\n",
+                encoding="utf-8",
+            )
+            write_metasploit_check_output(logs, output_file, run["tool_id"])
         elif run["tool_id"] == "sqlmap-controlled":
             (run_dir / "tool.log").write_text(
                 "SQLmap raw console output omitted; findings and payloads sanitized.\n",
@@ -5751,7 +5923,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 4} if run["tool_id"] == "wpscan-passive" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "k6": normalize_k6, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nmap-vuln-reviewed": normalize_nmap_vuln, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "k6": normalize_k6, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "metasploit-cve-2021-41773-check": normalize_metasploit_check, "metasploit-cve-2021-42013-check": normalize_metasploit_check, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nmap-vuln-reviewed": normalize_nmap_vuln, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             normalizer = normalizers[run["tool_id"]]
             if run["tool_id"] in {"ffuf", "httpx", "katana", "nuclei-reviewed"}:
                 observation_count = normalizer(
@@ -5763,7 +5935,7 @@ def execute_run(run_id: UUID) -> None:
             elif run["tool_id"] in {"naabu", "nmap", "nmap-vuln-reviewed"}:
                 expected_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
                 observation_count = normalizer(run_id, output_file, expected_host)
-            elif run["tool_id"] == "k6":
+            elif run["tool_id"] == "k6" or run["tool_id"] in METASPLOIT_CHECK_TOOLS:
                 observation_count = normalizer(run_id, output_file, run["base_url"])
             else:
                 observation_count = normalizer(run_id, output_file)

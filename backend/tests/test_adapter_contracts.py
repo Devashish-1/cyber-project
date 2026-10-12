@@ -21,6 +21,7 @@ from app.runner import (
     hostname_is_exact_target,
     nmap_host_is_target,
     normalize_k6,
+    write_metasploit_check_output,
 )
 
 
@@ -92,6 +93,43 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(command[command.index("--max-rate") + 1], "10")
         self.assertEqual(command[command.index("-p") + 1], "80,443,8000,8080,8443,8888")
 
+    def test_metasploit_checks_are_fixed_and_non_exploitative(self):
+        expected = {
+            "metasploit-cve-2021-41773-check": "CVE-2021-41773",
+            "metasploit-cve-2021-42013-check": "CVE-2021-42013",
+        }
+        for tool_id, cve_id in expected.items():
+            with self.subTest(tool_id=tool_id):
+                adapter = self.adapters[tool_id]
+                command = self.command_for(tool_id)
+                script = command[command.index("-x") + 1]
+                self.assertEqual(command[:2], ["-q", "-x"])
+                self.assertIn("use auxiliary/scanner/http/apache_normalize_path", script)
+                self.assertIn(f"set CVE {cve_id}", script)
+                self.assertIn("set ACTION CHECK_TRAVERSAL", script)
+                self.assertIn("set TARGETURI /cgi-bin", script)
+                for forbidden in ("CHECK_RCE", "READ_FILE", "payload", "handler", "session", "exploit"):
+                    self.assertNotIn(forbidden, script.lower())
+                self.assertEqual(adapter["profile"], "extended-active")
+                self.assertEqual(adapter["user"], "65532:65532")
+                self.assertIn("arbitrary-modules-disabled", adapter["controls"])
+                self.assertIn("raw-response-not-retained", adapter["controls"])
+    def test_metasploit_writer_never_retains_response_content(self):
+        raw = (
+            b"[+] 127.0.0.1:80 - The target is vulnerable to CVE-2021-41773.\n"
+            b"root:x:0:0:root:/root:/bin/bash\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "metasploit.jsonl"
+            write_metasploit_check_output(
+                raw, output, "metasploit-cve-2021-41773-check"
+            )
+            retained = output.read_text(encoding="utf-8")
+            payload = json.loads(retained)
+        self.assertEqual(payload["outcome"], "vulnerable")
+        self.assertFalse(payload["raw_response_retained"])
+        self.assertNotIn("root:x:0:0", retained)
+        self.assertNotIn("/bin/bash", retained)
     def test_zap_profiles_have_explicit_time_bounds(self):
         expected = {"zap-passive": "3", "zap-baseline": "5", "zap-full": "15"}
         for tool_id, minutes in expected.items():
