@@ -89,6 +89,7 @@ RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
+GREENBONE_READINESS = "security-platform:greenbone:readiness"
 RUNNER_HEARTBEAT_TTL = 15
 RUNNER_READINESS_TTL = 180
 POLL_SECONDS = 1.0
@@ -195,6 +196,63 @@ def collect_adapter_readiness(adapters: dict, client, checked_at: float | None =
     }
 
 
+GREENBONE_REQUIRED_SERVICES = frozenset({
+    "redis-server", "pg-gvm", "gvmd", "gsad", "nginx", "openvasd", "ospd-openvas",
+})
+
+
+def summarize_greenbone_containers(containers: list, checked_at: float | None = None) -> dict:
+    services = []
+    for container in containers:
+        labels = container.labels or {}
+        service = str(labels.get("com.docker.compose.service") or "")
+        project = str(labels.get("com.docker.compose.project") or "")
+        image = str((container.attrs.get("Config") or {}).get("Image") or "")
+        if service not in GREENBONE_REQUIRED_SERVICES:
+            continue
+        if "greenbone" not in image.lower() and "greenbone" not in project.lower():
+            continue
+        state_payload = container.attrs.get("State") or {}
+        status = str(state_payload.get("Status") or container.status or "unknown")
+        health = str((state_payload.get("Health") or {}).get("Status") or "none")
+        services.append({"service": service, "status": status, "health": health})
+    services.sort(key=lambda item: item["service"])
+    found = {item["service"] for item in services}
+    missing = sorted(GREENBONE_REQUIRED_SERVICES - found)
+    unhealthy = sorted(
+        item["service"] for item in services
+        if item["status"] in {"dead", "removing", "restarting"} or item["health"] == "unhealthy"
+    )
+    not_running = sorted(item["service"] for item in services if item["status"] != "running")
+    if not services:
+        state = "stopped"
+    elif unhealthy:
+        state = "degraded"
+    elif missing or not_running:
+        state = "initializing"
+    else:
+        state = "ready"
+    return {
+        "checked_at": checked_at if checked_at is not None else time.time(),
+        "state": state,
+        "stack_detected": bool(services),
+        "scan_submission_enabled": False,
+        "automatic_target_discovery": False,
+        "required_services": sorted(GREENBONE_REQUIRED_SERVICES),
+        "missing_services": missing,
+        "unhealthy_services": unhealthy,
+        "services": services,
+        "operator_action": (
+            "Use the local Greenbone UI to create one explicitly authorized task; export XML and import it through the scoped connector."
+            if state == "ready" else
+            "The optional Greenbone stack is stopped or still initializing; no scan task can be submitted by this control plane."
+        ),
+    }
+
+
+def collect_greenbone_readiness(client, checked_at: float | None = None) -> dict:
+    return summarize_greenbone_containers(client.containers.list(all=True), checked_at)
+
 def adapter_readiness_loop() -> None:
     cache = redis.from_url(
         REDIS_URL,
@@ -209,6 +267,8 @@ def adapter_readiness_loop() -> None:
             client = docker.from_env()
             payload = collect_adapter_readiness(adapters, client)
             cache.set(RUNNER_READINESS, json.dumps(payload, separators=(",", ":")), ex=RUNNER_READINESS_TTL)
+            greenbone = collect_greenbone_readiness(client)
+            cache.set(GREENBONE_READINESS, json.dumps(greenbone, separators=(",", ":")), ex=RUNNER_READINESS_TTL)
         except (OSError, yaml.YAMLError, redis.RedisError, docker.errors.DockerException) as exc:
             print(f"adapter readiness error: {exc}", flush=True)
         finally:

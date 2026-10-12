@@ -53,6 +53,7 @@ RUN_QUEUE = "security-platform:runs"
 RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
+GREENBONE_READINESS = "security-platform:greenbone:readiness"
 PLATFORM_PAUSE = "security-platform:control:paused"
 RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "metasploit-cve-2021-41773-check", "metasploit-cve-2021-42013-check", "naabu", "nikto", "njsscan", "nmap", "nmap-vuln-reviewed", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
 SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
@@ -367,7 +368,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.181.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.182.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2314,6 +2315,59 @@ def build_adaptive_target_plan(
         "policy_blocked": policy_blocked,
         "metasploit_check_candidates": metasploit_check_candidates,
         "disclaimer": "Evidence-derived suggestions require operator review and explicit run approval; no work is queued automatically.",
+    }
+
+@app.get("/greenbone/status")
+def greenbone_status() -> dict:
+    raw = queue_client().get(GREENBONE_READINESS)
+    try:
+        payload = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+    checked_at = payload.get("checked_at") if isinstance(payload, dict) else None
+    fresh = isinstance(checked_at, (int, float)) and 0 <= time.time() - checked_at <= MAX_RUNNER_READINESS_AGE_SECONDS
+    services = payload.get("services") if isinstance(payload, dict) else None
+    valid_services = (
+        isinstance(services, list)
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"service", "status", "health"}
+            and all(isinstance(item[key], str) for key in ("service", "status", "health"))
+            for item in services
+        )
+    )
+    if not fresh or not valid_services:
+        return {
+            "state": "unknown",
+            "stack_detected": False,
+            "fresh": False,
+            "scan_submission_enabled": False,
+            "automatic_target_discovery": False,
+            "services": [],
+            "missing_services": [],
+            "unhealthy_services": [],
+            "staged": True,
+            "report_import_enabled": True,
+            "operator_action": "Wait for the runner readiness inventory. The control plane will not start Greenbone or submit a scan automatically.",
+        }
+    allowed_states = {"stopped", "initializing", "degraded", "ready"}
+    state = str(payload.get("state") or "unknown")
+    if state not in allowed_states:
+        state = "unknown"
+    return {
+        "state": state,
+        "stack_detected": bool(payload.get("stack_detected")),
+        "fresh": True,
+        "checked_at": checked_at,
+        "scan_submission_enabled": False,
+        "automatic_target_discovery": False,
+        "services": services,
+        "missing_services": [str(value) for value in payload.get("missing_services") or []][:20],
+        "unhealthy_services": [str(value) for value in payload.get("unhealthy_services") or []][:20],
+        "staged": True,
+        "report_import_enabled": True,
+        "operator_action": str(payload.get("operator_action") or "")[:500],
+        "disclaimer": "Greenbone remains operator-controlled. Readiness does not authorize a scan or any neighboring-address discovery.",
     }
 
 @app.get("/providers/status")
