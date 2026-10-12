@@ -44,6 +44,12 @@ services:
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?Set CREDENTIAL_ENCRYPTION_KEY in .env}
       TOOL_REGISTRY_PATH: /app/config/tools.yaml
       ADAPTERS_PATH: /app/config/adapters.yaml
+      PROVIDER_REGISTRY_PATH: /app/config/providers.yaml
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      SECURITYTRAILS_API_KEY: ${SECURITYTRAILS_API_KEY:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      CENSYS_API_ID: ${CENSYS_API_ID:-}
+      CENSYS_API_SECRET: ${CENSYS_API_SECRET:-}
       EVIDENCE_ROOT: /evidence/runs
       SOURCE_ROOT: /sources
       IMAGE_AUDIT_ROOT: /image-audits

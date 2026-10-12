@@ -1,0 +1,26 @@
+providers:
+  crtsh:
+    adapters: [amass, spiderfoot, theharvester]
+    credential_env: []
+    mode: public-service
+    note: Public certificate-transparency queries still require target-level third-party authorization.
+  shodan:
+    adapters: [subfinder, theharvester]
+    credential_env: [SHODAN_API_KEY]
+    mode: credential-gated
+    note: Optional provider; credentials are never returned by the API or passed to tools automatically.
+  securitytrails:
+    adapters: [subfinder, amass]
+    credential_env: [SECURITYTRAILS_API_KEY]
+    mode: credential-gated
+    note: Optional provider; enable only after reviewing provider terms and target authorization.
+  virustotal:
+    adapters: [subfinder, amass]
+    credential_env: [VIRUSTOTAL_API_KEY]
+    mode: credential-gated
+    note: Optional provider; target data may be sent to the provider when explicitly enabled in a future adapter.
+  censys:
+    adapters: [amass, theharvester]
+    credential_env: [CENSYS_API_ID, CENSYS_API_SECRET]
+    mode: credential-gated
+    note: Both identifier and secret are required; values remain redacted.

@@ -11,6 +11,7 @@ from app.main import (
     require_load_testing_permission,
     require_state_changing_permission,
     require_third_party_service_permission,
+    summarize_provider_status,
     testing_window_allows,
 )
 
@@ -164,6 +165,47 @@ class TestingWindowTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("testing window", raised.exception.detail)
 
+
+class ProviderReadinessTests(unittest.TestCase):
+    def test_reports_presence_without_returning_secret_values(self):
+        registry = {
+            "providers": {
+                "public": {
+                    "adapters": ["spiderfoot"],
+                    "credential_env": [],
+                    "mode": "public-service",
+                },
+                "private": {
+                    "adapters": ["subfinder"],
+                    "credential_env": ["PROVIDER_SECRET"],
+                    "mode": "credential-gated",
+                },
+            }
+        }
+        status = summarize_provider_status(
+            registry, {"PROVIDER_SECRET": "do-not-return-this-value"}
+        )
+        providers = {item["id"]: item for item in status["providers"]}
+        self.assertTrue(providers["public"]["configured"])
+        self.assertTrue(providers["private"]["configured"])
+        self.assertFalse(providers["private"]["credentials_exposed"])
+        self.assertFalse(providers["private"]["automatic_tool_injection"])
+        self.assertNotIn("do-not-return-this-value", repr(status))
+        self.assertFalse(status["credential_values_returned"])
+
+    def test_lists_missing_credential_names_only(self):
+        registry = {
+            "providers": {
+                "private": {
+                    "adapters": ["amass"],
+                    "credential_env": ["FIRST_KEY", "SECOND_KEY"],
+                }
+            }
+        }
+        status = summarize_provider_status(registry, {"FIRST_KEY": "present"})
+        provider = status["providers"][0]
+        self.assertFalse(provider["configured"])
+        self.assertEqual(provider["missing_credentials"], ["SECOND_KEY"])
 
 if __name__ == "__main__":
     unittest.main()

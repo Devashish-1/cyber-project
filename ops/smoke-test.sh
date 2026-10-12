@@ -52,7 +52,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.184' "$work_dir/dashboard.html"
+grep -q 'UI v0.185' "$work_dir/dashboard.html"
 grep -q 'Load and resilience access:' "$work_dir/dashboard.html"
 grep -q 'fixed at one virtual user, one iteration, and one exact base-URL request' "$work_dir/dashboard.html"
 grep -q "loadTools=input==='target'" "$work_dir/dashboard.html"
@@ -91,6 +91,9 @@ grep -q 'Read-only viewer mode' "$work_dir/dashboard.html"
 grep -q "const mutatingActions=new Set" "$work_dir/dashboard.html"
 grep -q 'new MutationObserver' "$work_dir/dashboard.html"
 grep -q 'id="tool-status"' "$work_dir/dashboard.html"
+grep -q 'id="provider-readiness"' "$work_dir/dashboard.html"
+grep -q 'Credential values returned:' "$work_dir/dashboard.html"
+grep -q 'function loadProviderStatus' "$work_dir/dashboard.html"
 grep -q 'value="approval-required">External approval required' "$work_dir/dashboard.html"
 grep -q "label:'external approval required'" "$work_dir/dashboard.html"
 grep -q 'requires target-level opt-in and explicit authorization' "$work_dir/dashboard.html"
@@ -211,6 +214,7 @@ jq -e '
   and (.paths["/projects/{project_id}/audit-events.json"] != null)
   and (.paths["/projects/{project_id}/adapter-coverage"] != null)
   and (.paths["/projects/{project_id}/adaptive-plan"].get != null)
+  and (.paths["/providers/status"].get != null)
   and (.paths["/projects/{project_id}/role-coverage"] != null)
   and (.paths["/projects/{project_id}/target-coverage"] != null)
   and (.paths["/projects/{project_id}/source-coverage"] != null)
@@ -239,6 +243,12 @@ jq -e '
   all(.plans["source-dependencies-and-iac"][]; .profile == "source-assisted")
 ' "$work_dir/run-plans.json" >/dev/null
 
+curl --config "$curl_config" "$base_url/providers/status" > "$work_dir/providers.json"
+jq -e '
+  (.credential_values_returned == false) and
+  (.total_count >= 1) and
+  all(.providers[]; (.credentials_exposed == false) and (.automatic_tool_injection == false))
+' "$work_dir/providers.json" >/dev/null
 curl --config "$curl_config" "$base_url/vulnerability-intelligence/status" > "$work_dir/vulnerability-intelligence.json"
 jq -e '
   (.available == true) and

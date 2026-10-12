@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 REGISTRY_PATH = Path(os.getenv("TOOL_REGISTRY_PATH", "/app/config/tools.yaml"))
 ADAPTERS_PATH = Path(os.getenv("ADAPTERS_PATH", "/app/config/adapters.yaml"))
+PROVIDER_REGISTRY_PATH = Path(os.getenv("PROVIDER_REGISTRY_PATH", "/app/config/providers.yaml"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 CONTROL_PLANE_TOKEN = os.environ["CONTROL_PLANE_TOKEN"]
@@ -360,7 +361,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.179.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.180.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -769,6 +770,38 @@ def load_adapters() -> dict:
     with ADAPTERS_PATH.open("r", encoding="utf-8") as adapters_file:
         return yaml.safe_load(adapters_file)
 
+
+def load_provider_registry() -> dict:
+    with PROVIDER_REGISTRY_PATH.open("r", encoding="utf-8") as provider_file:
+        return yaml.safe_load(provider_file) or {}
+
+
+def summarize_provider_status(
+    registry: dict, environment: dict | os._Environ = os.environ
+) -> dict:
+    providers = []
+    for provider_id, metadata in sorted((registry.get("providers") or {}).items()):
+        required = [str(name) for name in metadata.get("credential_env") or []]
+        missing = [name for name in required if not str(environment.get(name) or "").strip()]
+        public = not required
+        providers.append({
+            "id": provider_id,
+            "mode": str(metadata.get("mode") or "credential-gated"),
+            "adapters": sorted(str(name) for name in metadata.get("adapters") or []),
+            "credential_names": required,
+            "configured": public or not missing,
+            "missing_credentials": missing,
+            "credentials_exposed": False,
+            "automatic_tool_injection": False,
+            "note": str(metadata.get("note") or ""),
+        })
+    return {
+        "providers": providers,
+        "configured_count": sum(1 for item in providers if item["configured"]),
+        "total_count": len(providers),
+        "credential_values_returned": False,
+        "disclaimer": "Provider readiness does not authorize a target or inject credentials into tools.",
+    }
 
 def queue_client() -> redis.Redis:
     return redis.from_url(REDIS_URL, socket_connect_timeout=3, decode_responses=True)
@@ -2214,6 +2247,13 @@ def build_adaptive_target_plan(
         "metasploit_check_candidates": metasploit_check_candidates,
         "disclaimer": "Evidence-derived suggestions require operator review and explicit run approval; no work is queued automatically.",
     }
+
+@app.get("/providers/status")
+def provider_status() -> dict:
+    try:
+        return summarize_provider_status(load_provider_registry())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, AttributeError, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Provider registry is unavailable or invalid")
 
 @app.get("/run-plans")
 def run_plans() -> dict:
