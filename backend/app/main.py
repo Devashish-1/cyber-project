@@ -8,12 +8,13 @@ import posixpath
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import time
 import tarfile
 import zipfile
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
@@ -22,7 +23,7 @@ from uuid import UUID, uuid4
 import psycopg
 import redis
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from cryptography.fernet import Fernet
 from psycopg.types.json import Jsonb
@@ -52,7 +53,7 @@ RUNNER_HEARTBEAT = "security-platform:runner:heartbeat"
 RUNNER_READINESS = "security-platform:runner:adapter-readiness"
 RUNNER_RECOVERY = "security-platform:runner:recovery"
 PLATFORM_PAUSE = "security-platform:control:paused"
-RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
+RUNNER_IMPLEMENTED_TOOLS = {"amass", "arjun", "bandit", "brakeman", "checkov", "codeql", "dalfox", "dnsrecon", "dnsx", "feroxbuster", "ffuf", "gitleaks", "gobuster", "grype", "hadolint", "httpx", "k6", "katana", "kics", "kiterunner", "kubescape", "massdns", "naabu", "nikto", "njsscan", "nmap", "nmap-vuln-reviewed", "nuclei-reviewed", "osv-scanner", "playwright", "schemathesis", "semgrep", "shellcheck", "spiderfoot", "sqlmap-controlled", "subfinder", "syft", "testssl", "theharvester", "trivy", "trufflehog", "wapiti", "whatweb", "wpscan-passive", "zap-passive", "zap-baseline", "zap-full"}
 SUPERVISED_ADAPTER_EXECUTION_MODES = frozenset({
     "adapter", "approval-gated", "external-service-gated",
 })
@@ -62,7 +63,7 @@ RUN_PLANS = {
     "controlled-web": ["dnsx", "naabu", "nmap", "httpx", "playwright", "katana", "nuclei-reviewed", "nikto", "zap-baseline"],
     "extended-web": ["naabu", "nmap", "httpx", "katana", "arjun", "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster", "feroxbuster", "kiterunner", "wapiti", "sqlmap-controlled"],
     "deep-web-authorized": [
-        "httpx", "whatweb", "testssl", "naabu", "nmap", "katana", "arjun",
+        "httpx", "whatweb", "testssl", "naabu", "nmap", "nmap-vuln-reviewed", "katana", "arjun",
         "nuclei-reviewed", "nikto", "zap-baseline", "ffuf", "gobuster",
         "feroxbuster", "kiterunner", "wapiti", "dalfox", "zap-full",
     ],
@@ -87,6 +88,7 @@ DEPLOYMENT_SECURITY_STATUS_PATH = Path(os.getenv(
     "DEPLOYMENT_SECURITY_STATUS_PATH",
     "/validation/deployment-security-status.json",
 ))
+VULNERABILITY_INTEL_PATH = Path(os.getenv("VULNERABILITY_INTEL_PATH", "/vulnerability-intel/intel.sqlite3"))
 MAX_BACKUP_AGE_HOURS = int(os.getenv("MAX_BACKUP_AGE_HOURS", "48"))
 MAX_SOURCE_ARCHIVE_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_EXTRACTED_BYTES = 250 * 1024 * 1024
@@ -335,7 +337,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Security Testing Platform", version="0.174.0", lifespan=lifespan)
+app = FastAPI(title="Security Testing Platform", version="0.176.0", lifespan=lifespan)
 
 
 def control_plane_role(supplied: str) -> str | None:
@@ -2015,6 +2017,89 @@ def run_plans() -> dict:
             for plan_id, tool_ids in RUN_PLANS.items()
         }
     }
+
+
+def vulnerability_intel_connection() -> sqlite3.Connection:
+    if VULNERABILITY_INTEL_PATH.is_symlink() or not VULNERABILITY_INTEL_PATH.is_file():
+        raise HTTPException(status_code=503, detail="Vulnerability intelligence has not been synchronized")
+    if VULNERABILITY_INTEL_PATH.stat().st_size > 16 * 1024 * 1024 * 1024:
+        raise HTTPException(status_code=503, detail="Vulnerability intelligence store exceeds safety limit")
+    connection = sqlite3.connect(f"file:{VULNERABILITY_INTEL_PATH}?mode=ro&immutable=1", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+@app.get("/vulnerability-intelligence/status")
+def vulnerability_intelligence_status() -> dict:
+    with closing(vulnerability_intel_connection()) as connection:
+        sources = [dict(row) for row in connection.execute(
+            "SELECT source,synchronized_at,record_count,detail FROM sync_state ORDER BY source"
+        )]
+        counts = {
+            "cves": connection.execute("SELECT COUNT(*) FROM cves").fetchone()[0],
+            "known_exploited": connection.execute("SELECT COUNT(*) FROM kev").fetchone()[0],
+            "epss_scores": connection.execute("SELECT COUNT(*) FROM epss").fetchone()[0],
+        }
+    return {
+        "available": True,
+        "database_size_bytes": VULNERABILITY_INTEL_PATH.stat().st_size,
+        "counts": counts,
+        "sources": sources,
+    }
+
+
+@app.get("/vulnerability-intelligence/cves/{cve_id}")
+def vulnerability_intelligence_cve(cve_id: str) -> dict:
+    normalized = cve_id.upper()
+    if not re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", normalized):
+        raise HTTPException(status_code=422, detail="Invalid CVE identifier")
+    with closing(vulnerability_intel_connection()) as connection:
+        row = connection.execute(
+            """SELECT c.*,k.vendor,k.product,k.vulnerability_name,k.date_added,k.due_date,
+                      k.ransomware_use,k.required_action,e.score AS epss_score,
+                      e.percentile AS epss_percentile,e.published_date AS epss_date
+               FROM cves c LEFT JOIN kev k USING(cve_id) LEFT JOIN epss e USING(cve_id)
+               WHERE c.cve_id = ?""",
+            (normalized,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="CVE not present in the synchronized intelligence store")
+    result = dict(row)
+    for key in ("weaknesses_json", "cpes_json", "references_json"):
+        result[key.removesuffix("_json")] = json.loads(result.pop(key) or "[]")
+    result["known_exploited"] = result.get("date_added") is not None
+    return result
+
+
+@app.get("/vulnerability-intelligence/matches")
+def vulnerability_intelligence_matches(
+    product: str = Query(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._+\- ]+$"),
+    vendor: str | None = Query(default=None, min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._+\- ]+$"),
+    version: str | None = Query(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._+\-*]+$"),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict:
+    clauses, parameters = ["lower(cp.product) = lower(?)"], [product.strip()]
+    if vendor:
+        clauses.append("lower(cp.vendor) = lower(?)")
+        parameters.append(vendor.strip())
+    if version:
+        clauses.append("cp.version IN (?, '*', '-')")
+        parameters.append(version.strip())
+    parameters.append(limit)
+    with closing(vulnerability_intel_connection()) as connection:
+        rows = connection.execute(
+            f"""SELECT DISTINCT c.cve_id,c.description,c.cvss_score,c.cvss_severity,
+                       cp.vendor,cp.product,cp.version,
+                       CASE WHEN k.cve_id IS NULL THEN 0 ELSE 1 END AS known_exploited,
+                       e.score AS epss_score,e.percentile AS epss_percentile
+                FROM cve_cpes cp JOIN cves c USING(cve_id)
+                LEFT JOIN kev k USING(cve_id) LEFT JOIN epss e USING(cve_id)
+                WHERE {' AND '.join(clauses)}
+                ORDER BY known_exploited DESC,COALESCE(e.score,0) DESC,COALESCE(c.cvss_score,0) DESC
+                LIMIT ?""",
+            parameters,
+        ).fetchall()
+    return {"query": {"vendor": vendor, "product": product, "version": version}, "matches": [dict(row) for row in rows]}
 
 
 @app.get("/projects/{project_id}/workflow-templates")

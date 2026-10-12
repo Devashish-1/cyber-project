@@ -81,6 +81,17 @@ class AdapterContractTests(unittest.TestCase):
         self.assertIn("-no-interactsh", command)
         self.assertEqual(command[command.index("-rate-limit") + 1], "5")
 
+    def test_nmap_vulnerability_profile_uses_only_reviewed_scripts(self):
+        command = self.command_for("nmap-vuln-reviewed")
+        scripts = command[command.index("--script") + 1].split(",")
+        self.assertEqual(len(scripts), 12)
+        self.assertIn("ssl-heartbleed", scripts)
+        self.assertIn("http-shellshock", scripts)
+        self.assertNotIn("vuln", scripts)
+        self.assertNotIn("exploit", scripts)
+        self.assertEqual(command[command.index("--max-rate") + 1], "10")
+        self.assertEqual(command[command.index("-p") + 1], "80,443,8000,8080,8443,8888")
+
     def test_zap_profiles_have_explicit_time_bounds(self):
         expected = {"zap-passive": "3", "zap-baseline": "5", "zap-full": "15"}
         for tool_id, minutes in expected.items():

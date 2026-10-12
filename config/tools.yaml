@@ -1,7 +1,7 @@
 profiles:
   observe: {description: Passive production checks, max_concurrency: 2, tools: [httpx, testssl, zap-passive]}
   controlled-active: {description: Reviewed active checks, max_concurrency: 1, tools: [subfinder, dnsx, katana, nuclei-reviewed, zap-baseline, nikto, schemathesis]}
-  extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox]}
+  extended-active: {description: Operator-approved validation, max_concurrency: 1, requires_operator: true, tools: [feroxbuster, ffuf, arjun, zap-full, sqlmap-controlled, dalfox, nmap-vuln-reviewed]}
   source-assisted: {description: Source and supply-chain checks, max_concurrency: 2, tools: [semgrep, bandit, njsscan, brakeman, syft, grype, trivy, gitleaks, trufflehog, osv-scanner, checkov, kics, hadolint, shellcheck]}
   load-resilience: {description: Separately approved bounded resilience probes, max_concurrency: 1, requires_operator: true, tools: [k6]}
 
@@ -20,6 +20,7 @@ tools:
   whatweb: {category: web-fingerprinting, risk: low, availability: optional, execution: adapter, automation_note: "One low-aggression request to the authorized base URL; redirects and cookies are disabled and only sanitized technology metadata is retained."}
   wpscan-passive: {category: cms-security, risk: medium, availability: optional, execution: adapter, automation_note: "Passive WordPress detection only; no force, enumeration, API token, password testing, or database updates."}
   nmap: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
+  nmap-vuln-reviewed: {category: network-vulnerability, risk: high, availability: core, execution: approval-gated, official_url: "https://nmap.org/book/nse.html", automation_note: "Runs only an explicit reviewed allowlist of twelve NSE checks against common web ports; broad vuln, exploit, brute, dos, external, and third-party script categories are not enabled."}
   naabu: {category: network-discovery, risk: medium, availability: optional, execution: adapter}
   masscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}
   rustscan: {category: network-discovery, risk: high, availability: manual-lab, execution: disabled}
@@ -69,7 +70,8 @@ tools:
   medusa: {category: credential-testing, risk: critical, availability: manual-lab, execution: disabled}
   hashcat: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
   john: {category: password-audit, risk: high, availability: manual-lab, execution: disabled}
-  metasploit: {category: exploitation, risk: critical, availability: manual-lab, execution: disabled}
+  metasploit: {category: exploitation, risk: critical, availability: manual-lab, execution: disabled, automation_note: "Exploit, payload, handler, session, post-exploitation, and arbitrary module execution remain disabled."}
+  metasploit-check-runtime: {category: evidence-validation, risk: high, availability: installed-hardened, execution: manual-lab, official_url: "https://github.com/rapid7/metasploit-framework", automation_note: "Pinned official image derived to non-root UID 65532 with Ruby capabilities removed. The default offline command prints the framework version only. Dashboard execution remains disabled until a fixed CVE-to-module map and prior-evidence gate are implemented."}
   netexec: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
   impacket: {category: active-directory, risk: critical, availability: manual-lab, execution: disabled}
   bloodhound: {category: active-directory, risk: high, availability: manual-lab, execution: disabled}

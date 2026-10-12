@@ -8,7 +8,7 @@ The dashboard is bound to server localhost and is intended to be reached through
 
 - FastAPI control plane, PostgreSQL, Redis, and a multi-view web dashboard.
 - Projects with reversible read-only archival, authorized targets, excluded paths, optional approved DNS resolvers, source archives, and encrypted test identities.
-- 75 catalogued tools with 46 supervised adapters; adapter images are pinned by digest.
+- 76 catalogued tools with 47 supervised adapters; adapter images are pinned by digest.
 - Observe, controlled-active, extended-active, source-assisted, and separately opted-in load-resilience execution profiles.
 - Reviewed single-tool runs plus ordered target and source-analysis workflow templates with cancellation and emergency stop. The `deep-web-authorized` preset performs broad fingerprinting, TLS and network checks, crawling, parameter and content discovery, reviewed vulnerability checks, focused XSS testing, and bounded full DAST after one explicit scope-and-impact approval.
 - Dedicated Docker runner with read-only filesystems, dropped capabilities, non-root execution, resource limits, bounded output, and no Docker socket inside scanner containers.
@@ -16,6 +16,7 @@ The dashboard is bound to server localhost and is intended to be reached through
 - Sealed evidence with integrity verification plus SARIF, DefectDojo JSON, Markdown, JSON, audit, coverage-gap, and report-bundle exports.
 - Sanitized Burp Suite XML finding import. Raw requests, responses, cookies, and credentials are discarded; manual imports remain distinct from supervised coverage.
 - Adapter readiness, storage and queue admission, deployment confinement, backup status, image audit history, and health monitoring.
+- Local vulnerability intelligence index populated from the NVD CVE 2.0 API, CISA Known Exploited Vulnerabilities catalog, and FIRST EPSS daily dataset. The API exposes source freshness, record counts, and evidence for exact CVE identifiers; it does not treat a database match as proof that a target is vulnerable.
 
 Runtime proof is deliberately separate from implementation status. Adapters that depend on third-party discovery providers remain marked as requiring separate authorization until they are tested against an explicitly approved target.
 

@@ -1096,6 +1096,21 @@ def build_command(
             "-oX", "-",
             hostname,
         ]
+    if tool_id == "nmap-vuln-reviewed":
+        hostname = urlsplit(base_url).hostname
+        if not hostname:
+            raise ValueError("Nmap vulnerability target does not contain a hostname")
+        scripts = ",".join((
+            "ssl-heartbleed", "ssl-poodle", "ssl-ccs-injection", "http-shellshock",
+            "http-vuln-cve2017-5638", "http-vuln-cve2017-1001000",
+            "http-vuln-cve2014-3704", "http-vuln-cve2015-1635",
+            "http-csrf", "http-dombased-xss", "http-stored-xss", "http-security-headers",
+        ))
+        return [
+            "-sT", "-sV", "--version-light", "-T2", "--max-rate", "10",
+            "--max-retries", "1", "--host-timeout", "240s", "-Pn", "-n",
+            "-p", "80,443,8000,8080,8443,8888", "--script", scripts, "-oX", "-", hostname,
+        ]
     if tool_id == "testssl":
         return [
             "--quiet",
@@ -1792,6 +1807,43 @@ def normalize_nmap(run_id: UUID, output_file: Path, expected_host: str) -> int:
                 """,
                 records,
             )
+    return len(records)
+
+
+def normalize_nmap_vuln(run_id: UUID, output_file: Path, expected_host: str) -> int:
+    records = []
+    try:
+        raw = output_file.read_text(encoding="utf-8", errors="replace")
+        xml_start = raw.find("<?xml")
+        if xml_start < 0:
+            return 0
+        root = ET.fromstring(raw[xml_start:])
+        for host_node in root.findall("host"):
+            address_node = host_node.find("address")
+            address = (address_node.get("addr") if address_node is not None else "") or "network-target"
+            hostnames = [str(node.get("name") or "") for node in host_node.findall("./hostnames/hostname")]
+            if not nmap_host_is_target(address, hostnames, expected_host):
+                continue
+            for port_node in host_node.findall("./ports/port"):
+                port = int(port_node.get("portid") or 0)
+                if not 1 <= port <= 65535:
+                    continue
+                for script in port_node.findall("script"):
+                    script_id = str(script.get("id") or "")[:200]
+                    output = str(script.get("output") or "")[:2000]
+                    if not script_id or not output:
+                        continue
+                    negative = any(marker in output.lower() for marker in ("not vulnerable", "couldn't find", "not detected", "false"))
+                    severity = "info" if negative or script_id == "http-security-headers" else "medium"
+                    details = {"address": address, "port": port, "script_id": script_id, "result": output}
+                    fingerprint = hashlib.sha256(f"nmap-vuln|{address}|{port}|{script_id}".encode()).hexdigest()
+                    records.append((uuid4(), run_id, "reviewed-nse-result", f"Nmap NSE: {script_id}", severity, f"{address}:{port}", json.dumps(details), fingerprint))
+    except (OSError, ET.ParseError, TypeError, ValueError):
+        return 0
+    if records:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany("""INSERT INTO observations (id,run_id,observation_type,title,severity,asset,details,fingerprint) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (run_id,fingerprint) DO UPDATE SET title=EXCLUDED.title,severity=EXCLUDED.severity,asset=EXCLUDED.asset,details=EXCLUDED.details""", records)
     return len(records)
 
 
@@ -5699,7 +5751,7 @@ def execute_run(run_id: UUID) -> None:
             output_file.write_bytes(logs)
         successful_exit_codes = {0, 1, 2} if run["tool_id"] in {"zap-passive", "zap-baseline", "zap-full"} else {0, 3} if run["tool_id"] == "brakeman" else {0, 4} if run["tool_id"] == "wpscan-passive" else {0, 1} if run["tool_id"] in {"dalfox", "gitleaks", "hadolint", "njsscan", "osv-scanner", "schemathesis", "shellcheck"} else {0}
         if exit_code in successful_exit_codes:
-            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "k6": normalize_k6, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
+            normalizers = {"amass": normalize_amass, "arjun": normalize_arjun, "bandit": normalize_bandit, "brakeman": normalize_brakeman, "checkov": normalize_checkov, "codeql": normalize_codeql, "dalfox": normalize_dalfox, "dnsrecon": normalize_dnsrecon, "dnsx": normalize_dnsx, "feroxbuster": normalize_feroxbuster, "ffuf": normalize_ffuf, "gitleaks": normalize_gitleaks, "gobuster": normalize_gobuster, "grype": normalize_grype, "hadolint": normalize_hadolint, "httpx": normalize_httpx, "k6": normalize_k6, "katana": normalize_katana, "kics": normalize_kics, "kiterunner": normalize_kiterunner, "kubescape": normalize_kubescape, "massdns": normalize_massdns, "naabu": normalize_naabu, "nikto": normalize_nikto, "njsscan": normalize_njsscan, "nmap": normalize_nmap, "nmap-vuln-reviewed": normalize_nmap_vuln, "nuclei-reviewed": normalize_nuclei, "osv-scanner": normalize_osv, "playwright": normalize_playwright, "schemathesis": normalize_schemathesis, "semgrep": normalize_semgrep, "shellcheck": normalize_shellcheck, "spiderfoot": normalize_spiderfoot, "sqlmap-controlled": normalize_sqlmap, "subfinder": normalize_subfinder, "syft": normalize_syft, "testssl": normalize_testssl, "theharvester": normalize_theharvester, "trivy": normalize_trivy, "trufflehog": normalize_trufflehog, "wapiti": normalize_wapiti, "whatweb": normalize_whatweb, "wpscan-passive": normalize_wpscan, "zap-passive": normalize_zap, "zap-baseline": normalize_zap, "zap-full": normalize_zap}
             normalizer = normalizers[run["tool_id"]]
             if run["tool_id"] in {"ffuf", "httpx", "katana", "nuclei-reviewed"}:
                 observation_count = normalizer(
@@ -5708,7 +5760,7 @@ def execute_run(run_id: UUID) -> None:
                     run["base_url"],
                     run["excluded_paths"],
                 )
-            elif run["tool_id"] in {"naabu", "nmap"}:
+            elif run["tool_id"] in {"naabu", "nmap", "nmap-vuln-reviewed"}:
                 expected_host = (urlsplit(run["base_url"]).hostname or "").lower().rstrip(".")
                 observation_count = normalizer(run_id, output_file, expected_host)
             elif run["tool_id"] == "k6":

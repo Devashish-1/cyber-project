@@ -48,7 +48,7 @@ curl -fsS "$base_url/health" | jq -e '
   .status == "ok" and .database == "ok" and .queue == "ok"
 ' >/dev/null
 curl -fsS "${base_url%/api}/" > "$work_dir/dashboard.html"
-grep -q 'UI v0.180' "$work_dir/dashboard.html"
+grep -q 'UI v0.181' "$work_dir/dashboard.html"
 grep -q 'Load and resilience access:' "$work_dir/dashboard.html"
 grep -q 'fixed at one virtual user, one iteration, and one exact base-URL request' "$work_dir/dashboard.html"
 grep -q "loadTools=input==='target'" "$work_dir/dashboard.html"
@@ -223,6 +223,15 @@ jq -e '
   all(.plans["source-secrets-and-quality"][]; .profile == "source-assisted") and
   all(.plans["source-dependencies-and-iac"][]; .profile == "source-assisted")
 ' "$work_dir/run-plans.json" >/dev/null
+
+curl --config "$curl_config" "$base_url/vulnerability-intelligence/status" > "$work_dir/vulnerability-intelligence.json"
+jq -e '
+  (.available == true) and
+  (.counts.cves >= 1) and
+  (.counts.known_exploited >= 1) and
+  (.counts.epss_scores >= 1) and
+  ([.sources[].source] | contains(["cisa-kev", "epss", "nvd"]))
+' "$work_dir/vulnerability-intelligence.json" >/dev/null
 
 curl --config "$curl_config" "$base_url/deployment-security-status" > "$work_dir/deployment-security.json"
 jq -e '

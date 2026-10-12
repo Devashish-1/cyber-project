@@ -50,6 +50,7 @@ services:
       BACKUP_ROOT: /backups
       VALIDATION_STATUS_PATH: /validation/local-validation-suite.json
       DEPLOYMENT_SECURITY_STATUS_PATH: /validation/deployment-security-status.json
+      VULNERABILITY_INTEL_PATH: /vulnerability-intel/intel.sqlite3
       MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-10737418240}
       MAX_STORAGE_USED_PERCENT: ${MAX_STORAGE_USED_PERCENT:-90}
       MAX_PENDING_RUNS: ${MAX_PENDING_RUNS:-100}
@@ -65,6 +66,7 @@ services:
       - ./data/exports/image-audits:/image-audits:ro
       - ./backups:/backups:ro
       - ./data/tmp:/validation:ro
+      - ./data/vulnerability-intel:/vulnerability-intel:ro
     depends_on:
       postgres:
         condition: service_healthy
